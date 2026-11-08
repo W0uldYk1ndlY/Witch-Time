@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
+#include "nvn_vk_requirements.h"
 void rpt_begin(void); void rpt_end(void); int rpt_printf(const char *fmt, ...);     /* hostrt.c: [Recomps#1] the reports in one write each */
 static int have_targets_live(void);
 
@@ -132,11 +133,18 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
                !m ? (e ? "turned off by WT_VK_GPL=0" : "off by default in this build") : D.has_gpl ? (e ? "asked for by WT_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
                !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
     }
-    if (!D.f13.dynamicRendering || !D.f13.synchronization2) vkd_fail("the device lacks dynamicRendering / synchronization2");
+    {
+        VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+        VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &p11; p11.pNext = &p12;
+        vkGetPhysicalDeviceProperties2(V.gpu, &p2);
+        const char *missing = nvn_vk_requirement_error(&D.f2.features, &D.f12, &D.f13, &p11, &p12);
+        if (missing) vkd_fail("unsupported GPU %s: requires %s; Vulkan 1.3 alone is insufficient", V.props.deviceName, missing);
+    }
     if (!D.has_vids)                               /* finding 116: AMD Polaris (RX 400/500) on Windows, older drivers */
         printf("nvn_vk: NO VK_EXT_vertex_input_dynamic_state%s: the vertex layout of a draw is part of its pipeline (numbered in ../cache/vk/vlayouts.bin); attribute divisors above 1: %s\n",
                getenv("WT_VK_VIDS") && !atoi(getenv("WT_VK_VIDS")) ? " (WT_VK_VIDS=0, a test)" : " on this GPU", D.has_vad && D.vad.vertexAttributeInstanceRateDivisor ? "yes" : "NO");
-    if (!D.f2.features.textureCompressionBC) nvn_vk_missing("a GPU without BC texture compression");
     di->enabledExtensionCount = D.next; di->ppEnabledExtensionNames = D.exts; di->pNext = &D.f2;
     printf("nvn_vk: features: vertex input dynamic %d, custom border colour %d, provoking vertex last %d, 8-bit indices %d, list restart %d, ASTC %d, depth clamp %d, wide lines %d, robust buffers %d\n",
            D.has_vids, D.has_cbc, D.has_pv, D.has_iu8, D.has_plr, (int)D.f2.features.textureCompressionASTC_LDR, (int)D.f2.features.depthClamp, (int)D.f2.features.wideLines, (int)D.f2.features.robustBufferAccess);
@@ -5150,6 +5158,39 @@ static void present_flush(void) {
     else vk_ok("vkQueuePresentKHR", r);
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { LONG64 nowt = tk(); if (g_gap_prev && nowt - g_gap_prev > g_gap_max) g_gap_max = nowt - g_gap_prev; g_gap_prev = nowt; g_wd_beat = nowt; }
 }
+#ifdef __ANDROID__
+/* Render thread, between jobs or before a present. SDL's foreground callback
+ * happens after Java has installed the new ANativeWindow. Keep device objects,
+ * replace only the surface/swapchain, and discard the old deferred present. */
+void nvn_vk_android_resume(void) {
+    int display_android_wait_foreground(void);
+    static int generation;
+    int current = display_android_wait_foreground();
+    if (!V.alive) { generation = current; return; }
+    if (current == generation && !V.android_surface_lost) return;
+    generation = current;
+    if (g_pend.on) { g_pend.on = 0; display_present_flushed(); }
+    g_pend.recreate = 0;
+    cmd_wait_all();
+    swapchain_destroy();
+    VKC(vkDeviceWaitIdle(V.device));
+    for (int i = 0; i < 16; i++) if (g_sem_img[i]) {
+        vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL;
+    }
+    if (V.surface) vkDestroySurfaceKHR(V.instance, V.surface, NULL);
+    V.surface = VK_NULL_HANDLE;
+    if (!android_surface_create(0)) return;
+    VkBool32 can = VK_FALSE;
+    VkResult support = vkGetPhysicalDeviceSurfaceSupportKHR(V.gpu, V.family, V.surface, &can);
+    if (support == VK_ERROR_SURFACE_LOST_KHR) { V.android_surface_lost = 1; return; }
+    if (support != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceSupportKHR", support);
+    if (!can) vkd_fail("Android replacement surface is not supported by the selected queue");
+    V.android_surface_lost = 0;
+    swapchain_create();
+    InterlockedIncrement64(&g_vk_recreated);
+    printf("nvn_vk: Android surface recreated after foreground transition\n");
+}
+#endif
 void nvn_vk_present_flush_job(void *arg) { (void)arg; if (V.alive) present_flush(); }
 #include "nvn_vk_flash.c"                         /* session 13: the white-flash detector (fl_pass, fl_capture, fl_shutdown) */
 /* nvn_vk_m4.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
@@ -5214,6 +5255,9 @@ static void prep_first_hold(LONG64 frame) {
 }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
+#ifdef __ANDROID__
+    nvn_vk_android_resume();
+#endif
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
     if (!V.alive) return;

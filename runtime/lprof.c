@@ -5,7 +5,7 @@
  * lifted code). The file lists per sample: thread id, the thread's guest name or "-", the PCs innermost first; then the
  * presented frame ("@<frame>", last), and the mappings (/proc/self/maps), so `wtbuild lprof` (tools/wtbuild/src/lprof.rs) can turn addresses into function names (the symbol tables of
  * witch-time-game and game.so; lifted functions are f_<guest address>). Included by boot.c (Linux only), like prof15.c. */
-#include <execinfo.h>
+#include "posix/stacktrace.h"
 #include <signal.h>
 #include <sys/syscall.h>
 #include <dirent.h>
@@ -28,9 +28,9 @@ static void lp_signal(int sig, siginfo_t *si, void *ucv) {
     if (i < LP_MAX) {
         LpSample *s = &g_lp[i];
         void *tmp[LP_DEPTH + 3];
-        int k = backtrace(tmp, LP_DEPTH + 3), j = 0;
+        int k = plat_backtrace(tmp, LP_DEPTH + 3), j = 0;
         s->tid = (int)syscall(SYS_gettid); s->frame = (int)g_prof15_frame;
-        s->pc[j++] = (void *)((ucontext_t *)ucv)->uc_mcontext.gregs[REG_RIP];
+        s->pc[j++] = plat_signal_pc(ucv);
         for (int m = 2; m < k && j < LP_DEPTH; m++) s->pc[j++] = tmp[m];      /* 0 = this handler, 1 = the signal return trampoline */
         s->n = j;
     }

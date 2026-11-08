@@ -137,14 +137,22 @@ fn check(repo: &Path, clang: &str, t: Target, args: &[String], tmp: &Path, log: 
     let probe = tmp.join("probe.c");
     let mut src = String::from("#include <setjmp.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n");
     src += "const unsigned long jmp_size = sizeof(jmp_buf), jmp_align = _Alignof(jmp_buf);\n";
+    let mut probe_flags = vec!["-O2".into()];
+    if t.android() {
+        src += "#include \"sdklift.h\"\n";
+        src += "const unsigned long sdk_jmp_size = sizeof(SdkJmpRec), sdk_jmp_align = _Alignof(SdkJmpRec);\n";
+        src += "const unsigned long sdk_jmp_key = __builtin_offsetof(SdkJmpRec, key), sdk_jmp_x = __builtin_offsetof(SdkJmpRec, x), sdk_jmp_d = __builtin_offsetof(SdkJmpRec, d), sdk_jmp_value = __builtin_offsetof(SdkJmpRec, value), sdk_jmp_stamp = __builtin_offsetof(SdkJmpRec, stamp);\n";
+        src += "void sdk_jump_probe(Ctx *c) { SDK_SETJMP(c); }\n";
+        probe_flags.extend(["-I".into(), s(&rt), "-I".into(), s(&rt.join("split"))]);
+    }
     if t.windows() {
         // setjmp as mingw-w64 expands it (the UCRT's _setjmp and a frame)
         src += "int jump(jmp_buf b) { return setjmp(b); }\nfloat mag(float x) { return fabsf(x); }\n";
-    } else {
+    } else if !t.android() {
         src += "const unsigned long tag_mask = __builtin_offsetof(struct __jmp_buf_tag, __mask_was_saved);\n";
     }
     fs::write(&probe, src).map_err(|e| format!("{}: {}", probe.display(), e))?;
-    jobs.push(("probe.c".into(), probe, vec!["-O2".into()]));
+    jobs.push(("probe.c".into(), probe, probe_flags));
 
     let mut pre = t.clang_flags();
     if t.windows() {
@@ -157,6 +165,7 @@ fn check(repo: &Path, clang: &str, t: Target, args: &[String], tmp: &Path, log: 
             let o = tmp.join(side).join(format!("{}.o", name));
             let _ = fs::create_dir_all(o.parent().unwrap());
             let mut cmd = Command::new(clang);
+            t.configure_command(&mut cmd);
             cmd.args(&pre).arg("-c").args(flags).args(extra).arg(src).arg("-o").arg(&o);
             let (code, out, _) = run(&mut cmd, None);
             if code != Some(0) {
@@ -175,7 +184,8 @@ fn check(repo: &Path, clang: &str, t: Target, args: &[String], tmp: &Path, log: 
     Ok(bad)
 }
 
-const USAGE: &str = "usage: check-freestanding [--words N] [--seed S] [--clang <c>] [--gen <dir>] [--tables <dir>] [--target windows] [--jobs N] [--repo <dir>]";
+const USAGE: &str =
+    "usage: check-freestanding [--words N] [--seed S] [--clang <c>] [--gen <dir>] [--tables <dir>] [--target windows] [--jobs N] [--repo <dir>]";
 
 /// every option takes a value: a misspelled one would silently skip a check
 fn parse(args: &[String]) -> Result<(), &'static str> {
@@ -192,13 +202,13 @@ fn parse(args: &[String]) -> Result<(), &'static str> {
 pub fn main(args: &[String]) -> i32 {
     parse(&args[1..]).unwrap_or_else(|e| crate::die(e));
     let repo = crate::repo_root(args);
+    let t = Target::from_args(args).unwrap_or_else(|e| crate::die(e));
     let clang = args
         .iter()
         .position(|a| a == "--clang")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| compile::find_clang(&repo));
-    let t = Target::from_args(args).unwrap_or_else(|e| crate::die(e));
+        .unwrap_or_else(|| compile::find_clang_for(&repo, t).unwrap_or_else(|e| crate::die(e)));
     let tmp = std::env::temp_dir().join(format!("wtfree_{}", std::process::id()));
     let r = check(&repo, &clang, t, args, &tmp, &mut |l| println!("{}", l));
     let _ = fs::remove_dir_all(&tmp);

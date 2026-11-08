@@ -1,4 +1,4 @@
-/* Linux build only: the Win32 functions plat.h declares (threads and waitable handles, memory regions, fibers, modules,
+/* POSIX builds (Linux / Android): the Win32 functions plat.h declares (threads and waitable handles, memory regions, fibers, modules,
  * files). Behaviour follows what the runtime's call sites rely on, not all of Win32; the limits are marked "shortcut:". */
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -18,7 +18,11 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#if defined(__ANDROID__) && defined(__aarch64__)
+#include "posix/fiber_aarch64.h"
+#else
 #include <ucontext.h>
+#endif
 #ifndef PAGEMAP_SCAN                          /* [witchtime] Linux 6.7's uapi, for older kernel headers (the release builds
                                                  on Ubuntu 22.04); whether the kernel has it is asked at run time */
 #define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
@@ -280,7 +284,16 @@ BOOL InitOnceExecuteOnce(INIT_ONCE *once, BOOL (*fn)(INIT_ONCE *, PVOID, PVOID *
 
 /* ---------------------------------------------------------------- fibers */
 DWORD FlsAlloc(void (*dtor)(PVOID)) { pthread_key_t k; return pthread_key_create(&k, dtor) ? FLS_OUT_OF_INDEXES : (DWORD)k; }
-typedef struct Fiber { ucontext_t uc; LPFIBER_START_ROUTINE fn; void *arg, *stack; size_t stack_size; } Fiber;
+typedef struct Fiber {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    WtFiberContext uc;
+#else
+    ucontext_t uc;
+#endif
+    LPFIBER_START_ROUTINE fn;
+    void *arg, *stack;
+    size_t stack_size;
+} Fiber;
 static __thread Fiber *t_fiber;
 static void fiber_entry(void) { t_fiber->fn(t_fiber->arg); _exit(70); }   /* a fiber function never returns (Windows ends the thread) */
 LPVOID ConvertThreadToFiber(LPVOID arg) {
@@ -296,17 +309,30 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     if (f->stack == MAP_FAILED) { free(f); return NULL; }
     f->fn = fn; f->arg = arg;
+#if defined(__ANDROID__) && defined(__aarch64__)
+    f->uc.sp = ((uintptr_t)f->stack + f->stack_size) & ~(uintptr_t)15;
+    f->uc.x19_x30[11] = (uintptr_t)fiber_entry;   /* LR: first switch enters the trampoline */
+    uint64_t fpcr, fpsr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+    f->uc.fpcr = (uint32_t)fpcr; f->uc.fpsr = (uint32_t)fpsr;
+#else
     getcontext(&f->uc);
     f->uc.uc_stack.ss_sp = f->stack;
     f->uc.uc_stack.ss_size = f->stack_size;
     f->uc.uc_link = NULL;
     makecontext(&f->uc, fiber_entry, 0);
+#endif
     return f;
 }
 void SwitchToFiber(LPVOID fiber) {
     Fiber *from = t_fiber, *to = fiber;
     t_fiber = to;
+#if defined(__ANDROID__) && defined(__aarch64__)
+    wt_fiber_swap(&from->uc, &to->uc);
+#else
     swapcontext(&from->uc, &to->uc);
+#endif
 }
 void DeleteFiber(LPVOID fiber) {
     Fiber *f = fiber;
@@ -319,7 +345,22 @@ typedef struct { uintptr_t base; size_t size; int ww; } Region;   /* ww: 0 no wr
 static Region *g_regions;
 static size_t g_nregions, g_cap;
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
-static size_t page_up(size_t n) { return (n + 4095) & ~(size_t)4095; }
+/* Host pages can be 16 KiB on Android; guest pages are always 4 KiB.
+ * These helpers reject overflow before issuing a syscall. */
+static size_t host_page_size(void) {
+    long n = sysconf(_SC_PAGESIZE);
+    return n > 0 ? (size_t)n : 4096;
+}
+static int page_span(uintptr_t addr, size_t size, size_t page, uintptr_t *base, size_t *len) {
+    if (!size || size > UINTPTR_MAX - addr) { errno = EINVAL; return 0; }
+    uintptr_t end = addr + size;
+    size_t tail = (size_t)(end % page);
+    if (tail && end > UINTPTR_MAX - (page - tail)) { errno = EINVAL; return 0; }
+    if (tail) end += page - tail;
+    *base = addr - addr % page;
+    *len = end - *base;
+    return 1;
+}
 static int to_prot(DWORD p) {
     switch (p & 0xff) {
     case PAGE_READONLY: return PROT_READ;
@@ -335,6 +376,10 @@ static int to_prot(DWORD p) {
  * (an older kernel, userfaultfd not allowed) a watched region answers "every page written": always correct, only slower. */
 static int g_uffd = -1, g_pagemap = -1, g_ww_state;   /* g_ww_state: 0 not tried, 1 on, 2 not available */
 static int ww_available(void) {
+    /* The renderer stamps 4 KiB guest pages. Resetting one 16 KiB kernel page
+     * would lose dirty state in neighboring guest pages that were not queried.
+     * Report every guest page instead: conservative, never falsely clean. */
+    if (host_page_size() != 4096) return 0;
     pthread_mutex_lock(&g_reg_lock);
     if (!g_ww_state) {
         struct uffdio_api api = { .api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED };
@@ -358,19 +403,21 @@ static int ww_of(uintptr_t a, size_t n) {              /* the write watch of the
     int ww = 0;
     pthread_mutex_lock(&g_reg_lock);
     for (size_t i = 0; i < g_nregions && !ww; i++)
-        if (a >= g_regions[i].base && a + n <= g_regions[i].base + g_regions[i].size) ww = g_regions[i].ww;
+        if (a >= g_regions[i].base && a - g_regions[i].base <= g_regions[i].size && n <= g_regions[i].size - (a - g_regions[i].base)) ww = g_regions[i].ww;
     pthread_mutex_unlock(&g_reg_lock);
     return ww;
 }
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
-    size = page_up(size);
+    uintptr_t a;
+    size_t n;
+    if (!page_span((uintptr_t)addr, size, host_page_size(), &a, &n)) return NULL;
     if (!(type & MEM_RESERVE)) {               /* commit inside a reservation */
-        uintptr_t a = (uintptr_t)addr & ~(uintptr_t)4095;
-        size_t n = page_up((uintptr_t)addr + size - a);
         if (mprotect((void *)a, n, to_prot(prot))) return NULL;
         if (ww_of(a, n) == 1) ww_protect(a, n);  /* newly committed pages are not written (as on Windows) */
         return addr;
     }
+    if (addr && a != (uintptr_t)addr) { errno = EINVAL; return NULL; }
+    size = n;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | (addr ? MAP_FIXED_NOREPLACE : 0);
     void *p = mmap(addr, size, (type & MEM_COMMIT) ? to_prot(prot) : PROT_NONE, flags, -1, 0);
     if (p == MAP_FAILED || (addr && p != addr)) { if (p != MAP_FAILED) munmap(p, size); return NULL; }
@@ -387,8 +434,12 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
 }
 BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     if (type & MEM_DECOMMIT) {                 /* back to reserved: contents dropped, as on Windows */
-        uintptr_t a = (uintptr_t)addr & ~(uintptr_t)4095;
-        size_t n = page_up((uintptr_t)addr + size - a);
+        uintptr_t a;
+        size_t n, page = host_page_size();
+        if (!page_span((uintptr_t)addr, size, page, &a, &n)) return FALSE;
+        /* Discarding a whole host page for a guest subpage would corrupt live
+         * neighbors. Subpage decommit needs emulation, not outward rounding. */
+        if (page > 4096 && (a != (uintptr_t)addr || n != size)) { errno = ENOTSUP; return FALSE; }
         madvise((void *)a, n, MADV_DONTNEED);
         return mprotect((void *)a, n, PROT_NONE) == 0;
     }
@@ -407,14 +458,20 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
 BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old) {
     MEMORY_BASIC_INFORMATION mi;
     if (old) *old = VirtualQuery(addr, &mi, sizeof mi) ? mi.Protect : PAGE_NOACCESS;
-    uintptr_t a = (uintptr_t)addr & ~(uintptr_t)4095;
-    return mprotect((void *)a, page_up((uintptr_t)addr + size - a), to_prot(prot)) == 0;
+    uintptr_t a;
+    size_t n, page = host_page_size();
+    if (!page_span((uintptr_t)addr, size, page, &a, &n)) return FALSE;
+    /* There is no independent 4 KiB protection inside one 16 KiB host page.
+     * Fail rather than change the permissions of neighboring guest memory. */
+    if (page > 4096 && (a != (uintptr_t)addr || n != size)) { errno = ENOTSUP; return FALSE; }
+    return mprotect((void *)a, n, to_prot(prot)) == 0;
 }
 /* shortcut: reads /proc/self/maps on every call (fine for the runtime's diagnostics; cache it if a hot path calls it) */
 SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     if (len < sizeof *mi) return 0;
     memset(mi, 0, sizeof *mi);
-    uintptr_t a = (uintptr_t)addr, page = a & ~(uintptr_t)4095;
+    size_t ps = host_page_size();
+    uintptr_t a = (uintptr_t)addr, page = a - a % ps;
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
     char line[512], perm[8];
@@ -437,7 +494,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     }
     fclose(f);
     (void)prev_hi;
-    if (!found) { mi->BaseAddress = (void *)page; mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = 4096; }
+    if (!found) { mi->BaseAddress = (void *)page; mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = ps; }
     return sizeof *mi;
 }
 BOOL IsBadReadPtr(const void *p, UINT_PTR n) {
@@ -450,7 +507,10 @@ BOOL IsBadReadPtr(const void *p, UINT_PTR n) {
 /* The pages of [base, base+size) written since the last reset, in address order, at most *count of them; with
  * WRITE_WATCH_FLAG_RESET the ones listed count as not written again. Fails (non-zero) for memory that is not watched. */
 UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR *count, ULONG *gran) {
-    uintptr_t start = (uintptr_t)base & ~(uintptr_t)4095, end = page_up((uintptr_t)base + size);
+    uintptr_t start;
+    size_t len;
+    if (!count || !gran || (!addrs && *count) || !page_span((uintptr_t)base, size, 4096, &start, &len)) return 1;
+    uintptr_t end = start + len;
     int ww = size ? ww_of(start, end - start) : 0;
     if (!ww) return 1;
     *gran = 4096;
@@ -476,15 +536,21 @@ UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR
     return 0;
 }
 UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
-    uintptr_t a = (uintptr_t)base & ~(uintptr_t)4095, n = page_up((uintptr_t)base + size) - a;
+    uintptr_t a;
+    size_t n;
+    if (!page_span((uintptr_t)base, size, 4096, &a, &n)) return 1;
     int ww = size ? ww_of(a, n) : 0;
     if (!ww) return 1;
     return ww == 1 && !ww_protect(a, n);
 }
 void GetSystemInfo(SYSTEM_INFO *si) {
     memset(si, 0, sizeof *si);
+#if defined(__aarch64__)
+    si->wProcessorArchitecture = 12;           /* PROCESSOR_ARCHITECTURE_ARM64 */
+#else
     si->wProcessorArchitecture = 9;            /* PROCESSOR_ARCHITECTURE_AMD64 */
-    si->dwPageSize = 4096;
+#endif
+    si->dwPageSize = (DWORD)host_page_size();
     si->dwAllocationGranularity = 65536;
     si->lpMinimumApplicationAddress = (void *)0x10000;
     si->lpMaximumApplicationAddress = (void *)0x7ffffffeffffull;
@@ -496,7 +562,12 @@ void GetSystemInfo(SYSTEM_INFO *si) {
 /* ---------------------------------------------------------------- modules and process */
 HMODULE LoadLibraryA(LPCSTR name) {
     static const char *const map[][2] = {      /* the Windows DLLs the runtime opens by name, and their Linux libraries */
+#ifdef __ANDROID__
+        /* APK native libraries and Android's Vulkan loader have unversioned sonames. */
+        {"vulkan-1.dll", "libvulkan.so"}, {"wt_glslang.dll", "libwt_glslang.so"}, {"SDL3.dll", "libSDL3.so"}, {"libopus-0.dll", "libopus.so"},
+#else
         {"vulkan-1.dll", "libvulkan.so.1"}, {"wt_glslang.dll", "libwt_glslang.so"}, {"SDL3.dll", "libSDL3.so.0"}, {"libopus-0.dll", "libopus.so.0"},
+#endif
     };
     for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
         if (!strcasecmp(name, map[i][0])) {
@@ -829,8 +900,12 @@ static View g_views[256];
 static pthread_mutex_t g_view_lock = PTHREAD_MUTEX_INITIALIZER;
 LPVOID MapViewOfFile(HANDLE map, DWORD access, DWORD off_hi, DWORD off_lo, SIZE_T n) {
     (void)access;
-    uint64_t off = ((uint64_t)off_hi << 32) | off_lo, at = off & ~(uint64_t)4095;
-    if (!n) { struct stat st; if (fstat(file_fd(map), &st)) return NULL; n = (SIZE_T)((uint64_t)st.st_size - off); }
+    uint64_t off = ((uint64_t)off_hi << 32) | off_lo, at = off - off % host_page_size();
+    struct stat st;
+    if (fstat(file_fd(map), &st)) return NULL;
+    if (st.st_size < 0 || off >= (uint64_t)st.st_size) { errno = EINVAL; return NULL; }
+    if (!n) n = (SIZE_T)((uint64_t)st.st_size - off);
+    if (n > (uint64_t)st.st_size - off || n > SIZE_MAX - (off - at)) { errno = EINVAL; return NULL; }
     size_t len = (size_t)(off - at) + n;
     uint8_t *p = mmap(NULL, len, PROT_READ, MAP_SHARED, file_fd(map), (off_t)at);   /* Windows needs 64 KB-aligned offsets; here any works */
     if (p == MAP_FAILED) { fail_errno(); return NULL; }
@@ -840,7 +915,7 @@ LPVOID MapViewOfFile(HANDLE map, DWORD access, DWORD off_hi, DWORD off_lo, SIZE_
     return p + (off - at);
 }
 BOOL UnmapViewOfFile(LPCVOID v) {
-    uintptr_t a = (uintptr_t)v & ~(uintptr_t)4095;
+    uintptr_t a = (uintptr_t)v;
     pthread_mutex_lock(&g_view_lock);
     for (int i = 0; i < 256; i++)
         if (g_views[i].base && (uintptr_t)g_views[i].base <= a && a < (uintptr_t)g_views[i].base + g_views[i].len) {

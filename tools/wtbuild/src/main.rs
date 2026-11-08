@@ -94,14 +94,14 @@ fn main() {
         Some("compile") => {
             // the compile step on build/gen_eh on its own (developers)
             let repo = repo_root(&args).to_string_lossy().into_owned();
-            let clang = compile::find_clang(Path::new(&repo));
+            let t = target::Target::from_args(&args).unwrap_or_else(|e| die(e));
+            let clang = compile::find_clang_for(Path::new(&repo), t).unwrap_or_else(|e| die(e));
             let jobs = args
                 .iter()
                 .position(|a| a == "--jobs")
                 .and_then(|i| args.get(i + 1))
                 .and_then(|j| j.parse().ok())
                 .unwrap_or_else(util::default_jobs);
-            let t = target::Target::from_args(&args).unwrap_or_else(|e| die(e));
             if let Err(e) = compile::run_step(&repo, &clang, t, jobs, &setup::child_env, &mut |l| println!("{}", l)) {
                 die(e)
             }
@@ -109,8 +109,8 @@ fn main() {
         Some("link") => {
             // the link step on its own (developers): build/game.so, and the runtime when not prebuilt
             let repo = repo_root(&args);
-            let clang = compile::find_clang(&repo);
             let t = target::Target::from_args(&args).unwrap_or_else(|e| die(e));
+            let clang = compile::find_clang_for(&repo, t).unwrap_or_else(|e| die(e));
             link::run_step(&repo, &clang, t, &setup::child_env, &mut |l| println!("{}", l)).unwrap_or_else(|e| die(e));
         }
         Some("smoke") => smoke::main(&args[1..]).unwrap_or_else(|e| die(e)),
@@ -122,8 +122,8 @@ fn main() {
                 .position(|a| a == "--out")
                 .and_then(|i| args.get(i + 1))
                 .unwrap_or_else(|| die("runtime: --out <dir>"));
-            let clang = compile::find_clang(&repo);
             let t = target::Target::from_args(&args).unwrap_or_else(|e| die(e));
+            let clang = compile::find_clang_for(&repo, t).unwrap_or_else(|e| die(e));
             link::make_prebuilt(&repo, &clang, t, Path::new(out), &mut |l| println!("{}", l)).unwrap_or_else(|e| die(e));
         }
         Some("tables") if args.len() == 2 => {

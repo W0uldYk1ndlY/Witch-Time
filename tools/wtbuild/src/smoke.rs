@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const USAGE: &str = "usage: smoke [--repo <dir>] [--prebuilt <dir>] [--lib <file>]... [--target windows] [--wine <program>]";
+const USAGE: &str = "usage: smoke [--repo <dir>] [--prebuilt <dir>] [--lib <file>]... [--target windows] [--wine <program>] | smoke --target android-arm64 --link-only [--prebuilt <dir>]";
 
 // nvn_sdk.c's sdk addresses the stand-in sdk has no counterpart of (any value links; the smoke run never calls them)
 const SDKA: [&str; 15] = [
@@ -58,6 +58,12 @@ fn parse(args: &[String]) -> Result<(Option<PathBuf>, Vec<PathBuf>, Option<Strin
     let (mut prebuilt, mut libs, mut wine) = (None, Vec::new(), None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if a == "--link-only" {
+            if !Target::from_args(args)?.android() {
+                return Err("--link-only is only supported for Android cross-link checks".into());
+            }
+            continue;
+        }
         let v = it.next().ok_or(USAGE)?;
         match a.as_str() {
             "--prebuilt" => prebuilt = Some(PathBuf::from(v)),
@@ -91,6 +97,9 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), String> {
 pub fn main(args: &[String]) -> Result<(), String> {
     let (prebuilt, libs, wine) = parse(args)?;
     let t = Target::from_args(args)?;
+    if t.android() && !args.iter().any(|a| a == "--link-only") {
+        return Err("Android smoke requires --link-only: cross-linking the stand-in modules is not an on-device runtime smoke test".into());
+    }
     let wine = wine.or_else(|| (t.windows() && !cfg!(windows)).then(|| "wine".into()));
     let root = crate::repo_root(args);
     let shim = root.join("runtime").join("game_shim_eh.c");
@@ -110,7 +119,7 @@ fn run(root: &Path, tmp: &Path, t: Target, prebuilt: Option<&Path>, libs: &[Path
     let io = |p: &Path, e: std::io::Error| format!("{}: {}", p.display(), e);
     let fake = root.join("tools").join("wtbuild").join("testdata").join("fake_main");
     let repo = tmp.join("repo");
-    let (build, exefs) = (repo.join("build"), repo.join("targets").join("exefs"));
+    let (build, exefs) = (t.build_dir(&repo), repo.join("targets").join("exefs"));
     // an exact copy, or link.rs's sources hash differs from the prebuilt runtime's
     copy_tree(&root.join("runtime"), &repo.join("runtime"), &["gen"])?;
     for d in [repo.join("runtime").join("gen"), repo.join("lifter"), exefs.clone(), build.clone()] {
@@ -137,9 +146,35 @@ fn run(root: &Path, tmp: &Path, t: Target, prebuilt: Option<&Path>, libs: &[Path
     }
     fs::write(&addrs, h).map_err(|e| io(&addrs, e))?;
     // the Options-row patches fit only the real main
-    lifter::eh::lift_main(&lifter::Image::main(main), &build.join("gen_eh"), log).map_err(|e| format!("lift: {}", e))?;
-    let clang = compile::find_clang(root);
+    lifter::eh::lift_main(&lifter::Image::main(main), &crate::layout::build(&repo).join("gen_eh"), log).map_err(|e| format!("lift: {}", e))?;
+    let clang = compile::find_clang_for(root, t)?;
     compile::run_step(&repo.to_string_lossy(), &clang, t, util::default_jobs(), &setup::child_env, log)?;
+    if t.android() {
+        // The committed sdk fixture does not use setjmp. Exercise every Android SDK bridge in this link check too.
+        let boundary = build.join("sdk_jump_boundary.c");
+        fs::write(
+            &boundary,
+            "#include \"sdklift.h\"\nvoid android_sdk_jump_probe(Ctx *c) { SDK_SETJMP(c); if (c->x[0]) sdk_longjmp(c); }\n",
+        )
+        .map_err(|e| io(&boundary, e))?;
+        let mut cmd = Command::new(&clang);
+        t.configure_command(&mut cmd);
+        cmd.args(t.clang_flags())
+            .args(link::table_flags(t))
+            .args(link::freestanding(&repo))
+            .arg("-I")
+            .arg(repo.join("runtime"))
+            .arg("-I")
+            .arg(repo.join("runtime/gen"))
+            .arg("-c")
+            .arg(&boundary)
+            .arg("-o")
+            .arg(build.join("obj/zz_sdk_jump_boundary.obj"));
+        let (code, output, _) = compile::run(&mut cmd, None);
+        if code != Some(0) {
+            return Err(format!("Android SDK jump boundary did not compile:\n{}", compile::tail(&output, 3000)));
+        }
+    }
     if t.windows() {
         let standin = build.join("standin.c");
         let c: String = only.iter().map(|n| format!("void {}(Ctx *c) {{ (void)c; }}\n", n)).collect();
@@ -156,7 +191,12 @@ fn run(root: &Path, tmp: &Path, t: Target, prebuilt: Option<&Path>, libs: &[Path
         }
     }
     if let Some(p) = prebuilt {
-        copy_tree(p, &repo.join(link::PREBUILT), &[])?;
+        let dir = if t.android() {
+            repo.join(link::PREBUILT).join(t.name())
+        } else {
+            repo.join(link::PREBUILT)
+        };
+        copy_tree(p, &dir, &[])?;
     }
     for lib in libs {
         let to = build.join(lib.file_name().ok_or(format!("--lib {}: not a file", lib.display()))?);
@@ -169,6 +209,16 @@ fn run(root: &Path, tmp: &Path, t: Target, prebuilt: Option<&Path>, libs: &[Path
     })?;
     if prebuilt.is_some() && !used_prebuilt {
         return Err("the prebuilt runtime was not used".into());
+    }
+    if t.android() {
+        for file in [t.game_lib(), "libwitchtime.so", "libwt_glslang.so"] {
+            let data = fs::read(build.join(file)).map_err(|e| format!("{}: {}", file, e))?;
+            if data.get(..6) != Some(&b"\x7fELF\x02\x01"[..]) || data.get(18..20) != Some(&[183, 0][..]) {
+                return Err(format!("{} is not a little-endian AArch64 ELF64 library", file));
+            }
+        }
+        println!("Android stand-in cross-link passed (AArch64 ELF64). Not run on a device; does not validate game boot or gameplay.");
+        return Ok(());
     }
     if !t.windows() {
         let o = Command::new("ldd")
@@ -273,5 +323,13 @@ mod tests {
         );
         assert!(parse(&["--lib".into()]).is_err());
         assert!(parse(&["--jobs".into(), "4".into()]).is_err());
+    }
+
+    #[test]
+    fn android_cross_link_requires_an_explicit_non_execution_mode() {
+        let args = ["--target", "android-arm64", "--link-only"].map(String::from);
+        assert!(parse(&args).is_ok());
+        let args = ["--target", "linux", "--link-only"].map(String::from);
+        assert!(parse(&args).is_err(), "desktop smoke checks must still execute the program");
     }
 }

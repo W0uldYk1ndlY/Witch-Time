@@ -45,6 +45,40 @@ pub fn find_clang(repo: &Path) -> String {
     which(&clang).unwrap_or(clang)
 }
 
+/// Android must use the NDK's sysroot, libc and linker, never a host LLVM installation.
+pub fn find_clang_for(repo: &Path, t: Target) -> Result<String, String> {
+    if !t.android() {
+        return Ok(find_clang(repo));
+    }
+    let ndk = std::env::var_os("ANDROID_NDK_HOME")
+        .or_else(|| std::env::var_os("ANDROID_NDK_ROOT"))
+        .filter(|v| !v.is_empty())
+        .ok_or("android-arm64 requires ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) pointing to Android NDK r28 or newer")?;
+    android_clang(Path::new(&ndk))
+}
+
+fn android_clang(ndk: &Path) -> Result<String, String> {
+    let host = if cfg!(windows) {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    };
+    let toolchain = ndk.join("toolchains/llvm/prebuilt").join(host);
+    let clang = toolchain.join("bin").join(target::exe("clang"));
+    if !target::is_program(&clang) || !toolchain.join("sysroot/usr/include/android").is_dir() {
+        return Err(format!(
+            "{} is not a usable Android NDK for {} (need bin/clang and the Android sysroot)",
+            ndk.display(),
+            host
+        ));
+    }
+    fs::canonicalize(&clang)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("{}: {}", clang.display(), e))
+}
+
 /// shutil.which
 pub fn which(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
@@ -372,6 +406,7 @@ fn compile_one(c: &Cfg, name: &str, env: &dyn Fn(&mut Command)) -> (Option<i32>,
         }
         let mut cmd = Command::new(&c.clang);
         env(&mut cmd);
+        c.target.configure_command(&mut cmd);
         cmd.args(["-c", OPT]).args(&c.flags).args(&extra).arg(&src).arg("-o").arg(&obj);
         let (code, out, secs) = run(&mut cmd, Some(TIME_LIMIT));
         total += secs;
@@ -386,6 +421,7 @@ fn compile_one(c: &Cfg, name: &str, env: &dyn Fn(&mut Command)) -> (Option<i32>,
     }
     let mut cmd = Command::new(&c.clang);
     env(&mut cmd);
+    c.target.configure_command(&mut cmd);
     cmd.args(["-c", "-O0"]).args(&c.flags).arg(&src).arg("-o").arg(&obj);
     let (code, out, secs) = run(&mut cmd, None);
     (code, out, total + secs, "WHOLE FILE -O0 (time limit hit 3x)".into())
@@ -394,7 +430,10 @@ fn compile_one(c: &Cfg, name: &str, env: &dyn Fn(&mut Command)) -> (Option<i32>,
 /// the lifted code's flags after `-c OPT`, without the target's and the header folders (check-freestanding uses them
 /// too). They are hashed into every player's object stamps: a change compiles every build again
 pub fn lifted_flags(t: Target) -> Vec<String> {
-    let mut flags: Vec<String> = ["-ffp-contract=off", "-w", "-fno-strict-aliasing", "-mcx16"].map(String::from).into();
+    let mut flags: Vec<String> = ["-ffp-contract=off", "-w", "-fno-strict-aliasing"].map(String::from).into();
+    if !t.android() {
+        flags.push("-mcx16".into());
+    }
     flags.extend(t.pic());
     flags.push(FORCE_INLINE.into());
     flags
@@ -417,7 +456,7 @@ pub fn run_step(repo: &str, clang: &str, t: Target, jobs: usize, env: &(dyn Fn(&
         target: t,
         clang: clang.to_string(),
         gen: gen.clone(),
-        obj: crate::layout::build(Path::new(repo)).join("obj"),
+        obj: t.build_dir(Path::new(repo)).join("obj"),
         flags,
         inc,
     };
@@ -562,9 +601,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn android_toolchain_does_not_fall_back_to_host_clang() {
+        let missing = std::env::temp_dir().join(format!("wt_missing_ndk_{}", std::process::id()));
+        assert!(android_clang(&missing).unwrap_err().contains("not a usable Android NDK"));
+    }
+
+    #[test]
+    fn android_lifted_flags_do_not_request_x86_instructions() {
+        let flags = lifted_flags(Target::AndroidArm64);
+        assert!(!flags.iter().any(|f| f == "-mcx16"));
+        assert!(flags.iter().any(|f| f == "-fPIC"));
+    }
+
+    #[test]
     fn lifted_flags_unchanged() {
         // these strings are in every player's _stamps.json hash
-        let linux = ["-ffp-contract=off", "-w", "-fno-strict-aliasing", "-mcx16", "-fPIC", "-Dinline=inline __attribute__((always_inline))"];
+        let linux = [
+            "-ffp-contract=off",
+            "-w",
+            "-fno-strict-aliasing",
+            "-mcx16",
+            "-fPIC",
+            "-Dinline=inline __attribute__((always_inline))",
+        ];
         assert_eq!(lifted_flags(Target::Linux), linux);
         assert_eq!(lifted_flags(Target::Windows), [&linux[..4], &linux[5..]].concat());
     }

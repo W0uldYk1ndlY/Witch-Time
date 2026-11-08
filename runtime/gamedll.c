@@ -5,18 +5,7 @@
  *     -Ddyn_syms=(*game_dyn_syms_p) -Ddyn_sym_count=(*game_dyn_sym_count_p)
  * so the tables declared in runtime.h become pointers into the DLL, filled in here before main(). */
 #include "runtime.h"
-
-typedef struct {
-    void (*call_indirect)(Ctx *, uint64_t);
-    void (*host_import)(Ctx *, int);
-    void (*guest_trap)(const char *, uint64_t);
-    void (*guest_unimpl)(uint64_t, uint32_t, const char *);
-    void (*guest_svc)(Ctx *, uint32_t);
-    void (*stx_diag)(Ctx *, uint64_t, uint64_t, uint64_t, uint64_t, int);
-    void (*sdk_dispatch)(Ctx *, uint64_t);           /* [witchtime] game_shim.c */
-    void (*sdk_host_call)(Ctx *, int);
-    void (*sdk_trap_call)(Ctx *, const char *);
-} GameHost;
+#include "game_host.h"
 
 typedef struct {
     const FnEntry *table;
@@ -41,6 +30,11 @@ const int *game_dyn_sym_count_p;
 
 __attribute__((constructor)) static void bind_game(void) {
     GameHost h = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag, sdk_dispatch, sdk_host_call, sdk_trap_call};
+#ifdef __ANDROID__
+    h.sdk_jmp_record = sdk_jmp_record;
+    h.sdk_jmp_restore = sdk_jmp_restore;
+    h.sdk_longjmp = sdk_longjmp;
+#endif
     GameTables t;
     game_bind(&h, &t);
     game_fn_table_p = (const FnEntry (*)[])t.table;

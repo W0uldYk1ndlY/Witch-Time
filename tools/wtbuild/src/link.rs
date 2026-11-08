@@ -91,6 +91,21 @@ const LIBS: &[&str] = &[
     "-lswresample",
     "-lavutil",
 ];
+/// Bionic provides pthreads in libc. The Android renderer is Vulkan-only and has no desktop OpenGL dependency.
+const ANDROID_LIBS: &[&str] = &[
+    "-lSDL3",
+    "-lavformat",
+    "-lavcodec",
+    "-lswscale",
+    "-lswresample",
+    "-lavutil",
+    "-lvulkan",
+    "-landroid",
+    "-llog",
+    "-ldl",
+    "-lm",
+    "-lc++_shared",
+];
 /// Windows: SDL3, FFmpeg (movies), and the system's libraries (Media Foundation for the
 /// album's clips, waveOut)
 const WIN_LIBS: &[&str] = &[
@@ -181,6 +196,7 @@ fn runtime_files(t: Target) -> &'static [&'static str] {
     match t {
         Target::Linux => &["libwitchtime.so", "witch-time-game", "libwt_glslang.so", "game_shim_eh.o"],
         Target::Windows => &["witch-time-game.exe", "wt_glslang.dll", "game_shim_eh.o", UCRT_IMPLIB],
+        Target::AndroidArm64 => &["libwitchtime.so", "libwt_glslang.so", "game_shim_eh.o"],
     }
 }
 pub const PREBUILT: &str = "prebuilt";
@@ -200,7 +216,10 @@ pub fn freestanding(repo: &Path) -> Vec<String> {
 
 /// the player's tables' flags after the target's, without the header folders (check-freestanding uses them too)
 pub fn table_flags(t: Target) -> Vec<String> {
-    let mut flags = strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing", "-mcx16"]);
+    let mut flags = strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing"]);
+    if !t.android() {
+        flags.push("-mcx16".into());
+    }
     if !t.windows() {
         flags.extend(strs(&["-fPIC", "-D__declspec(x)="]));
     }
@@ -246,6 +265,56 @@ pub fn sources_hash(repo: &Path) -> String {
     files_hash(repo, &source_files(repo))
 }
 
+/// NDK r28's clang predates #embed. Expand the repository's simple directives to the same byte initializers.
+/// Reject syntax we do not implement instead of silently changing embedded shader, font or artwork data.
+fn expand_embeds(source: &str, directory: &Path) -> Result<String, String> {
+    let mut output = String::new();
+    for line in source.split_inclusive('\n') {
+        let Some(rest) = line.trim_start().strip_prefix("#embed") else {
+            output.push_str(line);
+            continue;
+        };
+        let rest = rest.trim();
+        let filename = rest
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .filter(|s| !s.contains('"'))
+            .ok_or_else(|| format!("unsupported #embed directive in {}: {}", directory.display(), line.trim()))?;
+        let path = directory.join(filename);
+        let bytes = fs::read(&path).map_err(|e| format!("#embed {}: {}", path.display(), e))?;
+        for (i, byte) in bytes.iter().enumerate() {
+            if i != 0 {
+                output.push(',');
+                if i % 32 == 0 {
+                    output.push('\n');
+                }
+            }
+            output.push_str(&byte.to_string());
+        }
+        if line.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+/// Stage the runtime with compiler-independent embedded assets, leaving tracked sources untouched.
+fn android_runtime_sources(repo: &Path, out: &Path) -> Result<PathBuf, String> {
+    let staged = out.join("android_sources");
+    for relative in source_files(repo).iter().filter(|p| p.starts_with("runtime/")) {
+        let source = repo.join(relative);
+        let dest = staged.join(relative.strip_prefix("runtime/").unwrap());
+        fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
+        if matches!(source.extension().and_then(|s| s.to_str()), Some("c" | "h" | "inc" | "S")) {
+            let text = fs::read_to_string(&source).map_err(|e| format!("{}: {}", source.display(), e))?;
+            fs::write(&dest, expand_embeds(&text, source.parent().unwrap())?).map_err(|e| format!("{}: {}", dest.display(), e))?;
+        } else {
+            fs::copy(&source, &dest).map_err(|e| format!("{}: {}", source.display(), e))?;
+        }
+    }
+    Ok(staged)
+}
+
 struct Clang<'a> {
     path: &'a str,
     t: Target,
@@ -256,6 +325,7 @@ impl Clang<'_> {
     fn run(&self, args: &[String]) -> (Option<i32>, String, f64) {
         let mut c = Command::new(self.path);
         (self.env)(&mut c);
+        self.t.configure_command(&mut c);
         c.args(self.t.clang_flags());
         c.args(args);
         run(&mut c, None)
@@ -314,17 +384,27 @@ pub fn build_runtime(
     log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let cl = Clang { path: clang, t, env };
-    let rt = repo.join("runtime");
+    let rt = if t.android() {
+        android_runtime_sources(repo, objdir)?
+    } else {
+        repo.join("runtime")
+    };
     let stub = objdir.join("stub");
     fs::create_dir_all(&stub).map_err(|e| e.to_string())?;
     fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let android_deps = if t.android() { Some(android_dependencies()?) } else { None };
 
     // 1. the host runtime, with runtime/split in place of the player's tables
     let mut flags = Vec::new();
     if !t.windows() {
         flags.extend(["-I".to_string(), s(&rt.join("posix"))]);
     }
-    flags.extend(strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing", "-mcx16"]));
+    flags.extend(strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing"]));
+    if let Some(deps) = &android_deps {
+        flags.extend(["-DWT_VULKAN_ONLY=1".into(), "-I".into(), s(&deps.join("include"))]);
+    } else {
+        flags.push("-mcx16".into());
+    }
     if t.windows() {
         flags.push("-gcodeview".into()); // debug information in a PDB beside the program (crash addresses -> source)
     }
@@ -349,7 +429,10 @@ pub fn build_runtime(
         "-Werror=int-conversion",
     ]));
     let t0 = Instant::now();
-    let sources: Vec<&str> = HOST_SOURCES.iter().chain(if t.windows() { &[][..] } else { POSIX_SOURCES }).cloned().collect();
+    let mut sources: Vec<&str> = HOST_SOURCES.iter().chain(if t.windows() { &[][..] } else { POSIX_SOURCES }).cloned().collect();
+    if t.android() {
+        sources.push("posix/fiber_aarch64.S");
+    }
     let jobs: Vec<(PathBuf, PathBuf)> = sources
         .iter()
         .map(|n| (rt.join(n), objdir.join(format!("{}.obj", Path::new(n).file_stem().unwrap().to_string_lossy()))))
@@ -370,7 +453,10 @@ pub fn build_runtime(
 
     // 2. game.so's own part of the runtime: the calls back into the host, the landing-pad resume, host versions of
     // game functions (on Windows also game.dll's entry point: it is linked without the C runtime)
-    let mut a = strs(&["-c", "-O1", "-w", "-mcx16"]);
+    let mut a = strs(&["-c", "-O1", "-w"]);
+    if !t.android() {
+        a.push("-mcx16".into());
+    }
     a.extend(if t.windows() {
         strs(&["-DWT_GAME_NOSTDLIB"])
     } else {
@@ -385,6 +471,9 @@ pub fn build_runtime(
 
     if t.windows() {
         return build_runtime_windows(repo, &cl, &jobs, out, objdir, log);
+    }
+    if let Some(deps) = android_deps {
+        return build_runtime_android(repo, &cl, &jobs, out, &stub, &deps, log);
     }
 
     // 3. libwitchtime.so, needing game.so (beside it, rpath $ORIGIN), linked against an empty one of that name: the
@@ -445,6 +534,98 @@ pub fn build_runtime(
     if code != Some(0) {
         log(tail(&o, 3000).to_string());
         return Err("libwt_glslang.so did not build".into());
+    }
+    Ok(())
+}
+
+fn android_dependencies() -> Result<PathBuf, String> {
+    let path = std::env::var_os("WTBUILD_ANDROID_DEPS")
+        .filter(|p| !p.is_empty())
+        .ok_or("android-arm64 runtime requires WTBUILD_ANDROID_DEPS, the prefix containing Android arm64 SDL3, FFmpeg and glslang include/ and lib/")?;
+    let path = PathBuf::from(path);
+    if !path.join("include").is_dir() || !path.join("lib").is_dir() {
+        return Err(format!("{}: Android dependency prefix must contain include/ and lib/", path.display()));
+    }
+    fs::canonicalize(&path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// The link-only stand-in exports exactly the game symbols. It is never installed or packaged.
+/// Using a named stand-in permits --no-undefined on the real runtime, so missing platform functions fail here.
+fn android_game_standin() -> String {
+    let mut code = String::from("/* Link-only stand-in. Never distribute this as the game library. */\n");
+    for name in GAME_EXPORTS.0 {
+        code += &format!("void {}(void) {{}}\n", name);
+    }
+    for name in GAME_EXPORTS.1 {
+        code += &format!("unsigned long long {};\n", name);
+    }
+    code
+}
+
+fn build_runtime_android(
+    repo: &Path,
+    cl: &Clang,
+    jobs: &[(PathBuf, PathBuf)],
+    out: &Path,
+    stub: &Path,
+    deps: &Path,
+    log: &mut dyn FnMut(String),
+) -> Result<(), String> {
+    let rt = repo.join("runtime");
+    let standin = stub.join("game.c");
+    fs::write(&standin, android_game_standin()).map_err(|e| e.to_string())?;
+    let game = stub.join(cl.t.game_lib());
+    let mut args = strs(&["-shared", "-fPIC", "-nostdlib", "-fuse-ld=lld"]);
+    args.extend(cl.t.link_flags());
+    args.extend([format!("-Wl,-soname,{}", cl.t.game_lib()), s(&standin), "-o".into(), s(&game)]);
+    let (code, output, _) = cl.run(&args);
+    if code != Some(0) {
+        return Err(format!("the link-only Android game stand-in did not link:\n{}", tail(&output, 3000)));
+    }
+
+    let host = out.join("libwitchtime.so");
+    let mut args = strs(&["-shared", "-fuse-ld=lld", "-g", "-Wl,--no-undefined", "-Wl,-soname,libwitchtime.so"]);
+    args.extend(cl.t.link_flags());
+    args.extend(jobs.iter().map(|j| s(&j.1)));
+    args.extend([
+        "-Wl,--no-as-needed".into(),
+        s(&game),
+        "-Wl,--as-needed".into(),
+        format!("-L{}", deps.join("lib").display()),
+    ]);
+    args.extend(strs(ANDROID_LIBS));
+    args.extend(["-o".into(), s(&host)]);
+    let (code, output, _) = cl.run(&args);
+    log(format!("libwitchtime.so (Android): link exit {}", code.unwrap_or(-1)));
+    if code != Some(0) {
+        return Err(format!("Android libwitchtime.so did not link:\n{}", tail(&output, 8000)));
+    }
+
+    let shim = out.join("libwt_glslang.so");
+    let glslang = std::env::var("WTBUILD_GLSLANG_LIBS").unwrap_or_else(|_| GLSLANG_LIBS.into());
+    let mut args = strs(&[
+        "-shared",
+        "-fPIC",
+        "-fuse-ld=lld",
+        "-O2",
+        "-w",
+        "-D_GNU_SOURCE",
+        "-D__declspec(x)=",
+        "-Wl,--no-undefined",
+        "-Wl,-soname,libwt_glslang.so",
+    ]);
+    args.extend(cl.t.link_flags());
+    for dir in [rt.join("posix"), rt.clone(), deps.join("include")] {
+        args.extend(["-I".into(), s(&dir)]);
+    }
+    args.extend([s(&rt.join("vk_glslang_shim.c")), format!("-L{}", deps.join("lib").display())]);
+    args.extend(glslang.split_whitespace().map(String::from));
+    args.extend(strs(&["-lc++_shared", "-lm", "-ldl", "-Wl,--exclude-libs,ALL"]));
+    args.extend(["-o".into(), s(&shim)]);
+    let (code, output, _) = cl.run(&args);
+    log(format!("libwt_glslang.so (Android): link exit {}", code.unwrap_or(-1)));
+    if code != Some(0) {
+        return Err(format!("Android libwt_glslang.so did not link:\n{}", tail(&output, 5000)));
     }
     Ok(())
 }
@@ -548,7 +729,7 @@ fn link_game(
 ) -> Result<(), String> {
     let cl = Clang { path: clang, t, env };
     let rt = repo.join("runtime");
-    let build = crate::layout::build(repo);
+    let build = t.build_dir(repo);
     let (obj, objt) = (build.join("obj"), build.join("obj_tables"));
     fs::create_dir_all(&objt).map_err(|e| e.to_string())?;
 
@@ -595,7 +776,7 @@ fn link_game(
     let t0 = Instant::now();
     let mut a = strs(&["-shared", "-nostdlib", "-fuse-ld=lld"]);
     if !t.windows() {
-        a.extend(strs(&["-Xlinker", "-soname=game.so"]));
+        a.extend(["-Xlinker".into(), format!("-soname={}", t.game_lib())]);
     }
     a.push(s(shim));
     a.extend(jobs.iter().map(|j| s(&j.1)));
@@ -608,6 +789,11 @@ fn link_game(
     }
     let builtins = cl.builtins();
     a.extend(builtins.iter().cloned());
+    a.extend(t.link_flags());
+    if t.android() {
+        // Unlike desktop lazy/global resolution, Bionic needs declared libc dependencies in the game DSO.
+        a.extend(strs(&["-lc", "-lm", "-ldl", "-Wl,--no-undefined"]));
+    }
     a.extend(["-o".into(), s(&dll)]);
     let (code, out, _) = cl.run(&a);
     log(format!(
@@ -627,8 +813,16 @@ fn link_game(
 
 /// prebuilt/manifest.json of a release, when its runtime was built from these sources: (folder, its files)
 fn prebuilt(repo: &Path, t: Target, log: &mut dyn FnMut(String)) -> Option<(PathBuf, Vec<String>)> {
-    let dir = repo.join(PREBUILT);
+    let dir = if t.android() {
+        repo.join(PREBUILT).join(t.name())
+    } else {
+        repo.join(PREBUILT)
+    };
     let m: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).ok()?).ok()?;
+    if m.get("target").and_then(Value::as_str) != Some(t.name()) {
+        log(format!("{}: manifest target is not {}", dir.display(), t.name()));
+        return None;
+    }
     let files: Vec<String> = m.get("files")?.as_array()?.iter().filter_map(|v| v.as_str().map(String::from)).collect();
     // only the files the release had: one an older release left behind (an update unpacks over it) builds nothing (#114)
     let listed: Option<Vec<String>> = m.get("source_files").and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -716,7 +910,8 @@ fn link_input(f: &str) -> bool {
 }
 
 pub fn run_step(repo: &Path, clang: &str, t: Target, env: &(dyn Fn(&mut Command) + Sync), log: &mut dyn FnMut(String)) -> Result<(), String> {
-    let build = crate::layout::build(repo);
+    let build = t.build_dir(repo);
+    fs::create_dir_all(&build).map_err(|e| e.to_string())?;
     for e in fs::read_dir(build.join("old")).into_iter().flatten().flatten() {
         let _ = fs::remove_file(e.path()); // what make_way moved, once nothing holds it
     }
@@ -815,6 +1010,67 @@ pub fn pe_imports(b: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn android_game_callbacks_bind_and_reject_missing_slots() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let executable = std::env::temp_dir().join(format!("wt_android_game_bind_{}", std::process::id()));
+        let mut cc = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()));
+        cc.args(["-std=gnu11", "-O1"]);
+        if cfg!(target_arch = "x86_64") {
+            cc.arg("-mcx16");
+        }
+        let status = cc
+            .arg(root.join("testdata/android_game_bind_test.c"))
+            .arg("-lm")
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success(), "Android callback regression fixture must compile");
+        let status = Command::new(&executable).status().unwrap();
+        let _ = fs::remove_file(executable);
+        assert!(status.success(), "callbacks must use bound slots, and reject an incomplete binding");
+    }
+
+    #[test]
+    fn android_embed_expansion_preserves_exact_binary_bytes() {
+        let dir = std::env::temp_dir().join(format!("wt_embed_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("asset.bin"), [0, 1, 128, 255]).unwrap();
+        let source = "const unsigned char data[] = {\n#embed \"asset.bin\"\n};\n";
+        let expanded = expand_embeds(source, &dir).unwrap();
+        assert_eq!(expanded, "const unsigned char data[] = {\n0,1,128,255\n};\n");
+        assert!(expand_embeds("#embed \"missing.bin\"\n", &dir).is_err());
+        assert!(expand_embeds("#embed \"asset.bin\" limit(2)\n", &dir).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn android_table_flags_do_not_request_x86_instructions() {
+        let flags = table_flags(Target::AndroidArm64);
+        assert!(!flags.iter().any(|f| f == "-mcx16"));
+        assert!(flags.iter().any(|f| f == "-fPIC"));
+    }
+
+    #[test]
+    fn android_rejects_a_prebuilt_manifest_for_linux() {
+        let d = std::env::temp_dir().join(format!("wt_android_manifest_{}", std::process::id()));
+        let dir = d.join(PREBUILT).join("android-arm64");
+        fs::create_dir_all(&dir).unwrap();
+        let files = runtime_files(Target::AndroidArm64);
+        for file in files {
+            fs::write(dir.join(file), []).unwrap();
+        }
+        let manifest = json!({"target": "linux", "sources": sources_hash(&d), "files": files});
+        fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        assert!(prebuilt(&d, Target::AndroidArm64, &mut |_| {}).is_none());
+        let manifest = json!({"target": "android-arm64", "sources": sources_hash(&d), "files": files});
+        fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        assert!(prebuilt(&d, Target::AndroidArm64, &mut |_| {}).is_some());
+        fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn table_flags_unchanged() {

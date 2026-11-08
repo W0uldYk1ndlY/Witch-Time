@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <malloc.h>
 #include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 /* L1 round 3, TEST ONLY: guest sync calls during the WT_L1_TRACE window (display.c) */
@@ -438,7 +439,7 @@ static void mtx_lock(Ctx *c) {
 static void mtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); }
 static void mtx_trylock(Ctx *c) { RET(TryEnterCriticalSection(&obj(A0)->cs) ? 1 : 0); }
 /* hitch.c (WT_HITCH): host thread id that owns the guest mutex `key` now, 0 = nobody. Diagnostics only. */
-DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs.OwningThread : 0; }
+DWORD os_mutex_owner(uint64_t key) { return key ? plat_mutex_owner(&obj(key)->cs) : 0; }
 static void pmtx_lock(Ctx *c) { EnterCriticalSection(&obj(A0)->cs); RET(0); }
 static void pmtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); RET(0); }
 

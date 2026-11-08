@@ -1,0 +1,24 @@
+plugins { id 'com.android.application' }
+def sdlSource = providers.environmentVariable('WT_SDL_SOURCE').orNull
+def nativePrefix = providers.environmentVariable('WTBUILD_ANDROID_DEPS').orNull
+if (!sdlSource || !nativePrefix) throw new GradleException('Set WT_SDL_SOURCE to SDL 3 source and WTBUILD_ANDROID_DEPS to the Android dependency prefix.')
+android {
+    namespace 'org.witchtime.android'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+    defaultConfig {
+        applicationId 'org.witchtime.android'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '0.1-android-experimental'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild { cmake { arguments "-DWT_ANDROID_DEPS=${nativePrefix}" } }
+    }
+    sourceSets.main {
+        java.srcDir "${sdlSource}/android-project/app/src/main/java"
+        jniLibs.srcDirs = ['src/main/jniLibs']
+    }
+    externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+    packaging { jniLibs { useLegacyPackaging = true } }
+}

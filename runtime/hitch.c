@@ -146,7 +146,7 @@ static DWORD WINAPI watchdog(LPVOID arg) {
         if (blocked_scan && (strstr(imp, "mutex") || strstr(imp, "Mutex"))) {      /* round 3: who owns the mutex, and what is the owner inside? */
             DWORD owner = os_mutex_owner(c->x[0]);
             int found = 0;
-            for (int i = 0; owner && i < 256; i++) {
+            for (int i = 0; owner && owner != UINT32_MAX && i < 256; i++) {
                 Ctx *tc; const char *name; HANDLE h;
                 if (!guest_thread_info(i, &tc, &name, &h)) break;
                 if (!h || GetThreadId(h) != owner) continue;
@@ -156,7 +156,8 @@ static DWORD WINAPI watchdog(LPVOID arg) {
                 bucket_add(key, dt); found = 1;
                 break;
             }
-            if (!found) { snprintf(key, sizeof key, "  (owner of mutex %llx) host thread %lu%s", (unsigned long long)c->x[0], (unsigned long)owner, owner ? " (not a guest thread)" : " (no owner at the sample)"); bucket_add(key, dt); }
+            if (owner == UINT32_MAX) { snprintf(key, sizeof key, "  (owner of mutex %llx) unavailable on this platform", (unsigned long long)c->x[0]); bucket_add(key, dt); }
+            else if (!found) { snprintf(key, sizeof key, "  (owner of mutex %llx) host thread %lu%s", (unsigned long long)c->x[0], (unsigned long)owner, owner ? " (not a guest thread)" : " (no owner at the sample)"); bucket_add(key, dt); }
         }
         if (blocked_scan) {                       /* who ran while the main thread stood still? */
             for (int i = 0; i < 256; i++) {

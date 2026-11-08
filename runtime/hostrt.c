@@ -506,7 +506,7 @@ void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
 void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
 
 #ifndef _WIN32
-#include <execinfo.h>
+#include "posix/stacktrace.h"
 #include <signal.h>
 /* Linux: the same report from a signal handler, on a stack of its own (a guest stack overflow lands here too) */
 static void crash_signal(int sig, siginfo_t *si, void *uc) {
@@ -515,7 +515,7 @@ static void crash_signal(int sig, siginfo_t *si, void *uc) {
     dump_guest_registers();
     printf("guest call stack (innermost first):\n");
     void *pcs[400];
-    int n = backtrace(pcs, 400);
+    int n = plat_backtrace(pcs, 400);
     uint64_t last = 0;
     for (int i = 0, shown = 0; i < n && shown < 40; i++) {
         uint64_t g = guest_function_of((uint64_t)(uintptr_t)pcs[i]);

@@ -148,6 +148,52 @@ program imports (its PE import table) against `build\`, `prebuilt\` and System32
 runs the smoke test there, or on Linux under Wine; `wtbuild check-freestanding --target windows` checks the freestanding
 headers against mingw-w64's.
 
+## Android arm64 cross-build (experimental)
+
+The Android target is native AArch64/Bionic with a Vulkan-only renderer, minimum Android API 29.
+It is a developer cross-build target, not a claim that Bayonetta 3 has been tested on a phone.
+Build the **host** wtbuild with Cargo as above; do not compile the Rust tool itself for Android.
+
+Set `ANDROID_NDK_HOME` (or `ANDROID_NDK_ROOT`) to Android NDK r28 or newer. Android builds never fall back to
+the desktop compiler. For the runtime, set `WTBUILD_ANDROID_DEPS` to an Android arm64 dependency prefix with
+`include/` and `lib/` containing SDL3 3.4.18 or newer, FFmpeg, glslang and Vulkan headers. See
+`scripts/android-deps.sh` for the pinned dependency build. Desktop `CPATH` and `LIBRARY_PATH` are deliberately
+ignored for Android; dependencies must be passed through this prefix.
+
+```
+export ANDROID_NDK_HOME=/path/to/android-ndk-r28c
+export WTBUILD_ANDROID_DEPS="$PWD/deps/android-arm64"
+export WTBUILD_GLSLANG_LIBS='-Wl,--start-group -lglslang -lglslang-default-resource-limits -Wl,--end-group'
+tools/wtbuild/target/release/wtbuild runtime --target android-arm64 --out prebuilt/android-arm64
+tools/wtbuild/target/release/wtbuild check-freestanding --target android-arm64 --words 60000 --jobs 4
+tools/wtbuild/target/release/wtbuild smoke --target android-arm64 --link-only --prebuilt prebuilt/android-arm64
+```
+
+The runtime build creates `libwitchtime.so`, `libwt_glslang.so` and `game_shim_eh.o`, plus a source/target manifest.
+There is no desktop executable. Every Android shared object linked by wtbuild uses 16 KB load-segment alignment.
+The NDK r28 compiler lacks `#embed`, so wtbuild stages an expanded copy of the runtime in its object folder,
+preserving each embedded shader, font and bitmap byte and leaving the checkout untouched.
+
+The `--link-only` smoke check converts, lifts, compiles and links the committed synthetic modules, checks that
+the result is AArch64 ELF64, then removes its temporary files. It does **not** execute the game or validate
+Vulkan support, loading on a device, performance, saves, or gameplay. Synthetic game libraries are never installed
+in `build/android-arm64` or `prebuilt/android-arm64`.
+
+For your own dump, the target-independent `nso2elf`, `tables` and `lift` steps still produce the usual
+`targets/`, `runtime/gen/` and `build/gen_eh/` inputs. Once those inputs exist:
+
+```
+tools/wtbuild/target/release/wtbuild compile --target android-arm64 --jobs 4
+tools/wtbuild/target/release/wtbuild link --target android-arm64
+```
+
+Objects and native output are isolated in `build/android-arm64/` (`--program 1` uses
+`build/program1/android-arm64/`). The game library is `libgame.so`, with the same Android SONAME, so it can be
+packaged as an APK native library. Android prebuilt manifests live in `prebuilt/android-arm64/` and must match
+the target and runtime sources. The desktop `setup` and launcher workflows do not yet support Android; they
+must not be used with an assumed `setup --target android-arm64` option. Package and test using `android/` and
+`scripts/android-package.sh` after building your own game library. Do not share dump-derived files or APKs.
+
 ## Regression tests
 
 `cargo test --release --manifest-path tools/wtbuild/Cargo.toml` needs no dump; CI runs it on Linux

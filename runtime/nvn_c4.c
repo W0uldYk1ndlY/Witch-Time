@@ -31,7 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-#include <GL/gl.h>
+#include "nvn_gl_api.h"
 #include "nvn_c4.h"
 
 /* AArch64 conversions used by the encoder */
