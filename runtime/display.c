@@ -449,18 +449,68 @@ int display_window_apply(void) { return 0; }      /* [witchtime] Windows: the PC
  * events into the same queue (test aid, kbm_script_thread). */
 #include <SDL3/SDL.h>
 #include "nnpad.h"
+#ifdef __ANDROID__
+/* SDLActivity calls SDL_main on SDL's native main thread. Video creation and
+ * event pumping stay there; the guest bootstrap runs separately and requests
+ * its window through display_init. Lifecycle events must be handled by a
+ * filter: SDL blocks its pump immediately after queuing background events. */
+static int g_android_requested, g_android_finished, g_android_result;
+static int g_android_background, g_android_generation;
+static int g_android_argc;
+static char **g_android_argv;
+static int g_android_pw, g_android_ph;
+static bool SDLCALL android_lifecycle(void *unused, SDL_Event *event) {
+    (void)unused;
+    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND)
+        __atomic_store_n(&g_android_background, 1, __ATOMIC_RELEASE);
+    if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        __atomic_add_fetch(&g_android_generation, 1, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&g_android_background, 0, __ATOMIC_RELEASE);
+    }
+    if (event->type == SDL_EVENT_TERMINATING) {
+        extern volatile LONG g_display_close;
+        InterlockedExchange(&g_display_close, 1);
+        __atomic_store_n(&g_android_background, 0, __ATOMIC_RELEASE);
+    }
+    return true;
+}
+/* Render thread. A new generation means ANativeWindow may have changed. */
+int display_android_wait_foreground(void) {
+    while (__atomic_load_n(&g_android_background, __ATOMIC_ACQUIRE)) Sleep(20);
+    return __atomic_load_n(&g_android_generation, __ATOMIC_ACQUIRE);
+}
+static DWORD WINAPI android_guest_main(LPVOID unused) {
+    (void)unused;
+    int wt_host_main(int, char **);
+    g_android_result = wt_host_main(g_android_argc, g_android_argv);
+    __atomic_store_n(&g_android_finished, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+#endif
 static int g_kbm_test;                       /* WT_KBM_SCRIPT set: the window counts as focused (a hidden test window never gets the focus) */
 static int has_focus(SDL_Window *w) { return g_kbm_test || (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS); }
 BOOL GetClientRect(HWND h, RECT *r) {
     int w = 0, hh = 0;
     memset(r, 0, sizeof *r);
-    if (!h || !SDL_GetWindowSizeInPixels((SDL_Window *)h, &w, &hh)) return FALSE;   /* pixels: what the swapchain needs */
+#ifdef __ANDROID__
+    if (!h) return FALSE;
+    w = __atomic_load_n(&g_android_pw, __ATOMIC_ACQUIRE);
+    hh = __atomic_load_n(&g_android_ph, __ATOMIC_ACQUIRE);
+#else
+    if (!h || !SDL_GetWindowSizeInPixels((SDL_Window *)h, &w, &hh)) return FALSE;
+#endif   /* pixels: what the swapchain needs */
     r->right = w; r->bottom = hh;
     return TRUE;
 }
 BOOL IsIconic(HWND h) { return h && (SDL_GetWindowFlags((SDL_Window *)h) & SDL_WINDOW_MINIMIZED) != 0; }
 int GetWindowTextA(HWND h, LPSTR out, int n) { const char *t = h ? SDL_GetWindowTitle((SDL_Window *)h) : ""; snprintf(out, (size_t)n, "%s", t ? t : ""); return (int)strlen(out); }
-BOOL SetWindowTextA(HWND h, LPCSTR t) { return h && SDL_SetWindowTitle((SDL_Window *)h, t); }
+BOOL SetWindowTextA(HWND h, LPCSTR t) {
+#ifdef __ANDROID__
+    (void)t; return h != NULL; /* Android has no desktop title bar. */
+#else
+    return h && SDL_SetWindowTitle((SDL_Window *)h, t);
+#endif
+}
 /* focus: the game window is "the foreground window" while it has the keyboard focus (nnhid.c, nnmisc.c focus rules) */
 HWND GetForegroundWindow(void) { return g_hwnd && has_focus((SDL_Window *)g_hwnd) ? g_hwnd : NULL; }
 DWORD GetWindowThreadProcessId(HWND h, DWORD *pid) { if (!h || h != g_hwnd) return 0; if (pid) *pid = GetCurrentProcessId(); return 1; }
@@ -635,12 +685,27 @@ static DWORD WINAPI window_thread(LPVOID arg) {
         gfx_aspect_window(dm ? dm->w : pw, dm ? dm->h : ph);
     }
     g_hwnd = (HWND)w;
+#ifdef __ANDROID__
+    __atomic_store_n(&g_android_pw, pw, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_android_ph, ph, __ATOMIC_RELEASE);
+#endif
     InterlockedExchange(&g_ready, 1);
     { const char *ks = getenv("WT_KBM_SCRIPT"); if (ks && ks[0]) { g_kbm_test = 1; CreateThread(NULL, 0, kbm_script_thread, (LPVOID)ks, 0, NULL); } }
     float fx = 0, fy = 0;
     for (;;) {
         SDL_Event e;
+#ifdef __ANDROID__
+        if (__atomic_load_n(&g_android_finished, __ATOMIC_ACQUIRE)) break;
+#endif
         int got = SDL_WaitEventTimeout(&e, 20);
+#ifdef __ANDROID__
+        if (got && (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_DID_ENTER_FOREGROUND)) {
+            SDL_GetWindowSizeInPixels(w, &pw, &ph);
+            __atomic_store_n(&g_android_pw, pw, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_android_ph, ph, __ATOMIC_RELEASE);
+            gfx_aspect_window(pw, ph);
+        }
+#endif
         sdl_mouse_update(w);                         /* also when display_mouse_want changed (nnhid.c, any thread) */
         if (!got) continue;
         if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && e.key.scancode < SDL_SCANCODE_COUNT) g_keys[e.key.scancode] = e.key.down;
@@ -672,6 +737,22 @@ static DWORD WINAPI window_thread(LPVOID arg) {
         }
     }
     return 0;
+}
+#endif
+
+#ifdef __ANDROID__
+/* Exported to the Android SDL_main launcher. */
+int display_android_run(int argc, char **argv) {
+    g_android_argc = argc; g_android_argv = argv;
+    SDL_SetEventFilter(android_lifecycle, NULL);
+    HANDLE guest = CreateThread(NULL, 16 << 20, android_guest_main, NULL, 0, NULL);
+    if (!guest) { fprintf(stderr, "display: could not start Android guest bootstrap\n"); return 5; }
+    while (!__atomic_load_n(&g_android_requested, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&g_android_finished, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    if (!__atomic_load_n(&g_android_finished, __ATOMIC_ACQUIRE)) window_thread(NULL);
+    WaitForSingleObject(guest, INFINITE); CloseHandle(guest);
+    SDL_SetEventFilter(NULL, NULL);
+    return g_android_result;
 }
 #endif
 
@@ -848,8 +929,12 @@ void display_init(void) {
      * WT_TIMER_PERIOD=<ms> (default 1; 0 = leave the system default). */
     { const char *e = getenv("WT_TIMER_PERIOD"); int ms = e ? atoi(e) : 1; if (ms > 0) { MMRESULT r = timeBeginPeriod((UINT)ms); printf("display: system timer period %d ms requested (%s)%c", ms, r == TIMERR_NOERROR ? "ok" : "refused", 10); } }
     hitch_init();
+#ifdef __ANDROID__
+    __atomic_store_n(&g_android_requested, 1, __ATOMIC_RELEASE);
+#else
     CreateThread(NULL, 0, window_thread, NULL, 0, NULL);
-    while (!g_ready) Sleep(1);
+#endif
+    while (!InterlockedCompareExchange(&g_ready, 0, 0)) Sleep(1);
     nvn_gl_start(g_hwnd);
     speed_init();
     if (!g_lockstep && !old_pacing()) CreateThread(NULL, 0, vblank_thread, NULL, 0, NULL);      /* session 14: the display's vblanks, timed */

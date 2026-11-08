@@ -42,7 +42,7 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>
-#include <GL/gl.h>
+#include "nvn_gl_api.h"
 #include "runtime.h"
 #include "hostrt.h"
 #include "mx_translate.h"
@@ -89,8 +89,13 @@ void nvn_vk_flush(int finish);
 void nvn_vk_shutdown(void);
 void nvn_vk_missing(const char *what);
 void nvn_vk_report(FILE *out);
+#ifdef WT_VULKAN_ONLY
+static const int g_vk = 1;
+const RBackend *g_rb = &rb_vk;
+#else
 static int g_vk;
 const RBackend *g_rb = &rb_gl;                 /* seam step S2: chosen once in nvn_gl_start (WT_RENDERER) */
+#endif
 static void vk_shutdown_at_exit(void);
 
 /* ---------------------------------------------------------------- OpenGL beyond 1.1 */
@@ -3994,6 +3999,9 @@ static void render_loop(void) {
             LeaveCriticalSection(&g_job_lock);
             if (!j) { nvn_front_done_moved(); break; }      /* finding 138: a game thread waiting for a fence takes the job now */
             HANDLE done = j->done;
+#ifdef __ANDROID__
+            { void nvn_vk_android_resume(void); nvn_vk_android_resume(); }
+#endif
             if (g_rb->idle) g_rb->idle();
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
             j->t0 = pf_now();                    /* finding 138 */
@@ -4116,7 +4124,12 @@ void nvn_gl_start(void *hwnd) {
         const char *e = getenv("WT_RENDERER");
         if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: WT_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); ExitProcess(5); }
         /* Track V session 4: VULKAN IS THE DEFAULT. WT_RENDERER=gl|vk wins; else renderer = vulkan | opengl of config\graphics.ini. */
+#ifdef WT_VULKAN_ONLY
+        if (e && !strcmp(e, "gl")) nvn_gl_unavailable("WT_RENDERER=gl");
+        if (gfx_options()->renderer) printf("nvn: graphics.ini requested OpenGL; this build uses Vulkan only\n");
+#else
         g_vk = e && e[0] ? !strcmp(e, "vk") : !gfx_options()->renderer;
+#endif
         g_rb = g_vk ? &rb_vk : &rb_gl;
         printf("nvn: renderer: %s (%s)\n", g_vk ? "Vulkan (nvn_vk.c)" : "OpenGL (nvn_gl.c)", e && e[0] ? "WT_RENDERER" : "graphics.ini; the default is Vulkan");
     }

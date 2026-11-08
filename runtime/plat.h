@@ -15,6 +15,8 @@ enum { PLAT_NONE, PLAT_RO, PLAT_RW };
 #ifdef _WIN32
 #include <windows.h>
 
+static inline DWORD plat_mutex_owner(const CRITICAL_SECTION *cs) { return (DWORD)(uintptr_t)cs->OwningThread; }
+
 /* rw memory at exactly addr (NULL when it cannot be mapped there) */
 static inline void *plat_map_fixed(uint64_t addr, size_t size) {
     void *p = VirtualAlloc((void *)(uintptr_t)addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -148,6 +150,15 @@ void GetSystemTimeAsFileTime(FILETIME *ft);
 
 /* critical sections (recursive, as on Windows) and condition variables */
 typedef pthread_mutex_t CRITICAL_SECTION;
+/* Diagnostics only: UINT32_MAX means unavailable, never an unlocked mutex. */
+static inline DWORD plat_mutex_owner(const CRITICAL_SECTION *cs) {
+#if defined(__GLIBC__) && !defined(__ANDROID__)
+    return (DWORD)cs->__data.__owner;
+#else
+    (void)cs;
+    return UINT32_MAX;  /* Bionic and other opaque pthread mutex implementations */
+#endif
+}
 typedef pthread_cond_t CONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT PTHREAD_COND_INITIALIZER
 void InitializeCriticalSection(CRITICAL_SECTION *cs);
@@ -165,7 +176,7 @@ typedef struct { volatile int done; } INIT_ONCE;
 typedef INIT_ONCE *PINIT_ONCE;
 BOOL InitOnceExecuteOnce(INIT_ONCE *once, BOOL (*fn)(INIT_ONCE *, PVOID, PVOID *), PVOID param, PVOID *ctx);
 
-/* fiber-local storage (destructor at thread exit) and fibers (ucontext) */
+/* fiber-local storage (destructor at thread exit) and cooperative fibers */
 #define FLS_OUT_OF_INDEXES 0xFFFFFFFFu
 DWORD FlsAlloc(void (*dtor)(PVOID));
 #define FlsSetValue(k, v) (pthread_setspecific((pthread_key_t)(k), (v)) == 0)
@@ -391,7 +402,13 @@ static inline int plat_protect(void *p, size_t size, int prot) {
 #define InterlockedCompareExchange(p, x, c)        plat_cas_((p), (x), (c))
 #define InterlockedCompareExchange64(p, x, c)      plat_cas_((p), (x), (c))
 #define InterlockedCompareExchangePointer(p, x, c) plat_cas_((p), (x), (c))
+#if defined(__aarch64__) || defined(__arm__)
+#define YieldProcessor() __asm__ volatile("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
 #define YieldProcessor() __builtin_ia32_pause()
+#else
+#define YieldProcessor() __asm__ volatile("" ::: "memory")
+#endif
 
 /* SRW locks: a mutex, because SleepConditionVariableSRW waits on them (a pthread condvar needs a mutex); shared
  * acquisitions are exclusive, which is stricter and so still correct */

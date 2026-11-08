@@ -125,6 +125,9 @@ static struct {
     VkSemaphore acquired, rendered;
     VkFence fence;
     int fence_pending, alive, validate;
+#ifdef __ANDROID__
+    int android_surface_lost;
+#endif
     VkSurfaceFormatKHR hdr10, scrgb;      /* [Recomps#1] finding 147: the HDR swapchains the surface offers (format 0 = none) */
     int hdr;                              /* the swapchain's output: 0 SDR (format), 1 HDR10, 2 scRGB (nvn_vk_draw.c hdr_*) */
     VkImageView views[16];                /* HDR: the swapchain images' views (the HDR pass draws into them) */
@@ -154,6 +157,9 @@ static void vk_fatal(const char *what, VkResult r) {
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */
 static int vk_ok(const char *what, VkResult r) {
     if (r == VK_SUCCESS) return 1;
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) V.android_surface_lost = 1;
+#endif
     if (InterlockedIncrement64(&g_vk_errors) <= 20) { printf("nvn_vk: %s: %s\n", what, vk_result_name(r)); fflush(stdout); }
     return 0;
 }
@@ -211,6 +217,52 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
     return 0;
 }
 
+#ifdef __ANDROID__
+#include <SDL3/SDL_timer.h>
+void nvn_vk_android_resume(void);
+/* Java may release ANativeWindow before SDL delivers its background event.
+ * A failed SDL surface create is therefore not proof of a broken driver.
+ * Startup waits on the render thread (SDL's event thread remains free);
+ * resume makes one attempt and lets later jobs retry if the window is absent. */
+static int android_surface_create(int wait) {
+    int display_android_wait_foreground(void);
+    extern volatile LONG g_display_close;
+    static int reported, failed, failure_generation;
+    static Uint64 failure_since;
+    do {
+        if (InterlockedCompareExchange(&g_display_close, 0, 0)) return 0;
+        int generation = display_android_wait_foreground();
+        if (InterlockedCompareExchange(&g_display_close, 0, 0)) return 0;
+        void *native = SDL_GetPointerProperty(SDL_GetWindowProperties((SDL_Window *)V.hwnd),
+                                             SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+        if (!native || generation != failure_generation) failed = 0;
+        failure_generation = generation;
+        if (native && SDL_Vulkan_CreateSurface((SDL_Window *)V.hwnd, V.instance, NULL, &V.surface)) {
+            V.android_surface_lost = 0; reported = failed = 0; return 1;
+        }
+        V.surface = VK_NULL_HANDLE; V.android_surface_lost = 1;
+        /* Missing windows/background transitions may wait indefinitely. A live
+         * foreground window repeatedly failing (OOM, extension, in-use, etc.)
+         * must report the driver error instead of hiding it in an endless retry.
+         * The same timer spans non-blocking resume calls. */
+        if (native) {
+            Uint64 now = SDL_GetTicks();
+            if (!failed) { failed = 1; failure_since = now; }
+            else if (now - failure_since >= 5000) {
+                char why[512];
+                snprintf(why, sizeof why, "Android surface creation failed for 5 seconds in foreground: %s", SDL_GetError());
+                vk_fatal(why, VK_ERROR_INITIALIZATION_FAILED);
+            }
+        }
+        if (!reported) {
+            printf("nvn_vk: waiting to create Android surface: %s\n", native ? SDL_GetError() : "native window unavailable");
+            fflush(stdout); reported = 1;
+        }
+        Sleep(20); /* Avoid a busy retry while Java and SDL catch up. */
+    } while (wait);
+    return 0;
+}
+#endif
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
 static int hdr_mode_want(void);                          /* nvn_vk_draw.c, finding 147: 0 SDR, 1 HDR10, 2 scRGB */
@@ -226,8 +278,14 @@ static void swapchain_destroy(void) {
 /* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface). */
 static int g_sc_src;                                  /* [witchtime] the swapchain images can be read (TRANSFER_SRC): WT_PCMENU_SHOT */
 static int swapchain_create(void) {
+#ifdef __ANDROID__
+    if (!V.surface || V.android_surface_lost) return 0;
+#endif
     VkSurfaceCapabilitiesKHR caps;
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) { V.android_surface_lost = 1; return 0; }
+#endif
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
@@ -252,10 +310,19 @@ static int swapchain_create(void) {
     g_sc_src = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
-    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    /* Android surfaces need not advertise OPAQUE. Pick only a supported mode. */
+    ci.compositeAlpha = (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & (0u - caps.supportedCompositeAlpha));
+    if (!ci.compositeAlpha) vk_fatal("surface has no supported composite alpha mode", VK_ERROR_INITIALIZATION_FAILED);
     ci.presentMode = V.mode;
     ci.clipped = VK_TRUE;
     r = vkCreateSwapchainKHR(V.device, &ci, NULL, &V.swapchain);
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) {
+        V.swapchain = VK_NULL_HANDLE;
+        if (r == VK_ERROR_SURFACE_LOST_KHR) V.android_surface_lost = 1;
+        return 0;
+    }
+#endif
     if (r != VK_SUCCESS) vk_fatal("vkCreateSwapchainKHR", r);
     V.image_count = 16;
     r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.images);
@@ -304,7 +371,7 @@ static void present_mode_pick(void) {
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
-    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
+    if (!p) { printf("nvn_vk: the Vulkan loader does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
 
@@ -316,7 +383,7 @@ int nvn_vk_init(void *hwnd) {
     VkResult r;
     V.hwnd = hwnd;
     V.loader = LoadLibraryA("vulkan-1.dll");
-    if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+    if (!V.loader) { printf("nvn_vk: the Vulkan loader cannot be loaded (error %lu): no usable Vulkan driver\n", (unsigned long)GetLastError()); fflush(stdout); ExitProcess(5); }
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
@@ -385,6 +452,8 @@ int nvn_vk_init(void *hwnd) {
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
     r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
     if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+#elif defined(__ANDROID__)
+    if (!android_surface_create(1)) ExitProcess(0); /* User closed during startup. */
 #else
     if (!SDL_Vulkan_CreateSurface((SDL_Window *)hwnd, V.instance, NULL, &V.surface)) { printf("nvn_vk: SDL_Vulkan_CreateSurface: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
 #endif

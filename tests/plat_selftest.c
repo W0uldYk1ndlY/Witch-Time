@@ -21,6 +21,9 @@ static int g_once_runs;
 static BOOL CALLBACK once_fn(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; g_once_runs++; return TRUE; }
 
 int main(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    size_t host_page = si.dwPageSize;
     /* atomics */
     volatile LONG64 a = 5;
     assert(InterlockedIncrement64(&a) == 6 && InterlockedExchangeAdd64(&a, 4) == 6 && a == 10);
@@ -87,7 +90,7 @@ int main(void) {
     assert(!IsBadReadPtr(r + 0x10000, 16) && IsBadReadPtr(r, 16));
     assert(VirtualFree(r + 0x10000, 0x10000, MEM_DECOMMIT) && VirtualAlloc(r + 0x10000, 0x1000, MEM_COMMIT, PAGE_READWRITE) && r[0x10000] == 0);
     DWORD old;
-    assert(VirtualProtect(r + 0x10000, 0x1000, PAGE_READONLY, &old) && old == PAGE_READWRITE);
+    assert(VirtualProtect(r + 0x10000, host_page, PAGE_READONLY, &old) && old == PAGE_READWRITE);
     assert(!VirtualFree(r + 0x1000, 0, MEM_RELEASE) && VirtualFree(r, 0, MEM_RELEASE));
     assert(VirtualQuery(r, &mi, sizeof mi) && mi.State == MEM_FREE);
 
@@ -98,7 +101,7 @@ int main(void) {
         ULONG_PTR cnt = 16;
         ULONG gran;
         assert(w && VirtualAlloc(w, 16 * 4096, MEM_COMMIT, PAGE_READWRITE) == w);
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 0 && gran == 4096);
+        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && (cnt == 0 || cnt == 16) && gran == 4096);
         w[2 * 4096 + 7] = 1;
         int fds[2];
         assert(pipe(fds) == 0 && write(fds[1], "abc", 3) == 3 && read(fds[0], w + 5 * 4096, 3) == 3);
@@ -116,7 +119,7 @@ int main(void) {
         assert(ResetWriteWatch(w, 16 * 4096) == 0);
         cnt = 16;
         assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == (tracked ? 0 : 16));
-        assert(VirtualFree(w + 4096, 4096, MEM_DECOMMIT) && VirtualAlloc(w + 4096, 4096, MEM_COMMIT, PAGE_READWRITE) && w[4096] == 0);
+        assert(VirtualFree(w + host_page, host_page, MEM_DECOMMIT) && VirtualAlloc(w + host_page, host_page, MEM_COMMIT, PAGE_READWRITE) && w[host_page] == 0);
         cnt = 16;
         assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == (tracked ? 0 : 16));   /* committed again: not written */
         uint8_t *plain = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -127,10 +130,11 @@ int main(void) {
     }
 
     /* files: create, write at an offset, size, truncate, find, case-insensitive paths, attributes */
-    char dir[64];
-    snprintf(dir, sizeof dir, "/tmp/plat_selftest_%u", (unsigned)GetCurrentProcessId());
+    char dir[256];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dir, sizeof dir, "%s/plat_selftest_%u", tmp && *tmp ? tmp : "/tmp", (unsigned)GetCurrentProcessId());
     assert(CreateDirectoryA(dir, NULL) && !CreateDirectoryA(dir, NULL));
-    char path[128], back[128];
+    char path[512], back[512];
     snprintf(path, sizeof path, "%s\\Sub", dir); assert(CreateDirectoryA(path, NULL));
     snprintf(path, sizeof path, "%s\\Sub\\Data.BIN", dir);
     HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);

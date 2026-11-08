@@ -104,3 +104,7 @@ Lifter, runtime and build scripts come from B2recomp (K0NL), which builds on
 
 The logo's lettering is set in [Cinzel Decorative](https://fonts.google.com/specimen/Cinzel+Decorative) by Natanael
 Gama (SIL Open Font License 1.1), converted to outlines; the font file itself is not included.
+
+## Experimental Android ARM64 branch
+
+This branch adds an NDK/SDL3/Vulkan Android build path. See [Android build and device validation](android/README.md). It is not a claim of playable support on any phone: the personal game build, GPU capability checks, and real device tests remain necessary. No game files are included.

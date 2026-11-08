@@ -136,10 +136,15 @@ static const char *wd_tname(DWORD tid, char *buf, size_t n) {
     return "host thread";
 }
 static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
+#ifdef __ANDROID__
+    (void)cs;
+    wdp("  lock %s: owner diagnostics unavailable on Android (Bionic mutex internals are private)\n", name);
+#else
     char tb[48];
     DWORD o = (DWORD)(uintptr_t)cs->OwningThread;
     if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld, lock count %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->RecursionCount, (long)cs->LockCount);
     else wdp("  lock %s: free\n", name);
+#endif
 }
 unsigned long nvn_front_present_tid(void);         /* nvn_gl.c */
 static void wd_dump(double stall_s, LONG64 tries_since) {

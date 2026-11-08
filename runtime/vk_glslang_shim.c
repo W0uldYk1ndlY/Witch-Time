@@ -15,8 +15,18 @@
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
 
+#ifdef _WIN32
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK init_once(PINIT_ONCE once, PVOID arg, PVOID *ctx) { (void)once; (void)arg; (void)ctx; return glslang_initialize_process() != 0; }
+static int ensure_init(void) { return InitOnceExecuteOnce(&g_once, init_once, NULL, NULL); }
+#else
+/* This is a separately loaded DSO: do not depend on the runtime's Win32 shim
+ * being exported globally (Bionic resolves only declared dependencies). */
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static int g_init_ok;
+static void init_once(void) { g_init_ok = glslang_initialize_process() != 0; }
+static int ensure_init(void) { return pthread_once(&g_once, init_once) == 0 && g_init_ok; }
+#endif
 
 __declspec(dllexport) void wt_spirv_free(uint32_t *words) { free(words); }
 
@@ -25,7 +35,7 @@ __declspec(dllexport) int wt_glsl_to_spirv(int stage, const char *src, uint32_t 
     int ok = 0;
     if (log && log_size) log[0] = 0;
     *words = NULL; *count = 0;
-    if (!InitOnceExecuteOnce(&g_once, init_once, NULL, NULL)) { if (log) snprintf(log, log_size, "glslang_initialize_process failed"); return 0; }
+    if (!ensure_init()) { if (log) snprintf(log, log_size, "glslang_initialize_process failed"); return 0; }
     memset(&in, 0, sizeof in);
     in.language = GLSLANG_SOURCE_GLSL;
     in.stage = stage == 0 ? GLSLANG_STAGE_VERTEX : stage == 1 ? GLSLANG_STAGE_FRAGMENT : stage == 3 ? GLSLANG_STAGE_TESSCONTROL : stage == 4 ? GLSLANG_STAGE_TESSEVALUATION : stage == 5 ? GLSLANG_STAGE_COMPUTE : GLSLANG_STAGE_COUNT;

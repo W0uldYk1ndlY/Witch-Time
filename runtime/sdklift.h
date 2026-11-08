@@ -32,7 +32,7 @@ void register_sdklift_imports(void);      /* maps the image; every lifted root t
  * `bl setjmp` is an ordinary host function that stays on the host stack until the guest function returns,
  * so the host's own setjmp can be used in place: the macro is expanded inside that function. The guest
  * callee-saved registers and sp are saved next to the host buffer and restored when a longjmp lands. */
-typedef struct {
+typedef struct SdkJmpRec {
     jmp_buf host;
     uint64_t key;                         /* address of the guest jmp_buf */
     uint64_t x[13];                       /* x19..x30, sp */
