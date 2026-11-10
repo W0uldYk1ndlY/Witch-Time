@@ -1270,6 +1270,7 @@ int display_present_defer(void) {
  * at g_defer_target AFTER it has published the tick, this looks at the tick AFTER the target is set: one of the two sees it.) */
 int display_present_due(void) { LONG64 t = g_defer_target; return t && g_vsync_n >= t; }
 void display_present_flushed(void) { InterlockedExchange64(&g_defer_target, 0); }
+LONG64 display_present_defer_target(void) { return g_defer_target; }
 /* Render thread, right after vkQueuePresentKHR returned: what the screen gets (see the comment at the top). */
 static void pace_stat_line(FILE *out, const char *what, int i, int since) {
     LONG64 n = g_ps[i].n - (since ? g_ps_last[i].n : 0), h[PS_HIST];

@@ -111,13 +111,32 @@ The runtime supports three candidate optimization treatments and one separate sc
   - *Eligibility:* Owned `MEM_WRITE_WATCH` allocations on supported 4 KiB and 16 KiB host page granules.
   - *Writer boundary:* Leases wrap direct kernel writes in `ReadFile` (`runtime/nnfs.c:736,879-903`) and `SystemFunction036` (`runtime/os_threads.c:590,615`). Native stacks, fiber stacks, signal handlers, and fixed mappings remain unwatched.
   - *Fallback:* Prefers kernel tracking when available. If tracking is unavailable or fails, falls back conservatively to full compute snapshot comparison without failing guest allocations or leaking tracking protections as logical permissions.
+
+### Software Write-Watch Architecture and Host Page-Size Matrix
+
+| Host Architecture | Host Granule | Handler Type | Status & Qualification |
+|---|---|---|---|
+| Android AArch64 (API 29+) | 4 KiB | POSIX `sigaction` (`SA_SIGINFO`, `ESR_ELx.WnR`) | Supported candidate (default off; requires device verification) |
+| Android AArch64 (API 29+) | 16 KiB | POSIX `sigaction` (`SA_SIGINFO`, `ESR_ELx.WnR`) | **Modeled configuration; explicitly unqualified** until physical 16 KiB device run |
+| Linux x86-64 | 4 KiB | POSIX `sigaction` (`SA_SIGINFO`, `REG_ERR` bit 1) | Supported host development/test platform |
+| Windows x86-64 | 4 KiB | Win32 native `GetWriteWatch` / `ResetWriteWatch` | Native baseline; software emulation inactive |
+| Any | Other (e.g. 64 KiB) | None | Explicitly unsupported / refused |
+
+- **Metadata Budget & Limits:** Aggregate tracker metadata is bounded at 16 MiB. Allocations exceeding this budget or failing metadata allocation return valid guest memory marked unwatched (`ww = 2`). Native stacks, fiber stacks, signal stacks, and non-`MEM_WRITE_WATCH` allocations are strictly excluded.
+- **Safe Off & Teardown Procedure:** Setting `WT_WW_SOFT=0` completely disables the software backend. At runtime, `plat_soft_ww_teardown()` restores logical write protections (`PROT_READ | PROT_WRITE`) on all tracked pages, uninstalls signal handlers, frees all tracker memory, transitions regions to `ww = 2` (untracked), and invokes `nvn_front_ww_invalidate()` to invalidate stale clean stamps across texture upload caches and compute-buffer coherency trackers.
+- **Qualification Rule:** Modeled, mocked, or skipped configurations remain explicitly unqualified. 16 KiB host kernel support cannot be claimed from 4 KiB host simulation alone.
 - **`WT_VK_WRITERWAIT=0|1` (Default: `0` / off):** Producer-scoped GPU waiting.
-  - *Behavior:* CPU indirect reads wait specifically for the submitting slot containing the producing draw/dispatch rather than awaiting all queued work globally.
-  - *Fallback:* Ambiguous or overlapping ranges fall back to conservative `cmd_submit` / slot synchronization (`cpu_read_sync`).
+  - *Behavior:* Publishes per-buffer write serials (`c->wserial = R.serial + 1`) at actual draw/dispatch recording points after preparation and ring operations wrap or submit. CPU indirect reads (`indirect_src`) wait specifically for the submitting slot containing the producing draw/dispatch rather than awaiting all queued work globally. If the producer has already completed (`R.done >= c->wserial`), reuse is instantaneous with zero wait.
+  - *Host Visibility Barrier:* Submissions tracking host-consumable writes emit a `VkMemoryBarrier` (`srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT`, `dstAccessMask = VK_ACCESS_HOST_READ_BIT`) before queue submission.
+  - *Indirect Record Stabilization:* CPU-consumed indirect records are snapshotted into compact owned buffers (stack or heap with checked size bounds <= 16 MiB and cleanup on every exit) before index buffer or draw preparation runs, preventing corruption from CB refills, reuse, or mid-preparation landing.
+  - *Preserved Features & Fallbacks:* Ambiguous or overlapping ranges fall back to conservative `cpu_read_sync`. GPU-side paths (`WT_VK_GPUCOUNT`), lazy barriers (`WT_VK_CBLAZY`), kept buffer discard (`WT_VK_CBDISCARD`), GPU copies (`WT_VK_GPUCOPY`), GPU-driven culling, particle simulation, exposure overlays, required Vulkan feature checks (`drawIndirectFirstInstance`, `multiDrawIndirect`), and non-blocking occlusion query workarounds remain strictly preserved.
 - **`WT_VK_LOADCLEAR=0|1` (Default: `0` / off):** Leading full colour clear folding.
-  - *Behavior:* An eligible single-sample 2D colour full-subresource clear at the beginning of an unopened pass initializes the attachment using `loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR` with the typed `VkClearValue`.
-  - *Fallback:* Partial rectangles, scissor clipping, masked channels, depth/stencil clears, or already open passes fall back to `vkCmdClearAttachments`.
-- **`WT_VK_SPLIT=<n>` (Default: `0`):** Separate submission-scheduling treatment specifying the draw threshold before mid-frame command buffer submission at pass boundaries.
+  - *Behavior:* An eligible single-sample 2D colour full-subresource clear at the beginning of an unopened pass initializes the attachment using `loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR` with the typed `VkClearValue`. Other attachments in the pass maintain `loadOp = VK_ATTACHMENT_LOAD_OP_LOAD`, and all attachments retain `storeOp = VK_ATTACHMENT_STORE_OP_STORE`. Logical clear counters (`frame_clears`) remain unchanged.
+  - *Eligibility:* Narrowly restricted to owned non-feedback single-sample 2D colour targets (`samples == 1`, `!feedback`, `!is3d`), single selected mip level and layer, full effective channel mask, and full subresource extent coverage (`sx == 0, sy == 0, sw == atw, sh == ath`).
+  - *Fallback:* Partial rectangles, scissor clipping, masked channels, depth/stencil clears, multisample, feedback targets, 3D/1D targets, or already open passes fall back to baseline `vkCmdClearAttachments`.
+  - *Non-Inference & Bounds:* Folded counts reflect API-level command omission, not physical DRAM bandwidth or UBWC compression claims. Image storage flags, mutable format capabilities, and required attachment stores are strictly preserved.
+  - *Rollback:* Setting `WT_VK_LOADCLEAR=0` instantly reverts all clear handling to the baseline `vkCmdClearAttachments` execution path without altering saves, configurations, or packages.
+- **`WT_VK_SPLIT=<n>` (Default: `0`):** Separate submission-scheduling experiment specifying the draw threshold before mid-frame command buffer submission at pass boundaries. Evaluated separately from `WT_VK_WRITERWAIT`; mock/simulation tests qualify source logic but do not satisfy hardware gate promotion.
 
 ### Diagnostic Metrics & Units
 - `words`: Logical hash words visited (`hash_words_visited`), representing CPU sampled reads, strictly distinct from physical DRAM traffic.

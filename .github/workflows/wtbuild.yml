@@ -7,7 +7,7 @@ name: wtbuild
 on:
   pull_request:
     paths: ['tools/wtbuild/**', 'lifter/**', 'runtime/gen_static/**', 'runtime/freestanding/**',
-            'runtime/*.h', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'android/app/src/main/cpp/main.c', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
+            'runtime/*.h', 'runtime/plat_posix.c', 'runtime/nvn_gl.c', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'android/app/src/main/cpp/main.c', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tests/treatment_controls_test.py', 'tests/soft_ww_metadata_test.py', 'tests/soft_ww_query_reset_test.py', 'tests/soft_ww_transaction_test.py', 'tests/soft_ww_fault_handler_test.py', 'tests/soft_ww_chaining_test.py', 'tests/soft_ww_lease_test.py', 'tests/soft_ww_consumer_test.py', 'tests/producer_wait_test.py', 'tests/loadclear_command_test.py', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
   workflow_dispatch:
 
 jobs:
@@ -82,6 +82,36 @@ jobs:
 
       - name: Flash detector policy and capture guard test (runtime/nvn_vk_flash.c, tests/flash_detector_policy_test.py)
         run: python3 tests/flash_detector_policy_test.py
+
+      - name: Treatment controls and diagnostics typed request validation (tests/treatment_controls_test.py)
+        run: python3 tests/treatment_controls_test.py
+
+      - name: Soft write-watch metadata and eligibility (runtime/plat_posix.c, tests/soft_ww_metadata_test.py)
+        run: python3 tests/soft_ww_metadata_test.py
+
+      - name: Soft write-watch queries, reset and rearming (runtime/plat_posix.c, tests/soft_ww_query_reset_test.py)
+        run: python3 tests/soft_ww_query_reset_test.py
+
+      - name: Soft write-watch transactions and logical protection (runtime/plat_posix.c, tests/soft_ww_transaction_test.py)
+        run: python3 tests/soft_ww_transaction_test.py
+
+      - name: Soft write-watch fault handler and positive recovery (runtime/plat_posix.c, tests/soft_ww_fault_handler_test.py)
+        run: python3 tests/soft_ww_fault_handler_test.py
+
+      - name: Soft write-watch alternate stack and signal chaining (runtime/plat_posix.c, tests/soft_ww_chaining_test.py)
+        run: python3 tests/soft_ww_chaining_test.py
+
+      - name: Soft write-watch write leases around blocking I/O (runtime/plat_posix.c, tests/soft_ww_lease_test.py)
+        run: python3 tests/soft_ww_lease_test.py
+
+      - name: Soft write-watch consumer integration and teardown (runtime/nvn_gl.c, runtime/nvn_vk_draw.c, tests/soft_ww_consumer_test.py)
+        run: python3 tests/soft_ww_consumer_test.py
+
+      - name: Producer-scoped GPU waiting and indirect stabilization (runtime/nvn_vk_draw.c, tests/producer_wait_test.py)
+        run: python3 tests/producer_wait_test.py
+
+      - name: Leading colour clear pass folding (runtime/nvn_vk_draw.c, tests/loadclear_command_test.py)
+        run: python3 tests/loadclear_command_test.py
 
   lifter-check:
     # the shipped lifter against Unicorn: random words of the forms added to the lifter, run in Unicorn and as their lifted C

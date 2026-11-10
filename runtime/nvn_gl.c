@@ -52,6 +52,7 @@
 #include "tex_pack.h"
 #include "nvn_sdk.h"
 #include "nvn_c4.h"
+#include "diag.h"
 
 #pragma comment(lib, "opengl32.lib")
 
@@ -702,7 +703,14 @@ static uint64_t *ww_slot(uint64_t page, int insert) {
 static int g_ww_tmon = -1;
 static ULONG_PTR g_ww_found;                       /* the pages the last question found written */
 static void ww_init(void) {
-    if (g_ww_off < 0) { g_ww_off = getenv("WT_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
+    if (g_ww_off < 0) {
+        g_ww_off = getenv("WT_NO_WRITEWATCH") != NULL;
+        g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab);
+        g_ww_stamp = 1;
+#if !defined(_WIN32)
+        plat_soft_ww_set_invalidate_callback(nvn_front_ww_invalidate);
+#endif
+    }
     if (g_ww_tmon < 0) g_ww_tmon = getenv("WT_VK_PREPTIME") && atoi(getenv("WT_VK_PREPTIME"));
 }
 /* Asks Windows which pages of [p, p+n) were written since the last question; they (and their blocks and regions) get a new
@@ -779,7 +787,20 @@ uint64_t nvn_front_mem_stamp(const void *p, size_t n) {
     ww_init();
     return g_ww_off || !n ? 0 : ww_stamps((uint64_t)(uintptr_t)p >> 12, ((uint64_t)(uintptr_t)p + n - 1) >> 12, 0);
 }
+static int g_tcl_nseen, g_tcl_n, g_tcl_on = -1;
+static uint32_t g_tcl_serial;
 uint64_t nvn_front_mem_now(void) { ww_init(); return g_ww_stamp; }
+void nvn_front_ww_invalidate(void) {
+    ww_init();
+    if (g_ww_tab) {
+        memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab);
+        g_ww_used = 0;
+        g_ww_floor = ++g_ww_stamp;
+    }
+    g_tcl_serial = 0;
+    g_tcl_n = 0;
+    g_tcl_nseen = 0;
+}
 /* [Recomps#1] finding 145 (cut C of finding 142): the textures a batch draws with were asked about one by one: ~340 questions a
  * fight frame at 120 fps (one batch a frame), each a GetWriteWatch of ~0.6 us + ~5 ns a page, then a walk over the texture's
  * pages in the stamp table, 0.4-0.5 ms of the render thread a frame. Two changes; WT_VK_TEXCLUSTER=0: both off.
@@ -798,8 +819,6 @@ uint64_t nvn_front_mem_now(void) { ww_init(); return g_ww_stamp; }
 #define TCL_GAP (256u << 10)
 static struct { uint64_t lo, hi; } g_tcl_seen[TCL_N], g_tcl[TCL_N];      /* the ranges this batch checked; the clusters of the last batch's */
 static struct { uint32_t serial, gen; int bad; } g_tcl_q[TCL_N];        /* a cluster's last question; bad: Windows refused it */
-static int g_tcl_nseen, g_tcl_n, g_tcl_on = -1;
-static uint32_t g_tcl_serial;
 int nvn_vk_cutc_live(void);                        /* nvn_vk_draw.c: TEST ONLY WT_VK_CUTC_ALT */
 static int tcl_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static void tcl_build(void) {                      /* a new batch: the clusters of the ranges the last one checked */
@@ -5055,6 +5074,7 @@ void nvn_l1_report(FILE *out) { if (g_l1_early_n || g_l1_early_miss) fprintf(out
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     L1T("PRESENT texture %d", (int)A2);
+    diag_hook_present_queued((int64_t)nvn_front_frame_next(), (int64_t)A2, 0, 0);
     g_pf_main_tid = GetCurrentThreadId();
     if (g_l1_early_win && g_l1_early_win == j.win && g_l1_early_idx == j.index) {      /* L1: this picture was presented at the game's wait already: only the pacing bookkeeping */
         g_l1_early_win = NULL;

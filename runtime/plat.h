@@ -29,6 +29,34 @@ static inline int plat_protect(void *p, size_t size, int prot) {
     DWORD old;
     return VirtualProtect(p, size, prot == PLAT_RW ? PAGE_READWRITE : prot == PLAT_RO ? PAGE_READONLY : PAGE_NOACCESS, &old) != 0;
 }
+static inline int plat_ww_soft_enabled(void) { return 0; }
+static inline int plat_ww_backend_of(uintptr_t addr, size_t size) { (void)addr; (void)size; return 0; }
+static inline size_t plat_soft_ww_memory_used(void) { return 0; }
+static inline size_t plat_soft_ww_budget_limit(void) { return 16 * 1024 * 1024; }
+static inline void plat_soft_ww_set_test_budget(size_t limit) { (void)limit; }
+static inline void plat_soft_ww_set_fault_inject(int f) { (void)f; }
+static inline void plat_set_kernel_ww_state_for_test(int s) { (void)s; }
+static inline void plat_soft_ww_set_test_stack_range(uintptr_t b, size_t s) { (void)b; (void)s; }
+static inline int plat_soft_ww_is_range_eligible(uintptr_t a, size_t s, DWORD t, size_t ps) { (void)a; (void)s; (void)t; (void)ps; return 0; }
+static inline int plat_soft_ww_mark_dirty(uintptr_t a, size_t s) { (void)a; (void)s; return 0; }
+static inline int plat_soft_ww_is_page_dirty(uintptr_t a) { (void)a; return 0; }
+static inline int plat_soft_ww_is_host_writable(uintptr_t a) { (void)a; return 0; }
+static inline int plat_soft_ww_get_host_lease(uintptr_t a) { (void)a; return 0; }
+static inline void plat_soft_ww_set_host_lease(uintptr_t a, uint16_t c) { (void)a; (void)c; }
+static inline uint64_t plat_ww_generation_of(uintptr_t a) { (void)a; return 0; }
+static inline int plat_ww_validate_generation(uintptr_t a, uint64_t g) { (void)a; (void)g; return 0; }
+static inline int plat_soft_ww_handle_fault(void *si, void *uc) { (void)si; (void)uc; return 0; }
+static inline int plat_soft_ww_install_handler(void) { return 0; }
+static inline void plat_soft_ww_uninstall_handler(void) {}
+static inline void plat_soft_ww_set_restore_fail_for_test(int f) { (void)f; }
+static inline uint64_t plat_soft_ww_fault_count(void) { return 0; }
+static inline void plat_soft_ww_thread_setup_altstack(void) {}
+static inline void plat_soft_ww_thread_teardown_altstack(void) {}
+typedef struct { int dummy; } SoftWWLease;
+static inline void plat_soft_ww_lease_begin(uintptr_t a, size_t s, SoftWWLease *l) { (void)a; (void)s; (void)l; }
+static inline void plat_soft_ww_lease_end(SoftWWLease *l, size_t w) { (void)l; (void)w; }
+static inline void plat_soft_ww_set_invalidate_callback(void (*cb)(void)) { (void)cb; }
+static inline int plat_soft_ww_teardown(void) { return 0; }
 
 #else /* POSIX (Linux) */
 #include <errno.h>
@@ -440,6 +468,41 @@ static inline void Sleep(DWORD ms) {
  * a host has set it: the Witch Time launcher, which runs the game in its own process and window (launcher/) */
 __attribute__((noreturn)) void plat_exit_process(int code);
 #define ExitProcess(code) plat_exit_process((int)(code))
+int plat_ww_soft_enabled(void);
+int plat_ww_backend_of(uintptr_t addr, size_t size);
+size_t plat_soft_ww_memory_used(void);
+size_t plat_soft_ww_budget_limit(void);
+void plat_soft_ww_set_test_budget(size_t limit_bytes);
+void plat_soft_ww_set_fault_inject(int fail_metadata_alloc);
+void plat_set_kernel_ww_state_for_test(int state);
+void plat_soft_ww_set_test_stack_range(uintptr_t base, size_t size);
+int plat_soft_ww_is_range_eligible(uintptr_t addr, size_t size, DWORD type, size_t page_size);
+int plat_soft_ww_mark_dirty(uintptr_t addr, size_t size);
+int plat_soft_ww_is_page_dirty(uintptr_t addr);
+int plat_soft_ww_is_host_writable(uintptr_t addr);
+int plat_soft_ww_get_host_lease(uintptr_t addr);
+void plat_soft_ww_set_host_lease(uintptr_t addr, uint16_t count);
+uint64_t plat_ww_generation_of(uintptr_t addr);
+int plat_ww_validate_generation(uintptr_t addr, uint64_t expected_gen);
+int plat_soft_ww_handle_fault(siginfo_t *si, void *ucontext);
+int plat_soft_ww_install_handler(void);
+void plat_soft_ww_uninstall_handler(void);
+void plat_soft_ww_set_restore_fail_for_test(int fail);
+uint64_t plat_soft_ww_fault_count(void);
+void plat_soft_ww_thread_setup_altstack(void);
+void plat_soft_ww_thread_teardown_altstack(void);
+typedef struct {
+    uintptr_t addr;
+    size_t size;
+    uint64_t generation;
+    size_t first_host;
+    size_t last_host;
+    int active;
+} SoftWWLease;
+void plat_soft_ww_lease_begin(uintptr_t addr, size_t size, SoftWWLease *lease);
+void plat_soft_ww_lease_end(SoftWWLease *lease, size_t bytes_written);
+void plat_soft_ww_set_invalidate_callback(void (*cb)(void));
+int plat_soft_ww_teardown(void);
 
 /* _aligned_*: glibc's free and malloc_usable_size accept memory from aligned_alloc / posix_memalign */
 static inline void *_aligned_malloc(size_t n, size_t align) { void *p; return posix_memalign(&p, align, n) ? NULL : p; }
