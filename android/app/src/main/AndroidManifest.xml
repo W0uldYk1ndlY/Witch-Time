@@ -2,7 +2,8 @@
     <uses-feature android:glEsVersion="0x00030000" android:required="false" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="4206592" android:required="true" />
     <application android:label="Witch Time (experimental)" android:allowBackup="false" android:extractNativeLibs="true" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
-        <activity android:name=".WitchTimeActivity" android:exported="true" android:resizeableActivity="true" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density">
+        <profileable android:shell="true" />
+        <activity android:name=".WitchTimeActivity" android:exported="true" android:resizeableActivity="true" android:showWhenLocked="true" android:turnScreenOn="true" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

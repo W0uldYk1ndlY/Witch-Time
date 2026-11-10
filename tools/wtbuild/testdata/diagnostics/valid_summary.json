@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run_20261110_190000_a1b2",
+  "overall_outcome": "completed",
+  "validity": "valid",
+  "correctness": "passed",
+  "segments": {
+    "shibuya_fight": {
+      "segment_id": "shibuya_fight",
+      "target_fps": 60.0,
+      "sample_count": 3600,
+      "coverage": 1.0,
+      "duration_ms": 60000.0,
+      "frame_time_ms": {
+        "min": 15.2,
+        "max": 24.8,
+        "median": 16.6,
+        "p95": 18.2,
+        "p99": 21.0,
+        "mean": 16.7,
+        "stddev": 0.95
+      },
+      "gpu_time_ms": {
+        "min": 9.1,
+        "max": 14.5,
+        "median": 11.2,
+        "p95": 12.8,
+        "p99": 13.9,
+        "mean": 11.3,
+        "stddev": 0.8
+      },
+      "gpu_absence_reason": null,
+      "held_present_count": 0,
+      "progress_present_count": 3600,
+      "dropped_frame_count": 4
+    }
+  },
+  "measurements": {
+    "cpu_frame_median": {
+      "name": "cpu_frame_median",
+      "value": 16.6,
+      "units": "ms",
+      "source": "clock_monotonic",
+      "capability": "supported",
+      "sample_count": 3600,
+      "coverage": 1.0,
+      "validity": "valid"
+    },
+    "gpu_frame_median": {
+      "name": "gpu_frame_median",
+      "value": 11.2,
+      "units": "ms",
+      "source": "gpu_query_pool",
+      "capability": "supported",
+      "sample_count": 3600,
+      "coverage": 1.0,
+      "validity": "valid"
+    },
+    "audio_underrun_count": {
+      "name": "audio_underrun_count",
+      "value": 0.0,
+      "units": "count",
+      "source": "audio_ring_counter",
+      "capability": "supported",
+      "sample_count": 1,
+      "coverage": 1.0,
+      "validity": "valid"
+    },
+    "thermal_headroom": {
+      "name": "thermal_headroom",
+      "value": null,
+      "units": "celsius",
+      "source": "thermal_zone",
+      "capability": "unavailable",
+      "sample_count": 0,
+      "coverage": 0.0,
+      "validity": "unsupported",
+      "reason_code": "THERMAL_UNSUPPORTED"
+    }
+  },
+  "evidence_references": [
+    {
+      "ref_id": "events_chunk_1",
+      "path": "events-001.jsonl",
+      "chunk_type": "events",
+      "record_count": 500,
+      "byte_size": 45000
+    },
+    {
+      "ref_id": "metrics_chunk_1",
+      "path": "metrics-001.jsonl",
+      "chunk_type": "metrics",
+      "record_count": 3600,
+      "byte_size": 250000
+    }
+  ],
+  "hypotheses": [
+    {
+      "hypothesis_id": "CPU_BOUND",
+      "status": "unsupported",
+      "rationale": "Frame time tracked 60 fps budget cleanly; neither CPU nor GPU saturated.",
+      "evidence_refs": ["metrics-001.jsonl"]
+    }
+  ]
+}

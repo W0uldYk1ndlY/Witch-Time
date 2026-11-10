@@ -39,6 +39,7 @@
 #include <mmsystem.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "diag.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -371,6 +372,9 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
         g_sec_appended++;
         if (peak > g_sec_peak) g_sec_peak = peak;
         ok = 1;
+        if (diag_is_enabled()) {
+            diag_hook_audio_counters((int64_t)g_total_appended, (int64_t)g_total_released, (int64_t)g_underruns, (int64_t)g_starved);
+        }
     } else {
         g_total_dropped++;
     }
@@ -410,7 +414,12 @@ static void audio_GetReleasedAudioOutBuffer(Ctx *c) { /* (AudioOut *) -> AudioOu
     uint64_t r = 0;
     EnterCriticalSection(&g_lock);
     if (g_open) collect_finished(0);
-    if (g_rel_head != g_rel_tail) r = g_released[g_rel_head++ % SLOTS];
+    if (g_rel_head != g_rel_tail) {
+        r = g_released[g_rel_head++ % SLOTS];
+        if (r && diag_is_enabled()) {
+            diag_hook_audio_counters((int64_t)g_total_appended, (int64_t)g_total_released, (int64_t)g_underruns, (int64_t)g_starved);
+        }
+    }
     g_sec_polls++;
     if (!r) g_sec_empty++;
     LeaveCriticalSection(&g_lock);

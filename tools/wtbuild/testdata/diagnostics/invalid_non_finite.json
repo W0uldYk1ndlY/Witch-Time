@@ -1,0 +1,10 @@
+{
+  "name": "invalid_timing",
+  "value": "NaN",
+  "units": "ms",
+  "source": "clock_monotonic",
+  "capability": "supported",
+  "sample_count": 10,
+  "coverage": 1.0,
+  "validity": "valid"
+}

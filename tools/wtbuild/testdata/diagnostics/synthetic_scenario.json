@@ -1,0 +1,60 @@
+{
+  "scenario_id": "synthetic_boot_continue_combat",
+  "checkpoints": [
+    {
+      "checkpoint_id": "cp_boot",
+      "occurrence": 1,
+      "target_segment": "boot",
+      "expected": {
+        "chapter": 0,
+        "verse": 0,
+        "movie_active": false
+      },
+      "clock_policy": "host_time",
+      "deadline_ms": 5000,
+      "required": true
+    },
+    {
+      "checkpoint_id": "cp_title_menu",
+      "occurrence": 1,
+      "target_segment": "menu",
+      "expected": {
+        "chapter": 0,
+        "verse": 0,
+        "area": 0,
+        "movie_active": false
+      },
+      "clock_policy": "host_time",
+      "deadline_ms": 10000,
+      "required": true
+    },
+    {
+      "checkpoint_id": "cp_continue_loading",
+      "occurrence": 1,
+      "target_segment": "loading",
+      "expected": {
+        "chapter": 1,
+        "verse": 0,
+        "movie_active": false
+      },
+      "clock_policy": "host_time",
+      "deadline_ms": 15000,
+      "required": true
+    },
+    {
+      "checkpoint_id": "cp_prologue_combat",
+      "occurrence": 1,
+      "target_segment": "combat",
+      "expected": {
+        "chapter": 1,
+        "verse": 1,
+        "difficulty": 1,
+        "area": 11,
+        "movie_active": false
+      },
+      "clock_policy": "game_active_time",
+      "deadline_ms": 25000,
+      "required": true
+    }
+  ]
+}

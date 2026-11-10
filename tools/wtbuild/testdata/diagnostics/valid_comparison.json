@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "comparison_id": "cmp_20261110_a_vs_b",
+  "baseline_run_id": "run_20261110_180000_base",
+  "candidate_run_id": "run_20261110_190000_cand",
+  "policy_id": "policy_oppo_n5_combat_v1",
+  "policy_hash": "sha256_e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "eligibility": {
+    "is_eligible": true,
+    "ineligibility_reasons": []
+  },
+  "dimensions": {
+    "execution": "equivalent",
+    "correctness": "passed",
+    "performance": "improved",
+    "overall_verdict": "improvement",
+    "verdict_reasons": [
+      "All required correctness assertions passed on both runs",
+      "Statistically significant reduction in median frame time beyond noise margin"
+    ]
+  },
+  "metric_comparisons": [
+    {
+      "metric": "frame_time_median_ms",
+      "segment": "shibuya_fight",
+      "baseline_value": 17.5,
+      "candidate_value": 16.6,
+      "delta": -0.9,
+      "pct_change": -5.14,
+      "direction": "improved",
+      "noise_margin": 0.25,
+      "uncertainty": 0.08
+    },
+    {
+      "metric": "frame_time_p99_ms",
+      "segment": "shibuya_fight",
+      "baseline_value": 22.1,
+      "candidate_value": 21.0,
+      "delta": -1.1,
+      "pct_change": -4.98,
+      "direction": "improved",
+      "noise_margin": 0.5,
+      "uncertainty": 0.15
+    }
+  ],
+  "trade_offs": [],
+  "hypotheses": [
+    {
+      "hypothesis_id": "GPU_LATENCY_REDUCTION",
+      "status": "supported",
+      "rationale": "GPU frame median decreased from 12.1 ms to 11.2 ms without tail degradation.",
+      "evidence_refs": ["summary_baseline.json", "summary_candidate.json"]
+    }
+  ]
+}

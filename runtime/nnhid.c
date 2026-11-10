@@ -14,6 +14,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
+#include "diag_replay.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -113,9 +114,23 @@ static char g_marks[MARK_MAX][40];
 static volatile LONG g_mark_count, g_frame_draws_seen = -1;
 static LONG64 g_seq_polls;
 
+static volatile LONG g_mark_allocated = 0;
+
 void input_mark(const char *what) {                       /* any thread: something the sequence can wait for has happened */
-    LONG i = InterlockedIncrement(&g_mark_count) - 1;
-    if (i < MARK_MAX) { strncpy(g_marks[i], what, sizeof g_marks[i] - 1); MemoryBarrier(); }
+    if (!what) return;
+    LONG i = InterlockedIncrement(&g_mark_allocated) - 1;
+    if (i < MARK_MAX) {
+        strncpy(g_marks[i], what, sizeof(g_marks[i]) - 1);
+        g_marks[i][sizeof(g_marks[i]) - 1] = '\0';
+        MemoryBarrier();
+        /* Spin-wait until preceding slots have completed filling so publish order is strictly preserved */
+        while (g_mark_count < i) {
+            #if defined(_WIN32)
+            YieldProcessor();
+            #endif
+        }
+        InterlockedIncrement(&g_mark_count);
+    }
 }
 void input_frame_draws(int draws) { g_frame_draws_seen = draws; }       /* nvn_gl.c, once per presented frame */
 
@@ -124,6 +139,8 @@ static int mark_seen(const char *what) {
     for (LONG i = 0; i < n && i < MARK_MAX; i++) if (!strcmp(g_marks[i], what)) return 1;
     return 0;
 }
+int nnhid_mark_seen(const char *what) { return mark_seen(what); }
+int nnhid_get_frame_draws(void) { return (int)g_frame_draws_seen; }
 
 static void seq_begin(int i) {
     g_seq_index = i;
@@ -513,13 +530,15 @@ static int id_supported(uint32_t id) {
 /* Is a controller connected as this npad id? Player 1 always exists in scripted runs (the script is its pad). */
 static int player_connected(uint32_t id) {
     hid_setup();
-    if (id > 7 || !(g_supported_styles & STYLE_FULLKEY) || !id_supported(id)) return 0;
-    if (g_x_synth == 1 && id == 0) return x_present(g_source[id]);      /* synthetic pad run: player 1 exists only as that pad */
-    if (g_x_synth == 2 && id == 1) return x_present(g_source[id]);      /* self-test: player 2 is the test pad, whatever the keyboard player is */
-    if (id == 0 && scripted_run()) return 1;
-    if ((int)id == g_keyboard_player) return 1;
-    if (sdl_on()) return nnpad_present((int)id);
-    return x_present(g_source[id]);
+    int phys = 0;
+    if (g_x_synth == 1 && id == 0) phys = x_present(g_source[id]);      /* synthetic pad run: player 1 exists only as that pad */
+    else if (g_x_synth == 2 && id == 1) phys = x_present(g_source[id]);      /* self-test: player 2 is the test pad, whatever the keyboard player is */
+    else if (id == 0 && scripted_run()) phys = 1;
+    else if ((int)id == g_keyboard_player) phys = 1;
+    else if (sdl_on()) phys = nnpad_present((int)id);
+    else phys = x_present(g_source[id]);
+
+    return diag_input_is_player_connected(id, g_supported_styles, g_supported_ids, g_supported_id_count, phys) ? 1 : 0;
 }
 
 /* [Recomps#1] one bound key or mouse button down; the click that captured the mouse for the camera does not count (display.c) */
@@ -600,51 +619,64 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     };
     uint64_t buttons = 0;
     int lx = 0, ly = 0, rx = 0, ry = 0, wired = 1, prompts_used = -1;         /* [witchtime] the device player 1 just used: 0 pad, 1 keyboard / mouse */
-    if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) &&
-        ((int)id == g_keyboard_player || (id == 0 && scripted_run()))) {    /* keyboard, and the test scripts on player 1 */
-        for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (key_for(id, map[i].vk, map[i].bit)) buttons |= 1ull << map[i].bit;
-        lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
-        ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
-        if (sdl_on()) { rx = (key_for(id, 0, 22) - key_for(id, 0, 20)) * STICK_MAX; ry = (key_for(id, 0, 21) - key_for(id, 0, 23)) * STICK_MAX; }
-        if (lx && ly) { lx = lx * 23170 / STICK_MAX; ly = ly * 23170 / STICK_MAX; }       /* [witchtime] a diagonal is as long as a straight push (round gate) */
-        if (rx && ry) { rx = rx * 23170 / STICK_MAX; ry = ry * 23170 / STICK_MAX; }
-        if ((lx || ly) && key_for(id, 0, 24)) { lx = lx * 2 / 5; ly = ly * 2 / 5; }      /* [witchtime] WALK held: 0.4 of the travel, below the 0.5 of the stick-as-button bits */
-        int mx, my;
-        if (sdl_on() && (int)id == g_keyboard_player && mouse_stick(&mx, &my)) {      /* [Recomps#1] the mouse moves the camera */
-            rx += mx; ry += my;
-            if (rx > STICK_MAX) rx = STICK_MAX; if (rx < -STICK_MAX) rx = -STICK_MAX;
-            if (ry > STICK_MAX) ry = STICK_MAX; if (ry < -STICK_MAX) ry = -STICK_MAX;
+    if (diag_input_is_synthetic_player1_enabled() && id == 0) {
+        diag_replay_session_t *sess = diag_input_get_active_replay();
+        if (sess && sess->is_loaded) {
+            uint32_t attr = 0;
+            int16_t rx16 = 0, ry16 = 0, lx16 = 0, ly16 = 0;
+            long long since = g_rec_poll >= g_anchor_poll ? g_rec_poll - g_anchor_poll : 0;
+            diag_replay_poll(sess, g_anchor, (uint32_t)since, &buttons, &lx16, &ly16, &rx16, &ry16, &attr);
+            lx = lx16; ly = ly16; rx = rx16; ry = ry16;
+            wired = (attr & DIAG_REPLAY_ATTR_WIRED) != 0;
         }
-        if (buttons || lx || ly || abs(rx) > STICK_MAX / 4 || abs(ry) > STICK_MAX / 4) prompts_used = 1;     /* a nudged mouse is not use */
-    }
-    int slot = g_source[id];
-    if (sdl_on()) {
-        NnPadState ps;
-        if (nnpad_get((int)id, &ps)) {
-            wired = ps.wired;
-            if (devices_live()) {
-                if (ps.buttons || abs(ps.lx) > STICK_MAX / 2 || abs(ps.ly) > STICK_MAX / 2 || abs(ps.rx) > STICK_MAX / 2 || abs(ps.ry) > STICK_MAX / 2) prompts_used = 0;   /* a drifting stick is not use */
-                buttons |= ps.buttons;
-                if (ps.lx || ps.ly) { lx = ps.lx; ly = ps.ly; }
-                if (ps.rx || ps.ry || (!rx && !ry)) { rx = ps.rx; ry = ps.ry; }      /* [witchtime] was !rx: a vertical-only mouse move was lost */
+        prompts_used = 0; /* Controller origin, never keyboard prompts */
+    } else {
+        if (!(g_x_synth == 1 && id == 0) && !(g_x_synth == 2 && id == 1) &&
+            ((int)id == g_keyboard_player || (id == 0 && scripted_run()))) {    /* keyboard, and the test scripts on player 1 */
+            for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (key_for(id, map[i].vk, map[i].bit)) buttons |= 1ull << map[i].bit;
+            lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
+            ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
+            if (sdl_on()) { rx = (key_for(id, 0, 22) - key_for(id, 0, 20)) * STICK_MAX; ry = (key_for(id, 0, 21) - key_for(id, 0, 23)) * STICK_MAX; }
+            if (lx && ly) { lx = lx * 23170 / STICK_MAX; ly = ly * 23170 / STICK_MAX; }       /* [witchtime] a diagonal is as long as a straight push (round gate) */
+            if (rx && ry) { rx = rx * 23170 / STICK_MAX; ry = ry * 23170 / STICK_MAX; }
+            if ((lx || ly) && key_for(id, 0, 24)) { lx = lx * 2 / 5; ly = ly * 2 / 5; }      /* [witchtime] WALK held: 0.4 of the travel, below the 0.5 of the stick-as-button bits */
+            int mx, my;
+            if (sdl_on() && (int)id == g_keyboard_player && mouse_stick(&mx, &my)) {      /* [Recomps#1] the mouse moves the camera */
+                rx += mx; ry += my;
+                if (rx > STICK_MAX) rx = STICK_MAX; if (rx < -STICK_MAX) rx = -STICK_MAX;
+                if (ry > STICK_MAX) ry = STICK_MAX; if (ry < -STICK_MAX) ry = -STICK_MAX;
             }
+            if (buttons || lx || ly || abs(rx) > STICK_MAX / 4 || abs(ry) > STICK_MAX / 4) prompts_used = 1;     /* a nudged mouse is not use */
         }
-    } else if (x_present(slot) && devices_live()) {
-        const XGamepad *g = &g_x[slot].st.pad;
-        static const struct { WORD x; int pos, label; } xmap[] = {
-            {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},
-            {0x0100, BTN_L, BTN_L}, {0x0200, BTN_R, BTN_R}, {0x0010, BTN_PLUS, BTN_PLUS}, {0x0020, BTN_MINUS, BTN_MINUS},
-            {0x0040, BTN_STICK_L, BTN_STICK_L}, {0x0080, BTN_STICK_R, BTN_STICK_R},
-            {0x0001, BTN_UP, BTN_UP}, {0x0002, BTN_DOWN, BTN_DOWN}, {0x0004, BTN_LEFT, BTN_LEFT}, {0x0008, BTN_RIGHT, BTN_RIGHT},
-        };
-        for (size_t i = 0; i < sizeof xmap / sizeof xmap[0]; i++)
-            if (g->buttons & xmap[i].x) buttons |= 1ull << (g_label_layout ? xmap[i].label : xmap[i].pos);
-        if (g->lt >= 85) buttons |= 1ull << BTN_ZL;
-        if (g->rt >= 85) buttons |= 1ull << BTN_ZR;
-        if (g->lx || g->ly) { lx = g->lx < -STICK_MAX ? -STICK_MAX : g->lx; ly = g->ly < -STICK_MAX ? -STICK_MAX : g->ly; }
-        rx = g->rx < -STICK_MAX ? -STICK_MAX : g->rx;
-        ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
-        wired = !g_x[slot].wireless;
+        int slot = g_source[id];
+        if (sdl_on()) {
+            NnPadState ps;
+            if (nnpad_get((int)id, &ps)) {
+                wired = ps.wired;
+                if (devices_live()) {
+                    if (ps.buttons || abs(ps.lx) > STICK_MAX / 2 || abs(ps.ly) > STICK_MAX / 2 || abs(ps.rx) > STICK_MAX / 2 || abs(ps.ry) > STICK_MAX / 2) prompts_used = 0;   /* a drifting stick is not use */
+                    buttons |= ps.buttons;
+                    if (ps.lx || ps.ly) { lx = ps.lx; ly = ps.ly; }
+                    if (ps.rx || ps.ry || (!rx && !ry)) { rx = ps.rx; ry = ps.ry; }      /* [witchtime] was !rx: a vertical-only mouse move was lost */
+                }
+            }
+        } else if (x_present(slot) && devices_live()) {
+            const XGamepad *g = &g_x[slot].st.pad;
+            static const struct { WORD x; int pos, label; } xmap[] = {
+                {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},
+                {0x0100, BTN_L, BTN_L}, {0x0200, BTN_R, BTN_R}, {0x0010, BTN_PLUS, BTN_PLUS}, {0x0020, BTN_MINUS, BTN_MINUS},
+                {0x0040, BTN_STICK_L, BTN_STICK_L}, {0x0080, BTN_STICK_R, BTN_STICK_R},
+                {0x0001, BTN_UP, BTN_UP}, {0x0002, BTN_DOWN, BTN_DOWN}, {0x0004, BTN_LEFT, BTN_LEFT}, {0x0008, BTN_RIGHT, BTN_RIGHT},
+            };
+            for (size_t i = 0; i < sizeof xmap / sizeof xmap[0]; i++)
+                if (g->buttons & xmap[i].x) buttons |= 1ull << (g_label_layout ? xmap[i].label : xmap[i].pos);
+            if (g->lt >= 85) buttons |= 1ull << BTN_ZL;
+            if (g->rt >= 85) buttons |= 1ull << BTN_ZR;
+            if (g->lx || g->ly) { lx = g->lx < -STICK_MAX ? -STICK_MAX : g->lx; ly = g->ly < -STICK_MAX ? -STICK_MAX : g->ly; }
+            rx = g->rx < -STICK_MAX ? -STICK_MAX : g->rx;
+            ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
+            wired = !g_x[slot].wireless;
+        }
     }
     if (id == 0) {                                            /* [witchtime] button prompts follow the device: at once when it changes, else a few times a second */
         void prompts_tick(void);
@@ -654,7 +686,12 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         if (changed) { used = prompts_used; nnpad_prompts_used(used); }
         if (changed || !(++polls & 15)) { prompts_tick(); menu_swap_tick(); }
     }
-    if (id == 0) record_or_replay(&buttons, &lx, &ly);
+    if (id == 0 && !diag_input_is_synthetic_player1_enabled()) record_or_replay(&buttons, &lx, &ly);
+    else if (id == 0 && diag_input_is_synthetic_player1_enabled()) {
+        g_rec_poll++;
+        if (g_rec_mark < 0 && mark_seen("movie")) g_rec_mark = g_rec_poll;
+        anchor_tick();
+    }
     if (lx < -STICK_MAX / 2) buttons |= 1ull << BTN_SL_LEFT;
     if (lx > STICK_MAX / 2) buttons |= 1ull << BTN_SL_RIGHT;
     if (ly > STICK_MAX / 2) buttons |= 1ull << BTN_SL_UP;
@@ -719,7 +756,26 @@ void nnhid_menu_read(uint64_t *buttons, int *lx, int *ly, int swap_ab) {      /*
     *buttons = b; *lx = x; *ly = y;
 }
 int nnhid_menu_key(int vk) { return key(vk); }
-static void hid_GetNpadState_FullKey(Ctx *c) { fill_pad(A0, rd32(A1), 1); pad_gate(A0, rd32(A1)); }
+static void hid_GetNpadState_FullKey(Ctx *c) {
+    uint32_t id = rd32(A1);
+    fill_pad(A0, id, 1);
+    uint64_t unmasked_buttons = rd64(A0 + 8);
+    pad_gate(A0, id);
+    uint64_t gated_buttons = rd64(A0 + 8);
+
+    diag_delivered_pad_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.sampling_number = rd64(A0);
+    st.composed_buttons = gated_buttons;
+    st.raw_buttons = gated_buttons & DIAG_REPLAY_VALID_BUTTON_MASK;
+    st.lx = (int32_t)rd32(A0 + 0x10);
+    st.ly = (int32_t)rd32(A0 + 0x14);
+    st.rx = (int32_t)rd32(A0 + 0x18);
+    st.ry = (int32_t)rd32(A0 + 0x1c);
+    st.attributes = rd32(A0 + 0x20);
+    st.is_gated = (unmasked_buttons != 0 && gated_buttons == 0);
+    diag_record_delivered_pad_state(id, &st);
+}
 static void hid_GetNpadState_Other(Ctx *c) { fill_pad(A0, rd32(A1), 0); }
 static void hid_GetPlayerLedPattern(Ctx *c) {               /* the console's patterns for players 1..8 */
     static const uint8_t led[8] = {1, 3, 7, 15, 9, 5, 13, 6};

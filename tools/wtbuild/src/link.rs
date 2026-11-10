@@ -73,6 +73,9 @@ const HOST_SOURCES: &[&str] = &[
     "options_row.c",
     "prompts.c",
     "presence.c",
+    "diag.c",
+    "diag_writer.c",
+    "diag_replay.c",
 ];
 const POSIX_SOURCES: &[&str] = &["plat_posix.c", "plat_audio_sdl.c"];
 /// the player's tables, compiled on their PC into game.so: the dump's sdk data, the lifted sdk code, and the values
@@ -133,7 +136,7 @@ const GLSLANG_LIBS: &str = "-lglslang -lglslang-default-resource-limits";
 /// what game.dll exports to witch-time-game.exe (runtime/split, gen/sdkdata.c, gen/sdklift_gen.c, game_shim_eh.c): the
 /// functions, then the data. A name the runtime uses and this list lacks fails the runtime's link (CI), not the player's.
 const GAME_EXPORTS: (&[&str], &[&str]) = (
-    &["game_bind", "game_eh_bind"],
+    &["game_bind", "game_eh_bind", "game_diag_bind"],
     &[
         "game_cutscene_fps",
         "game_model_lod",

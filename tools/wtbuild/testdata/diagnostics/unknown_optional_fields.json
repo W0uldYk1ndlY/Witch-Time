@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run_20261110_extra_test",
+  "build": {
+    "variant": "diagnostic",
+    "target": "android-arm64",
+    "native_optimization": "release"
+  },
+  "scenario": {
+    "scenario_id": "test_scenario",
+    "route_id": "route_1",
+    "fixture_id": "fix_1",
+    "deadlines": {
+      "startup_deadline_secs": 10.0,
+      "scenario_deadline_secs": 30.0,
+      "recovery_deadline_secs": 5.0
+    }
+  },
+  "profile": {
+    "profile_name": "lightweight",
+    "memory_budget_bytes": 8388608,
+    "storage_budget_bytes": 134217728,
+    "incident_disk_reserve_bytes": 16777216,
+    "max_incidents": 3,
+    "collectors": []
+  },
+  "configuration": {
+    "resolution": [1280, 720],
+    "fps_target": 60.0,
+    "audio_mode": "muted",
+    "cache_mode": "process_cold",
+    "input_policy": {
+      "source": "synthetic_fullkey_player1",
+      "mapping": "default_type_a",
+      "menu_confirm": "native_a"
+    }
+  },
+  "policy": {
+    "policy_id": "pol_1",
+    "policy_hash": "hash_1",
+    "required_assertions": []
+  },
+  "future_unknown_setting": "forward_compatibility_payload",
+  "experimental_feature_flags": [1, 2, 3]
+}

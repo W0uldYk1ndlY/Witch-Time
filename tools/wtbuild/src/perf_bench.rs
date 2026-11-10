@@ -93,13 +93,93 @@ fn scene(name: &str) -> Result<&'static Scene, String> {
 }
 
 pub fn main(args: &[String]) {
-    if !cfg!(target_os = "linux") {
-        die("perf-bench is for Linux: it reads /proc and runs the Linux game");
-    }
     match args.first().map(String::as_str) {
-        Some("run") if args.len() >= 3 => run(&args[1..]),
+        Some("android") if args.len() >= 2 => {
+            android_run(&args[1..]);
+        }
+        Some("run") if args.len() >= 3 => {
+            if !cfg!(target_os = "linux") {
+                die("perf-bench run is for Linux: it reads /proc and runs the Linux game");
+            }
+            run(&args[1..]);
+        }
         Some("report") if args.len() >= 2 => print!("{}", report(&args[1..]).unwrap_or_else(|e| die(e))),
-        _ => die("usage: perf-bench run <scene> <scale> [--tag T] [--save DIR] [--desktop-scale F] [--secs N] [--env K=V]... | perf-bench report <run dir>..."),
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("usage: perf-bench run <scene> <scale> [--tag T] [--save DIR] [--desktop-scale F] [--secs N] [--env K=V]... (Linux)");
+            println!("       perf-bench android --request <path> [--serial S] [--package P] [--out DIR] (Windows and Linux)");
+            println!("       perf-bench report <run dir>... (Windows and Linux)");
+        }
+        _ => die("usage: perf-bench run <scene> <scale> [--tag T] [--save DIR] [--desktop-scale F] [--secs N] [--env K=V]... | perf-bench android --request <path> [--serial S] [--package P] [--out DIR] | perf-bench report <run dir>..."),
+    }
+}
+
+fn android_run(args: &[String]) {
+    let mut serial = None;
+    let mut package = "org.witchtime.android".to_string();
+    let mut request_path: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut startup_deadline = 15.0;
+    let mut scenario_deadline = 60.0;
+    let recovery_deadline = 5.0;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--serial" => {
+                if i + 1 < args.len() { serial = Some(args[i + 1].clone()); i += 2; }
+                else { die("--serial requires a value"); }
+            }
+            "--package" => {
+                if i + 1 < args.len() { package = args[i + 1].clone(); i += 2; }
+                else { die("--package requires a value"); }
+            }
+            "--request" => {
+                if i + 1 < args.len() { request_path = Some(PathBuf::from(&args[i + 1])); i += 2; }
+                else { die("--request requires a value"); }
+            }
+            "--out" => {
+                if i + 1 < args.len() { out_dir = Some(PathBuf::from(&args[i + 1])); i += 2; }
+                else { die("--out requires a value"); }
+            }
+            "--startup-deadline" => {
+                if i + 1 < args.len() { startup_deadline = num(&args[i + 1]).unwrap_or_else(|e| die(e)); i += 2; }
+                else { die("--startup-deadline requires a value"); }
+            }
+            "--scenario-deadline" => {
+                if i + 1 < args.len() { scenario_deadline = num(&args[i + 1]).unwrap_or_else(|e| die(e)); i += 2; }
+                else { die("--scenario-deadline requires a value"); }
+            }
+            _ => die(format!("unknown option {}", args[i])),
+        }
+    }
+
+    let req_path = request_path.unwrap_or_else(|| die("--request <path> is required"));
+    let req_bytes = std::fs::read(&req_path).unwrap_or_else(|e| die(format!("cannot read request file: {}", e)));
+    let val: serde_json::Value = serde_json::from_slice(&req_bytes).unwrap_or_else(|e| die(format!("invalid request JSON: {}", e)));
+    let run_id = val["run_id"].as_str().unwrap_or_else(|| die("request.json missing run_id")).to_string();
+
+    let host_out = out_dir.unwrap_or_else(|| PathBuf::from("build").join("diagnostics").join(&run_id));
+
+    let cfg = crate::diag::AndroidRunnerConfig {
+        serial,
+        package_id: package,
+        activity_name: ".WitchTimeActivity".to_string(),
+        run_id,
+        request_bytes: req_bytes,
+        host_output_dir: host_out,
+        startup_deadline_secs: startup_deadline,
+        scenario_deadline_secs: scenario_deadline,
+        recovery_deadline_secs: recovery_deadline,
+        max_recovery_attempts: 1,
+        allow_reconnect_without_relaunch: true,
+    };
+
+    let adb = crate::diag::RealAdb::new();
+    let runner = crate::diag::AndroidRunner::new(&adb, cfg);
+    let result = runner.execute();
+    println!("Android run completed with exit status: {:?}", result.exit_status);
+    if let Some(err) = result.failure_reason {
+        eprintln!("Failure reason: {}", err);
     }
 }
 
@@ -268,6 +348,10 @@ fn run(args: &[String]) {
     let extra: serde_json::Map<String, Value> = r.extra.iter().map(|(k, v)| (k.clone(), v.as_str().into())).collect();
     let mut meta = json!({"scene": r.scene.name, "scale": r.scale, "tag": r.tag, "extra": extra, "start": now(),
                           "load_before": load(), "gpu_users_before": gpu_users(), "gpu_busy_before": gpu_busy()});
+    let mut exit_code_val: Option<i32> = None;
+    let mut was_cancelled = false;
+    let mut was_timeout = false;
+
     // nothing between taking the lock and removing it may die
     let res = (|| -> Result<(), String> {
         let log = fs::File::create(out.join("log.txt")).map_err(|e| format!("log.txt: {}", e))?;
@@ -283,7 +367,16 @@ fn run(args: &[String]) {
         if !sig::stopped() {
             let mut child = cmd.spawn().map_err(|e| format!("timeout: {}", e))?;
             sig::child(child.id());
-            child.wait().map_err(|e| e.to_string())?;
+            let status = child.wait().map_err(|e| e.to_string())?;
+            if let Some(code) = status.code() {
+                exit_code_val = Some(code);
+                if code == 124 {
+                    was_timeout = true;
+                }
+            }
+        }
+        if sig::stopped() {
+            was_cancelled = true;
         }
         // our process may still be closing
         while !sig::stopped() && !game_pids().is_empty() {
@@ -295,12 +388,61 @@ fn run(args: &[String]) {
     meta["load_after"] = load().into();
     meta["gpu_users_after"] = gpu_users().into();
     meta["gpu_busy_after"] = gpu_busy().into();
+
+    let (execution_outcome, reason_code, clean_exit) = if was_cancelled {
+        ("cancelled", crate::diag::reasons::PROCESS_KILLED, false)
+    } else if was_timeout {
+        ("timed_out", crate::diag::reasons::SCENARIO_TIMEOUT, false)
+    } else if let Some(code) = exit_code_val {
+        if code == 0 {
+            ("completed", crate::diag::reasons::CLEAN_COMPLETION, true)
+        } else {
+            ("crashed", crate::diag::reasons::NATIVE_CRASH, false)
+        }
+    } else {
+        ("crashed", crate::diag::reasons::NATIVE_CRASH, false)
+    };
+
+    meta["execution_outcome"] = execution_outcome.into();
+    meta["reason_code"] = reason_code.into();
+    meta["exit_code"] = exit_code_val.into();
+    meta["clean_exit"] = clean_exit.into();
+
+    let outcome = crate::diag::DiagnosticOutcome {
+        schema_version: crate::diag::SchemaVersion::CURRENT,
+        run_id: name.clone(),
+        execution_outcome: execution_outcome.to_string(),
+        reason_code: reason_code.to_string(),
+        exit_status: crate::diag::DiagnosticExitStatus {
+            clean_exit,
+            exit_code: exit_code_val,
+            signal: None,
+            termination_origin: if was_timeout {
+                "runner_deadline".to_string()
+            } else if was_cancelled {
+                "runner_cancel".to_string()
+            } else {
+                "process".to_string()
+            },
+        },
+        last_confirmed_checkpoint: None,
+        covered_segments: vec![r.scene.name.to_string()],
+        checkpoints: Vec::new(),
+        correctness_assertions: Vec::new(),
+        storage_exhausted: false,
+        incomplete_recovery: false,
+        extra: std::collections::BTreeMap::new(),
+    };
+    if let Ok(outcome_json) = serde_json::to_string_pretty(&outcome) {
+        let _ = fs::write(out.join("outcome.json"), outcome_json);
+    }
+
     let _ = fs::remove_file(LOCK);
     if let Err(e) = res {
         die(e)
     }
     if sig::stopped() {
-        die(format!("stopped: {} has no meta.json", out.display()))
+        die(format!("stopped: {} has meta.json and outcome.json (cancelled)", out.display()))
     }
     let mut s = String::new();
     crate::setup::dump_json(&meta, 0, &mut s);
@@ -448,7 +590,7 @@ mod sig {
 
 // ---------------------------------------------------------------------------------------------- report
 
-fn report(dirs: &[String]) -> Result<String, String> {
+pub fn report(dirs: &[String]) -> Result<String, String> {
     let mut out = String::from(
         "| run | frames | avg fps | 1%-low | p50 / p90 / p99 ms | over 50 / 100 ms | at 60 | GPU ms p50 / p90 / p99 | CPU ms/frame: main, render, MainJob1, MainDraw | load, GPU busy before | bound |\n\
          |---|---|---|---|---|---|---|---|---|---|---|\n",
@@ -540,8 +682,12 @@ fn analyse(d: &Path) -> Result<(String, String), String> {
     let late_gpu = share(lg.iter().filter(|&&x| x > 14.0).count(), lg.len());
     // max(): the first of equal values
     let (top, top_ms) = cpu.iter().copied().reduce(|b, e| if e.1 > b.1 { e } else { b }).unwrap_or(("?", 0.0));
-    let bound = if at60 >= 99.0 {
+    let bound = if n == 0 {
+        "incomplete (0 frames)".to_string()
+    } else if at60 >= 99.0 {
         "-".to_string()
+    } else if g.is_empty() {
+        format!("unknown (no GPU timings; top thread {} {:.1} ms)", top, top_ms)
     } else if late_gpu >= 50.0 {
         format!("GPU ({:.0} % of late frames)", late_gpu)
     } else {
@@ -558,9 +704,22 @@ fn analyse(d: &Path) -> Result<(String, String), String> {
         .and_then(Value::as_f64)
         .map_or("-".into(), |b| format!("{:.0} %", b));
     let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let is_legacy = !d.join("manifest.json").exists()
+        && meta.get("schema_version").is_none()
+        && meta.get("manifest").is_none();
+    let name_display = if is_legacy {
+        format!("{} (legacy)", name)
+    } else {
+        name.clone()
+    };
+    let gpu_stats = if g.is_empty() {
+        "-".to_string()
+    } else {
+        format!("{:.1} / {:.1} / {:.1}", pct(&g, 50.0), pct(&g, 90.0), pct(&g, 99.0))
+    };
     let row = format!(
-        "| {} | {} | {:.1} | {:.1} | {:.1} / {:.1} / {:.1} | {} / {} | {:.1} % | {:.1} / {:.1} / {:.1} | {:.1}, {:.1}, {:.1}, {:.1} | {}-{}, {} | {} |\n",
-        name,
+        "| {} | {} | {:.1} | {:.1} | {:.1} / {:.1} / {:.1} | {} / {} | {:.1} % | {} | {:.1}, {:.1}, {:.1}, {:.1} | {}-{}, {} | {} |\n",
+        name_display,
         n,
         fps,
         if n > 0 { 1000.0 / pct(&ms, 99.0) } else { 0.0 },
@@ -570,9 +729,7 @@ fn analyse(d: &Path) -> Result<(String, String), String> {
         ms.iter().filter(|&&x| x > 50.0).count(),
         ms.iter().filter(|&&x| x > 100.0).count(),
         at60,
-        pct(&g, 50.0),
-        pct(&g, 90.0),
-        pct(&g, 99.0),
+        gpu_stats,
         c("main"),
         c("render(host)"),
         c("MainJob1"),

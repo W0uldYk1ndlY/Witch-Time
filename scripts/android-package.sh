@@ -20,5 +20,27 @@ ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
 test -n "$ndk" || { echo 'Set ANDROID_NDK_HOME' >&2; exit 1; }
 cp "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$out/"
 python3 "$repo/scripts/android-verify-libs.py" "$out" "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+variant="Debug"
+gradle_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --diagnostic)
+            variant="Diagnostic"
+            shift
+            ;;
+        --debug)
+            variant="Debug"
+            shift
+            ;;
+        *)
+            gradle_args+=("$1")
+            shift
+            ;;
+    esac
+done
+if [[ "${WT_BUILD_VARIANT:-}" == "diagnostic" ]]; then
+    variant="Diagnostic"
+fi
+
 cd "$repo/android"
-exec gradle --no-daemon :app:assembleDebug "$@"
+exec gradle --no-daemon ":app:assemble${variant}" "${gradle_args[@]}"

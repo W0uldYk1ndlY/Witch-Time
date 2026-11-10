@@ -32,6 +32,7 @@
 #include <io.h>                 /* [Recomps#1] _get_osfhandle: was implicitly declared (int return), an error in clang >= 16 */
 #include "runtime.h"
 #include "hostrt.h"
+#include "diag.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -858,11 +859,12 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
                      modded ? ", from the romfs mod " : "", modded ? path : "");
     {   static int on = -1; if (on < 0) on = getenv("WT_FSLOG") != NULL;       /* D2 debug: every open on stdout */
         if (on) printf("fslog: open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r ? "NOT FOUND" : "ok"); }
-    if (r) { wr64(A0, 0); RET(r); return; }
+    if (r) { wr64(A0, 0); if (diag_is_enabled()) diag_hook_file_op(DIAG_FILE_OP_OPEN, 0, 0, (int32_t)r); RET(r); return; }
     open_remember(h, (int)(A2 & 7), m);
     ui_pkz_open(h, STR(1), path);
     if (modded) prompt_swap_open(h, path);              /* [Recomps#1] finding 148 */
     wr64(A0, (uint64_t)h);
+    if (diag_is_enabled()) diag_hook_file_op(DIAG_FILE_OP_OPEN, 0, 0, 0);
     RET(0);
 }
 static void fs_CloseFile(Ctx *c) { if (A0) { open_mode((HANDLE)A0, 1); prompt_swap_close((HANDLE)A0); CloseHandle((HANDLE)A0); } }
@@ -870,6 +872,7 @@ extern int g_hitch_ms; void hitch_note(const char *s);      /* hitch.c: WT_HITCH
 static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     uint64_t total = 0;
     if (g_hitch_ms) { char note[80]; snprintf(note, sizeof note, "read of %llu KB", (unsigned long long)(size >> 10)); hitch_note(note); }
+    uint64_t t0 = diag_is_enabled() ? diag_time_ns() : 0;
     while (total < size) {
         OVERLAPPED ov = {0};
         uint64_t pos = (uint64_t)offset + total;
@@ -878,6 +881,10 @@ static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
         DWORD chunk = size - total > 0x40000000 ? 0x40000000 : (DWORD)(size - total), got = 0;
         if (!ReadFile(h, (char *)buf + total, chunk, &got, &ov) || got == 0) break;
         total += got;
+    }
+    if (t0) {
+        uint64_t t1 = diag_time_ns();
+        diag_hook_file_op(DIAG_FILE_OP_READ, (int64_t)(t1 - t0), (int64_t)total, 0);
     }
     prompt_swap_read(h, (uint64_t)offset, (uint8_t *)buf, total);      /* [Recomps#1] finding 148 */
     /* [Recomps#1] the heap is write-watched (r2_imports.c): one CPU write per page of what was read, so the renderer's
@@ -912,8 +919,13 @@ static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer
     LARGE_INTEGER size;
     if (!(mode & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
     if (!(mode & 4) && GetFileSizeEx((HANDLE)A0, &size) && (int64_t)(A1 + A3) > size.QuadPart) { RET(RESULT_NO_APPEND); return; }   /* a file only grows in append mode */
+    uint64_t t0 = diag_is_enabled() ? diag_time_ns() : 0;
     if (A3 && !WriteFile((HANDLE)A0, (void *)(uintptr_t)A2, (DWORD)A3, &put, &ov)) { RET(RESULT_GENERIC_FAILURE); return; }
     if (A4 && (rd32(A4) & 1)) FlushFileBuffers((HANDLE)A0);                  /* WriteOption::Flush */
+    if (t0) {
+        uint64_t t1 = diag_time_ns();
+        diag_hook_file_op(DIAG_FILE_OP_WRITE, (int64_t)(t1 - t0), (int64_t)put, 0);
+    }
     RET(0);
 }
 static void fs_FlushFile(Ctx *c) { FlushFileBuffers((HANDLE)A0); RET(0); }   /* [witchtime] (handle) */

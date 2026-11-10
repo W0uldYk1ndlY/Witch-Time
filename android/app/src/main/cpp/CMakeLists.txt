@@ -3,7 +3,7 @@ project(witch_time_android C)
 if(NOT ANDROID OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
     message(FATAL_ERROR "This launcher requires Android arm64-v8a")
 endif()
-add_library(main SHARED main.c)
+add_library(main SHARED main.c diag_bootstrap.c)
 # jniLibs is the sole packaging owner for SDL; an IMPORTED SHARED target
 # would also be copied by AGP and cause duplicate native-library entries.
 target_include_directories(main PRIVATE "${WT_ANDROID_DEPS}/include")

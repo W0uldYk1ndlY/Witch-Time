@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run_20261110_190000_a1b2",
+  "created_utc": "2026-11-10T19:00:00Z",
+  "build": {
+    "variant": "diagnostic",
+    "target": "android-arm64",
+    "native_optimization": "release",
+    "git_commit": "5b6d8d9c0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b",
+    "build_id": "build-diag-20261110-01"
+  },
+  "scenario": {
+    "scenario_id": "shibuya_combat",
+    "route_id": "chapter0_verse1_fight",
+    "fixture_id": "fix_shibuya_v1",
+    "save_fixture": "fixtures/saves/shibuya_clean.sav",
+    "replay_fixture": "fixtures/replays/shibuya_p1.bin",
+    "deadlines": {
+      "startup_deadline_secs": 30.0,
+      "scenario_deadline_secs": 180.0,
+      "recovery_deadline_secs": 15.0
+    }
+  },
+  "profile": {
+    "profile_name": "lightweight",
+    "memory_budget_bytes": 8388608,
+    "storage_budget_bytes": 134217728,
+    "incident_disk_reserve_bytes": 16777216,
+    "max_incidents": 3,
+    "collectors": [
+      "frame_timing",
+      "gpu_timing",
+      "live_status"
+    ]
+  },
+  "configuration": {
+    "resolution": [1600, 900],
+    "fps_target": 60.0,
+    "audio_mode": "output",
+    "cache_mode": "app_cache_cold",
+    "input_policy": {
+      "source": "synthetic_fullkey_player1",
+      "mapping": "default_type_a",
+      "menu_confirm": "native_a"
+    }
+  },
+  "policy": {
+    "policy_id": "policy_oppo_n5_combat_v1",
+    "policy_hash": "sha256_e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "required_assertions": [
+      "visual_no_black_screen",
+      "audio_output_active",
+      "combat_checkpoint_reached"
+    ]
+  }
+}

@@ -6,6 +6,7 @@
  * pointers the exe hands over once at start-up (gamedll.c). */
 #include "runtime.h"
 #include "game_host.h"
+#include "diag_shim.h"
 #ifdef __ANDROID__
 #include <stdlib.h>
 #endif
@@ -59,4 +60,25 @@ __declspec(dllexport) void game_bind(const GameHost *h, GameTables *t) {
     t->fn_table_count = &fn_table_count;
     t->dyn_syms = dyn_syms;
     t->dyn_sym_count = &dyn_sym_count;
+}
+
+static GameDiagBinding g_active_diag_binding;
+static bool g_diag_bound = false;
+
+__declspec(dllexport) int game_diag_bind(const GameDiagBinding *in_bind, GameDiagBinding *out_bind) {
+    if (!in_bind || !out_bind) return DIAG_SHIM_ERR_NULL_BINDING;
+    if (in_bind->version != DIAG_SHIM_VERSION) return DIAG_SHIM_ERR_UNSUPPORTED_VERSION;
+    if (in_bind->program_id != DIAG_SHIM_PROGRAM_SUPPORTED) return DIAG_SHIM_ERR_UNSUPPORTED_PROGRAM;
+    if (!in_bind->game_hash || strcmp(in_bind->game_hash, DIAG_SHIM_SUPPORTED_GAME_HASH) != 0) return DIAG_SHIM_ERR_UNSUPPORTED_HASH;
+
+    g_active_diag_binding = *in_bind;
+    g_diag_bound = true;
+
+    out_bind->version = DIAG_SHIM_VERSION;
+    out_bind->program_id = DIAG_SHIM_PROGRAM_SUPPORTED;
+    out_bind->game_hash = DIAG_SHIM_SUPPORTED_GAME_HASH;
+    out_bind->capabilities = DIAG_SHIM_CAP_SEMANTIC_OBSERVATIONS | DIAG_SHIM_CAP_REPLAY_VALIDATION;
+    out_bind->on_semantic_observation = in_bind->on_semantic_observation;
+
+    return DIAG_SHIM_OK;
 }
