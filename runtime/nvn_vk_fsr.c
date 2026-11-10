@@ -14,6 +14,7 @@
  * follows AMD's ffx_fsr3upscaler.cpp (fsr3upscalerDispatch) for constants, resources and the order of the passes. */
 
 __declspec(dllimport) extern volatile int game_fsr_w, game_fsr_h, game_fsr_phases;      /* game_shim_eh.c h_cam_upload: the jitter's pixel size (0 = none) and its phase count */
+#include "fsr_limits.h"
 
 /* AMD's Fsr3UpscalerConstants (ffx_fsr3upscaler_private.h), the std140 block cbFSR3Upscaler */
 typedef struct {
@@ -263,11 +264,28 @@ static void fsr_img(FImg *im, VkFormat f, int w, int h, int levels, int storage)
 static const char *fsr_unable(void) {               /* what the device lacks for FSR, NULL when nothing (physical-device queries only: any thread) */
     static char m[96];
     if (!D.has_push) return "the device has no VK_KHR_push_descriptor";
+    const VkPhysicalDeviceLimits *limits = &V.props.limits;
+    const char *limit_error = fsr_limit_error(limits->maxComputeWorkGroupInvocations, limits->maxComputeWorkGroupSize[0], limits->maxComputeWorkGroupSize[1], limits->maxComputeSharedMemorySize, limits->maxPerStageDescriptorStorageImages, limits->maxDescriptorSetStorageImages, D.fsr_push_descriptors, D.fsr_compute_quad, fmt_supported(VK_FORMAT_R16_SNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT));
+    if (limit_error) return limit_error;
     if (!D.f2.features.shaderStorageImageWriteWithoutFormat) return "the device has no shaderStorageImageWriteWithoutFormat";
     for (int i = 0; i < FI_N; i++)
         if (k_fi[i].f && i != FI_LUT && !fmt_supported(k_fi[i].f, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { snprintf(m, sizeof m, "no storage images of format %d", (int)k_fi[i].f); return m; }
+    {   /* The current shader permutation linearly samples these internal formats. */
+        const VkFormat filtered[] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
+        for (unsigned i = 0; i < sizeof filtered / sizeof filtered[0]; i++)
+            if (!fmt_supported(filtered[i], VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) { snprintf(m, sizeof m, "no linear filtering for format %d", (int)filtered[i]); return m; }
+    }
     if (!fmt_supported(VK_FORMAT_R32_UINT, VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)) return "no image atomics on R32_UINT";
     return NULL;
+}
+static void fsr_release_setup(void) {
+    for (int p = 0; p < P_N; p++) {
+        if (F.pipe[p]) { vkDestroyPipeline(V.device, F.pipe[p], NULL); F.pipe[p] = VK_NULL_HANDLE; }
+        if (F.pl[p]) { vkDestroyPipelineLayout(V.device, F.pl[p], NULL); F.pl[p] = VK_NULL_HANDLE; }
+        if (F.dl[p]) { vkDestroyDescriptorSetLayout(V.device, F.dl[p], NULL); F.dl[p] = VK_NULL_HANDLE; }
+    }
+    for (int i = 0; i < 2; i++) if (F.smp[i]) { vkDestroySampler(V.device, F.smp[i], NULL); F.smp[i] = VK_NULL_HANDLE; }
+    if (F.ubo) { vkDestroyBuffer(V.device, F.ubo, NULL); vmem_free(F.ubo_mem); F.ubo = VK_NULL_HANDLE; memset(&F.ubo_mem, 0, sizeof F.ubo_mem); }
 }
 static int fsr_setup(void) {                       /* render thread, once: samplers, the uniform ring, the 8 pipelines */
     const char *why = fsr_unable();
@@ -304,12 +322,12 @@ static int fsr_setup(void) {                       /* render thread, once: sampl
         char what[96]; snprintf(what, sizeof what, "FSR pass %s", k_fpass[p].file ? k_fpass[p].file : "camera motion vectors");
         VkShaderModule mod = src.p ? module_from_glsl(5, src.p, what, &h) : NULL;
         free(src.p);
-        if (!mod) { fsr_off("a pass did not compile (the line before names it)"); return 0; }
+        if (!mod) { fsr_release_setup(); fsr_off("a pass did not compile (the line before names it)"); return 0; }
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = mod; ci.stage.pName = "main"; ci.layout = F.pl[p];
         VkResult r = vkCreateComputePipelines(V.device, g_pcache, 1, &ci, NULL, &F.pipe[p]);
         vkDestroyShaderModule(V.device, mod, NULL);
-        if (r != VK_SUCCESS) { fsr_off("vkCreateComputePipelines failed"); return 0; }
+        if (r != VK_SUCCESS) { printf("nvn_vk_fsr: %s: vkCreateComputePipelines failed: %s (%d)\n", what, vk_result_name(r), (int)r); fsr_release_setup(); fsr_off("vkCreateComputePipelines failed"); return 0; }
     }
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     printf("nvn_vk_fsr: FSR 3.1.4 ready (8 compute pipelines, %.0f ms)\n", (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
@@ -707,13 +725,7 @@ static void fsr_draw(VStage *fs) {
 }
 /* nvn_vk_draw.c, at shutdown (the GPU is idle; the images went with the others) */
 static void fsr_shutdown(void) {
-    for (int p = 0; p < P_N; p++) {
-        if (F.pipe[p]) vkDestroyPipeline(V.device, F.pipe[p], NULL);
-        if (F.pl[p]) vkDestroyPipelineLayout(V.device, F.pl[p], NULL);
-        if (F.dl[p]) vkDestroyDescriptorSetLayout(V.device, F.dl[p], NULL);
-    }
-    for (int i = 0; i < 2; i++) if (F.smp[i]) vkDestroySampler(V.device, F.smp[i], NULL);
-    if (F.ubo) { vkDestroyBuffer(V.device, F.ubo, NULL); vmem_free(F.ubo_mem); }
+    fsr_release_setup();
     memset(&F, 0, sizeof F);
 }
 /* nvn_vk_draw.c vk_present2: a frame ends */
