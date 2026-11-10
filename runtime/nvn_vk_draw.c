@@ -332,6 +332,11 @@ static int oq_event(int q, uint64_t addr) {
     return 1;
 }
 static void oq_begin(void) {
+#ifdef __ANDROID__
+    /* Qualcomm Adreno GPU tile architecture crashes / loses device when hardware occlusion
+     * queries are begun/ended across render passes. Visibility is handled safely on host. */
+    return;
+#else
     if (!g_oq_on || g_oq_open >= 0 || !R.in_pass) return;
     if (!g_oq_pool) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = NSLOT * OQ_MAX;
@@ -342,45 +347,51 @@ static void oq_begin(void) {
     g_oq_open = g_oq_used[R.cur]++;
     vkCmdBeginQuery(R.cmd, g_oq_pool, (uint32_t)(R.cur * OQ_MAX + g_oq_open), D.f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     g_oq_queries++;
+#endif
 }
 static void oq_end(void) {
+#ifdef __ANDROID__
+    return;
+#else
     if (g_oq_open < 0) return;
     vkCmdEndQuery(R.cmd, g_oq_pool, (uint32_t)(R.cur * OQ_MAX + g_oq_open));
     g_oq_open = -1;
+#endif
 }
 static uint64_t vk_now_ns(void);
 static void oq_poll(void);
 static void oq_land(int si) {                     /* slot_wait: the slot's GPU work has finished */
-    int n = g_oq_used[si];
-    static uint64_t r[OQ_MAX];
     if (!g_oq_nev[si]) return;
 #ifdef __ANDROID__
-    if (n) {
-        /* Mobile drivers (Qualcomm Adreno) can hang indefinitely when host waits on query results with WAIT_BIT.
-         * Poll without WAIT_BIT; if incomplete, synthesize positive sample count so visibility logic does not stall. */
-        VkResult qres = vkGetQueryPoolResults(V.device, g_oq_pool, (uint32_t)(si * OQ_MAX), (uint32_t)n, sizeof r[0] * (size_t)n, r, 8, VK_QUERY_RESULT_64_BIT);
-        if (qres != VK_SUCCESS) {
-            for (int k = 0; k < n; k++) r[k] = 1000;
+    for (int i = 0; i < g_oq_nev[si]; i++) {
+        OqEv *e = &g_oq_ev[si][i];
+        if (e->q >= 0) g_oq_run += 1000;
+        else if (e->q == OQ_EV_RESET) g_oq_run = 0;
+        else if (e->addr) {
+            uint64_t d[2] = {1000, vk_now_ns()};
+            memcpy((void *)(uintptr_t)e->addr, d, 16);
+            R.gen++;
         }
     }
+    g_oq_nev[si] = 0;
+    return;
 #else
+    int n = g_oq_used[si];
+    static uint64_t r[OQ_MAX];
     if (n && vkGetQueryPoolResults(V.device, g_oq_pool, (uint32_t)(si * OQ_MAX), (uint32_t)n, sizeof r[0] * (size_t)n, r, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
         memset(r, 0, sizeof r[0] * (size_t)n);
-#endif
     for (int i = 0; i < g_oq_nev[si]; i++) {
         OqEv *e = &g_oq_ev[si][i];
         if (e->q >= 0) g_oq_run += r[e->q];
         else if (e->q == OQ_EV_RESET) g_oq_run = 0;
         else if (e->addr) {
             uint64_t d[2] = {g_oq_run, vk_now_ns()};
-#ifdef __ANDROID__
-            if (!d[0]) d[0] = 1000;
-#endif
             memcpy((void *)(uintptr_t)e->addr, d, 16);
             R.gen++;
         }
     }
     g_oq_nev[si] = 0;
+#endif
 }
 /* [Recomps#1] findings 118-119: texels the game reads on the CPU. On the Switch the GPU writes a texture's memory and the CPU can map
  * its pool and read it: Bayonetta 2 downsamples its linear depth into a pitch-linear (flag 0x10) 1280x720 R32F texture every frame
@@ -422,7 +433,9 @@ static void lr_forget(Tex *t) {                    /* vk_drop: the texture is fi
     for (int si = 0; si < NSLOT; si++) for (int i = 0; i < g_lr_nev[si]; i++) if (g_lr_ev[si][i].t == t) g_lr_ev[si][i].t = NULL;
 }
 static void oq_slot_reset(int si) {               /* cmd_begin, after the slot's fence: the slot's queries are reset in its new command buffer */
+#ifndef __ANDROID__
     if (g_oq_pool && g_oq_used[si]) vkCmdResetQueryPool(R.slot[si].cmd, g_oq_pool, (uint32_t)(si * OQ_MAX), OQ_MAX);
+#endif
     g_oq_used[si] = 0; g_oq_nev[si] = 0;
 }
 static int framelog_on(void);                      /* [witchtime] TEST ONLY: WT_VK_FRAMELOG (below) */
@@ -4307,6 +4320,17 @@ static void exec(const Cmd *m, int depth) {
         if (type < 32 && !InterlockedExchange(&said[type], 1)) printf("nvn_vk: nvnCommandBuffer%sCounter type %u (first use)\n", m->op == OP_COUNTER_RESET ? "Reset" : "Report", type);
         if (type > 1) { static char msg[80]; snprintf(msg, sizeof msg, "nvnCommandBuffer%sCounter of counter type %u (needs a GPU query)", m->op == OP_COUNTER_RESET ? "Reset" : "Report", type); nvn_vk_missing(msg); break; }
         if (type == 1) {
+#ifdef __ANDROID__
+            if (m->op == OP_COUNTER_RESET) {
+                oq_event(OQ_EV_RESET, 0);
+            } else if (a[1]) {
+                uint64_t d[2] = {1000, vk_now_ns()};
+                memcpy(P(a[1]), d, 16);
+                oq_event(OQ_EV_REPORT, a[1]);
+                g_oq_reports++;
+            }
+            break;
+#else
             if (!R.recording) cmd_begin();
             int in_pass = R.in_pass;
             oq_end();
@@ -4314,6 +4338,7 @@ static void exec(const Cmd *m, int depth) {
             else { oq_event(OQ_EV_REPORT, a[1]); g_oq_reports++; }
             if (in_pass) oq_begin();                                            /* counting goes on in this pass */
             break;
+#endif
         }
         if (m->op == OP_COUNTER_REPORT && a[1]) { uint64_t d[2] = {0, vk_now_ns()}; cb_sync(); if (g_ngcp) gcp_overwritten(a[1], 16); memcpy(P(a[1]), d, 16); R.gen++; }
         break;
