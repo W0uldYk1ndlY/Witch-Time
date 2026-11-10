@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <signal.h>
 #include <linux/fs.h>
 #include <linux/userfaultfd.h>
 #include <sys/ioctl.h>
@@ -91,10 +92,12 @@ static void ph_release(PH *h) {
 static void *thread_entry(void *p) {
     PH *h = p;
     h->tid = (pid_t)syscall(SYS_gettid);
+    plat_soft_ww_thread_setup_altstack();
     pthread_mutex_lock(&h->m);
     while (h->suspended) pthread_cond_wait(&h->cv, &h->m);
     pthread_mutex_unlock(&h->m);
     DWORD code = h->fn(h->arg);
+    plat_soft_ww_thread_teardown_altstack();
     pthread_mutex_lock(&h->m);
     h->code = code; h->signaled = 1;
     pthread_cond_broadcast(&h->cv);
@@ -341,10 +344,26 @@ void DeleteFiber(LPVOID fiber) {
 }
 
 /* ---------------------------------------------------------------- memory */
-typedef struct { uintptr_t base; size_t size; int ww; } Region;   /* ww: 0 no write watch, 1 tracked by the kernel, 2 untracked (every page written) */
+typedef struct {
+    uintptr_t base;
+    size_t size;
+    int ww;              /* ww: 0 no write watch, 1 tracked by the kernel, 2 untracked (every page written), 3 soft ww */
+    DWORD logical_prot;  /* application-requested logical protection (PAGE_READWRITE, PAGE_READONLY, etc.) */
+    uint64_t generation; /* unique generation counter */
+} Region;
 static Region *g_regions;
 static size_t g_nregions, g_cap;
+static uint64_t g_region_generation = 1;
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static Region *region_find_locked(uintptr_t addr) {
+    for (size_t i = 0; i < g_nregions; i++) {
+        if (g_regions[i].base <= addr && addr < g_regions[i].base + g_regions[i].size) {
+            return &g_regions[i];
+        }
+    }
+    return NULL;
+}
 /* Host pages can be 16 KiB on Android; guest pages are always 4 KiB.
  * These helpers reject overflow before issuing a syscall. */
 static size_t host_page_size(void) {
@@ -375,7 +394,292 @@ static int to_prot(DWORD p) {
  * pages written and protects them again in one call (Linux 6.7+; Wine emulates write watches the same way). Without it
  * (an older kernel, userfaultfd not allowed) a watched region answers "every page written": always correct, only slower. */
 static int g_uffd = -1, g_pagemap = -1, g_ww_state;   /* g_ww_state: 0 not tried, 1 on, 2 not available */
+static int g_ww_soft = -1;
+int plat_ww_soft_enabled(void) {
+    if (g_ww_soft < 0) {
+        const char *e = getenv("WT_WW_SOFT");
+        g_ww_soft = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return g_ww_soft;
+}
+
+#define SOFT_WW_DEFAULT_BUDGET (16 * 1024 * 1024)
+
+typedef struct SoftWWTracker {
+    uintptr_t base;
+    size_t size;
+    uint64_t generation;
+    size_t guest_page_count;
+    size_t host_page_count;
+    size_t pages_per_host;
+    uint8_t *guest_dirty_bitmap;   /* 1 bit per 4 KB guest page: 1 = dirty, 0 = clean */
+    uint8_t *host_page_state;      /* 1 byte per host page */
+    uint16_t *host_lease_count;    /* active write lease count per host page */
+    size_t metadata_bytes;
+    struct SoftWWTracker *next;
+} SoftWWTracker;
+
+static size_t g_soft_ww_budget = SOFT_WW_DEFAULT_BUDGET;
+static size_t g_soft_ww_mem_bytes = 0;
+static uint64_t g_soft_ww_generation = 1;
+static SoftWWTracker *g_soft_ww_trackers = NULL;
+static int g_soft_ww_fault_inject = 0;
+static int g_kernel_ww_test_override = -1;
+static uintptr_t g_test_stack_base = 0;
+static size_t g_test_stack_size = 0;
+
+static int is_address_in_stack(uintptr_t addr, size_t size) {
+    uintptr_t end = addr + size;
+    if (g_test_stack_base && g_test_stack_size) {
+        uintptr_t s_end = g_test_stack_base + g_test_stack_size;
+        if (!(end <= g_test_stack_base || addr >= s_end)) return 1;
+    }
+    if (t_fiber && t_fiber->stack) {
+        uintptr_t f_start = (uintptr_t)t_fiber->stack;
+        uintptr_t f_end = f_start + t_fiber->stack_size;
+        if (!(end <= f_start || addr >= f_end)) return 1;
+    }
+    stack_t ss;
+    if (sigaltstack(NULL, &ss) == 0 && !(ss.ss_flags & SS_DISABLE)) {
+        uintptr_t s_start = (uintptr_t)ss.ss_sp;
+        uintptr_t s_end = s_start + ss.ss_size;
+        if (!(end <= s_start || addr >= s_end)) return 1;
+    }
+#if defined(_GNU_SOURCE) || defined(__BIONIC__)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void *st_addr = NULL;
+        size_t st_size = 0;
+        if (pthread_attr_getstack(&attr, &st_addr, &st_size) == 0 && st_addr) {
+            uintptr_t st_start = (uintptr_t)st_addr;
+            uintptr_t st_end = st_start + st_size;
+            pthread_attr_destroy(&attr);
+            if (!(end <= st_start || addr >= st_end)) return 1;
+        } else {
+            pthread_attr_destroy(&attr);
+        }
+    }
+#endif
+    return 0;
+}
+
+int plat_soft_ww_is_range_eligible(uintptr_t addr, size_t size, DWORD type, size_t page_size) {
+    if (!(type & MEM_WRITE_WATCH)) return 0;
+    if (page_size != 4096 && page_size != 16384) return 0;
+    if (!size || size > UINTPTR_MAX - addr) return 0;
+    if (addr % page_size != 0 || size % page_size != 0) return 0;
+    if (is_address_in_stack(addr, size)) return 0;
+    return 1;
+}
+
+static SoftWWTracker *soft_ww_tracker_find_locked(uintptr_t addr) {
+    SoftWWTracker *t = g_soft_ww_trackers;
+    while (t) {
+        if (t->base <= addr && addr < t->base + t->size) return t;
+        t = t->next;
+    }
+    return NULL;
+}
+
+static SoftWWTracker *soft_ww_tracker_create(uintptr_t base, size_t size, size_t page_size, int initial_prot) {
+    (void)initial_prot;
+    if (g_soft_ww_fault_inject) return NULL;
+    if (!plat_soft_ww_is_range_eligible(base, size, MEM_WRITE_WATCH, page_size)) return NULL;
+
+    size_t guest_pages = size / 4096;
+    size_t host_pages = size / page_size;
+    size_t pages_per_host = page_size / 4096;
+    size_t bitmap_bytes = (guest_pages + 7) / 8;
+    size_t host_state_bytes = host_pages * sizeof(uint8_t);
+    size_t lease_bytes = host_pages * sizeof(uint16_t);
+    size_t total_needed = sizeof(SoftWWTracker) + bitmap_bytes + host_state_bytes + lease_bytes;
+
+    pthread_mutex_lock(&g_reg_lock);
+    if (g_soft_ww_mem_bytes + total_needed > g_soft_ww_budget) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return NULL;
+    }
+
+    SoftWWTracker *t = (SoftWWTracker *)calloc(1, sizeof(SoftWWTracker));
+    if (!t) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return NULL;
+    }
+
+    t->guest_dirty_bitmap = (uint8_t *)malloc(bitmap_bytes);
+    t->host_page_state = (uint8_t *)calloc(host_pages, sizeof(uint8_t));
+    t->host_lease_count = (uint16_t *)calloc(host_pages, sizeof(uint16_t));
+
+    if (!t->guest_dirty_bitmap || !t->host_page_state || !t->host_lease_count) {
+        free(t->guest_dirty_bitmap);
+        free(t->host_page_state);
+        free(t->host_lease_count);
+        free(t);
+        pthread_mutex_unlock(&g_reg_lock);
+        return NULL;
+    }
+
+    memset(t->guest_dirty_bitmap, 0, bitmap_bytes);
+
+    t->base = base;
+    t->size = size;
+    t->generation = ++g_soft_ww_generation;
+    t->guest_page_count = guest_pages;
+    t->host_page_count = host_pages;
+    t->pages_per_host = pages_per_host;
+    t->metadata_bytes = total_needed;
+
+    t->next = g_soft_ww_trackers;
+    g_soft_ww_trackers = t;
+    g_soft_ww_mem_bytes += total_needed;
+    pthread_mutex_unlock(&g_reg_lock);
+
+    return t;
+}
+
+static void soft_ww_tracker_destroy(uintptr_t base) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker **pp = &g_soft_ww_trackers;
+    while (*pp) {
+        SoftWWTracker *t = *pp;
+        if (t->base == base) {
+            *pp = t->next;
+            if (g_soft_ww_mem_bytes >= t->metadata_bytes) {
+                g_soft_ww_mem_bytes -= t->metadata_bytes;
+            } else {
+                g_soft_ww_mem_bytes = 0;
+            }
+            free(t->guest_dirty_bitmap);
+            free(t->host_page_state);
+            free(t->host_lease_count);
+            free(t);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+static inline int soft_ww_get_guest_dirty(const SoftWWTracker *t, size_t idx) {
+    return (t->guest_dirty_bitmap[idx / 8] >> (idx % 8)) & 1;
+}
+
+static inline void soft_ww_set_guest_dirty(SoftWWTracker *t, size_t idx) {
+    t->guest_dirty_bitmap[idx / 8] |= (uint8_t)(1 << (idx % 8));
+}
+
+static inline void soft_ww_clear_guest_dirty(SoftWWTracker *t, size_t idx) {
+    t->guest_dirty_bitmap[idx / 8] &= (uint8_t)~(1 << (idx % 8));
+}
+
+static UINT soft_ww_query(DWORD flags, uintptr_t start, uintptr_t end, PVOID *addrs, ULONG_PTR *count) {
+    ULONG_PTR cap = *count;
+    *count = 0;
+    if (cap == 0) return 0;
+
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(start);
+    if (!t || end > t->base + t->size) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 1;
+    }
+
+    size_t first_guest = (start - t->base) / 4096;
+    size_t last_guest = (end - t->base) / 4096;
+    if (last_guest > t->guest_page_count) last_guest = t->guest_page_count;
+
+    ULONG_PTR n = 0;
+    int do_reset = (flags & WRITE_WATCH_FLAG_RESET) != 0;
+
+    for (size_t g = first_guest; g < last_guest && n < cap; g++) {
+        if (soft_ww_get_guest_dirty(t, g)) {
+            addrs[n++] = (void *)(t->base + (uintptr_t)g * 4096);
+        }
+    }
+    *count = n;
+
+    if (do_reset && n > 0) {
+        size_t host_ps = t->pages_per_host * 4096;
+        size_t first_host = first_guest / t->pages_per_host;
+        size_t last_host = (last_guest + t->pages_per_host - 1) / t->pages_per_host;
+        if (last_host > t->host_page_count) last_host = t->host_page_count;
+
+        for (size_t h = first_host; h < last_host; h++) {
+            if (t->host_lease_count[h] > 0) continue;
+
+            int has_reported = 0;
+            for (ULONG_PTR i = 0; i < n; i++) {
+                uintptr_t pa = (uintptr_t)addrs[i];
+                size_t g = (pa - t->base) / 4096;
+                if (g / t->pages_per_host == h) {
+                    has_reported = 1;
+                    break;
+                }
+            }
+            if (!has_reported) continue;
+
+            uintptr_t host_base = t->base + h * host_ps;
+            if (mprotect((void *)host_base, host_ps, PROT_READ) == 0) {
+                t->host_page_state[h] = 0;
+                for (ULONG_PTR i = 0; i < n; i++) {
+                    uintptr_t pa = (uintptr_t)addrs[i];
+                    size_t g = (pa - t->base) / 4096;
+                    if (g / t->pages_per_host == h) {
+                        soft_ww_clear_guest_dirty(t, g);
+                    }
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_reg_lock);
+    return 0;
+}
+
+static UINT soft_ww_reset_range(uintptr_t start, uintptr_t end) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(start);
+    if (!t || end > t->base + t->size) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 1;
+    }
+
+    size_t first_guest = (start - t->base) / 4096;
+    size_t last_guest = (end - t->base) / 4096;
+    if (last_guest > t->guest_page_count) last_guest = t->guest_page_count;
+
+    size_t host_ps = t->pages_per_host * 4096;
+    size_t first_host = first_guest / t->pages_per_host;
+    size_t last_host = (last_guest + t->pages_per_host - 1) / t->pages_per_host;
+    if (last_host > t->host_page_count) last_host = t->host_page_count;
+
+    int all_ok = 1;
+    for (size_t h = first_host; h < last_host; h++) {
+        if (t->host_lease_count[h] > 0) {
+            all_ok = 0;
+            continue;
+        }
+
+        uintptr_t host_base = t->base + h * host_ps;
+        if (mprotect((void *)host_base, host_ps, PROT_READ) == 0) {
+            t->host_page_state[h] = 0;
+            size_t h_first_g = h * t->pages_per_host;
+            size_t h_last_g = h_first_g + t->pages_per_host;
+            for (size_t g = h_first_g; g < h_last_g; g++) {
+                if (g >= first_guest && g < last_guest) {
+                    soft_ww_clear_guest_dirty(t, g);
+                }
+            }
+        } else {
+            all_ok = 0;
+        }
+    }
+
+    pthread_mutex_unlock(&g_reg_lock);
+    return all_ok ? 0 : 1;
+}
 static int ww_available(void) {
+    if (g_kernel_ww_test_override >= 0) return g_kernel_ww_test_override == 1;
     /* The renderer stamps 4 KiB guest pages. Resetting one 16 KiB kernel page
      * would lose dirty state in neighboring guest pages that were not queried.
      * Report every guest page instead: conservative, never falsely clean. */
@@ -413,7 +717,14 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (!page_span((uintptr_t)addr, size, host_page_size(), &a, &n)) return NULL;
     if (!(type & MEM_RESERVE)) {               /* commit inside a reservation */
         if (mprotect((void *)a, n, to_prot(prot))) return NULL;
+        pthread_mutex_lock(&g_reg_lock);
+        Region *r = region_find_locked(a);
+        if (r) r->logical_prot = prot;
+        pthread_mutex_unlock(&g_reg_lock);
         if (ww_of(a, n) == 1) ww_protect(a, n);  /* newly committed pages are not written (as on Windows) */
+        else if (ww_of(a, n) == 3 && (to_prot(prot) & PROT_WRITE)) {
+            mprotect((void *)a, n, PROT_READ);
+        }
         return addr;
     }
     if (addr && a != (uintptr_t)addr) { errno = EINVAL; return NULL; }
@@ -423,12 +734,27 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (p == MAP_FAILED || (addr && p != addr)) { if (p != MAP_FAILED) munmap(p, size); return NULL; }
     int ww = 0;
     if (type & MEM_WRITE_WATCH) {
-        struct uffdio_register reg = { .range = { (uintptr_t)p, size }, .mode = UFFDIO_REGISTER_MODE_WP };
-        ww = ww_available() && ioctl(g_uffd, UFFDIO_REGISTER, &reg) == 0 && ww_protect((uintptr_t)p, size) ? 1 : 2;
+        if (ww_available()) {
+            struct uffdio_register reg = { .range = { (uintptr_t)p, size }, .mode = UFFDIO_REGISTER_MODE_WP };
+            ww = (ioctl(g_uffd, UFFDIO_REGISTER, &reg) == 0 && ww_protect((uintptr_t)p, size)) ? 1 : 2;
+        } else if (plat_ww_soft_enabled() && plat_soft_ww_is_range_eligible((uintptr_t)p, size, type, host_page_size())) {
+            SoftWWTracker *tr = soft_ww_tracker_create((uintptr_t)p, size, host_page_size(), (type & MEM_COMMIT) ? to_prot(prot) : PROT_NONE);
+            if (tr) {
+                ww = 3;
+                if ((type & MEM_COMMIT) && (to_prot(prot) & PROT_WRITE)) {
+                    mprotect(p, size, PROT_READ);
+                }
+            } else {
+                ww = 2;
+            }
+        } else {
+            ww = 2;
+        }
     }
     pthread_mutex_lock(&g_reg_lock);
     if (g_nregions == g_cap) { g_cap = g_cap ? g_cap * 2 : 256; g_regions = realloc(g_regions, g_cap * sizeof *g_regions); }
-    g_regions[g_nregions++] = (Region){ (uintptr_t)p, size, ww };
+    uint64_t gen = ++g_region_generation;
+    g_regions[g_nregions++] = (Region){ (uintptr_t)p, size, ww, (type & MEM_COMMIT) ? prot : PAGE_NOACCESS, gen };
     pthread_mutex_unlock(&g_reg_lock);
     return p;
 }
@@ -440,6 +766,19 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
         /* Discarding a whole host page for a guest subpage would corrupt live
          * neighbors. Subpage decommit needs emulation, not outward rounding. */
         if (page > 4096 && (a != (uintptr_t)addr || n != size)) { errno = ENOTSUP; return FALSE; }
+        pthread_mutex_lock(&g_reg_lock);
+        Region *r = region_find_locked(a);
+        if (r && r->ww == 3) {
+            r->logical_prot = PAGE_NOACCESS;
+            SoftWWTracker *t = soft_ww_tracker_find_locked(a);
+            if (t) {
+                size_t first_guest = (a - t->base) / 4096;
+                size_t last_guest = (a + n - t->base) / 4096;
+                if (last_guest > t->guest_page_count) last_guest = t->guest_page_count;
+                for (size_t g = first_guest; g < last_guest; g++) soft_ww_clear_guest_dirty(t, g);
+            }
+        }
+        pthread_mutex_unlock(&g_reg_lock);
         madvise((void *)a, n, MADV_DONTNEED);
         return mprotect((void *)a, n, PROT_NONE) == 0;
     }
@@ -449,6 +788,7 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
             Region r = g_regions[i];
             g_regions[i] = g_regions[--g_nregions];
             pthread_mutex_unlock(&g_reg_lock);
+            if (r.ww == 3) soft_ww_tracker_destroy((uintptr_t)addr);
             return munmap(addr, r.size) == 0;
         }
     pthread_mutex_unlock(&g_reg_lock);
@@ -456,14 +796,43 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     return FALSE;                              /* not the base of a VirtualAlloc region, as on Windows */
 }
 BOOL VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, DWORD *old) {
-    MEMORY_BASIC_INFORMATION mi;
-    if (old) *old = VirtualQuery(addr, &mi, sizeof mi) ? mi.Protect : PAGE_NOACCESS;
     uintptr_t a;
     size_t n, page = host_page_size();
     if (!page_span((uintptr_t)addr, size, page, &a, &n)) return FALSE;
     /* There is no independent 4 KiB protection inside one 16 KiB host page.
      * Fail rather than change the permissions of neighboring guest memory. */
     if (page > 4096 && (a != (uintptr_t)addr || n != size)) { errno = ENOTSUP; return FALSE; }
+
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(a);
+    if (r) {
+        if (old) *old = r->logical_prot;
+        if (r->ww == 3) {
+            r->logical_prot = prot;
+            int host_prot = to_prot(prot);
+            if (host_prot & PROT_WRITE) host_prot = (host_prot & ~PROT_WRITE) | PROT_READ;
+            int res = mprotect((void *)a, n, host_prot);
+            if (res != 0) {
+                pthread_mutex_unlock(&g_reg_lock);
+                return FALSE;
+            }
+            SoftWWTracker *t = soft_ww_tracker_find_locked(a);
+            if (t && !(to_prot(prot) & PROT_WRITE)) {
+                size_t first_host = (a - t->base) / (t->pages_per_host * 4096);
+                size_t last_host = (a + n - 1 - t->base) / (t->pages_per_host * 4096);
+                if (last_host >= t->host_page_count) last_host = t->host_page_count - 1;
+                for (size_t h = first_host; h <= last_host; h++) t->host_page_state[h] = 0;
+            }
+            pthread_mutex_unlock(&g_reg_lock);
+            return TRUE;
+        }
+    } else {
+        if (old) {
+            MEMORY_BASIC_INFORMATION mi;
+            *old = VirtualQuery(addr, &mi, sizeof mi) ? mi.Protect : PAGE_NOACCESS;
+        }
+    }
+    pthread_mutex_unlock(&g_reg_lock);
     return mprotect((void *)a, n, to_prot(prot)) == 0;
 }
 /* shortcut: reads /proc/self/maps on every call (fine for the runtime's diagnostics; cache it if a hot path calls it) */
@@ -495,6 +864,14 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     fclose(f);
     (void)prev_hi;
     if (!found) { mi->BaseAddress = (void *)page; mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = ps; }
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(page);
+    if (r && (r->ww == 3 || r->ww == 2)) {
+        mi->Protect = r->logical_prot;
+        mi->AllocationProtect = r->logical_prot;
+        mi->State = (r->logical_prot == PAGE_NOACCESS) ? MEM_RESERVE : MEM_COMMIT;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
     return sizeof *mi;
 }
 BOOL IsBadReadPtr(const void *p, UINT_PTR n) {
@@ -530,6 +907,8 @@ UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR
         }
         if (ww == 1) { *count = n; return 0; }
         start = (uintptr_t)base & ~(uintptr_t)4095;
+    } else if (ww == 3) {
+        return soft_ww_query(flags, start, end, addrs, count);
     }
     /* untracked: fail so callers treat memory as unwatched instead of falsely marking every page dirty on every frame */
     return 1;
@@ -540,7 +919,9 @@ UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     if (!page_span((uintptr_t)base, size, 4096, &a, &n)) return 1;
     int ww = size ? ww_of(a, n) : 0;
     if (!ww) return 1;
-    return ww == 1 && !ww_protect(a, n);
+    if (ww == 1) return !ww_protect(a, n);
+    if (ww == 3) return soft_ww_reset_range(a, a + n);
+    return 1;
 }
 void GetSystemInfo(SYSTEM_INFO *si) {
     memset(si, 0, sizeof *si);
@@ -723,19 +1104,97 @@ HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES 
 }
 static int file_fd(HANDLE h) { PH *p = h; return h && h != INVALID_HANDLE_VALUE && (p->kind == H_FILE || p->kind == H_MAP) ? p->fd : -1; }
 int _get_osfhandle_fd(HANDLE h) { return file_fd(h); }
+void plat_soft_ww_lease_begin(uintptr_t addr, size_t size, SoftWWLease *lease) {
+    if (!lease) return;
+    memset(lease, 0, sizeof *lease);
+    if (!addr || !size) return;
+
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(addr);
+    if (!r || r->ww != 3 || !(to_prot(r->logical_prot) & PROT_WRITE)) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return;
+    }
+
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (!t || addr + size > t->base + t->size || t->generation != r->generation) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return;
+    }
+
+    size_t host_ps = t->pages_per_host * 4096;
+    lease->addr = addr;
+    lease->size = size;
+    lease->generation = r->generation;
+    lease->first_host = (addr - t->base) / host_ps;
+    lease->last_host = (addr + size - 1 - t->base) / host_ps;
+    if (lease->last_host >= t->host_page_count) lease->last_host = t->host_page_count - 1;
+
+    for (size_t h = lease->first_host; h <= lease->last_host; h++) {
+        t->host_lease_count[h]++;
+        t->host_page_state[h] = 1; /* writable */
+        uintptr_t host_base = t->base + h * host_ps;
+        mprotect((void *)host_base, host_ps, PROT_READ | PROT_WRITE);
+        size_t start_g = h * t->pages_per_host;
+        size_t end_g = start_g + t->pages_per_host;
+        for (size_t g = start_g; g < end_g; g++) {
+            soft_ww_set_guest_dirty(t, g);
+        }
+    }
+    lease->active = 1;
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+void plat_soft_ww_lease_end(SoftWWLease *lease, size_t bytes_written) {
+    if (!lease || !lease->active) return;
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(lease->addr);
+    if (r && r->ww == 3 && r->generation == lease->generation) {
+        SoftWWTracker *t = soft_ww_tracker_find_locked(lease->addr);
+        if (t && t->generation == lease->generation) {
+            for (size_t h = lease->first_host; h <= lease->last_host; h++) {
+                if (t->host_lease_count[h] > 0) t->host_lease_count[h]--;
+            }
+            if (bytes_written > 0) {
+                size_t host_ps = t->pages_per_host * 4096;
+                size_t written_last_host = (lease->addr + bytes_written - 1 - t->base) / host_ps;
+                if (written_last_host >= t->host_page_count) written_last_host = t->host_page_count - 1;
+                for (size_t h = lease->first_host; h <= written_last_host; h++) {
+                    size_t start_g = h * t->pages_per_host;
+                    size_t end_g = start_g + t->pages_per_host;
+                    for (size_t g = start_g; g < end_g; g++) {
+                        soft_ww_set_guest_dirty(t, g);
+                    }
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+    lease->active = 0;
+}
+
 BOOL ReadFile(HANDLE h, LPVOID buf, DWORD n, DWORD *got, OVERLAPPED *ov) {
     int fd = file_fd(h);
     if (got) *got = 0;
     size_t done = 0;
     off_t off = ov ? (off_t)(((uint64_t)ov->OffsetHigh << 32) | ov->Offset) : 0;
+    SoftWWLease lease;
+    plat_soft_ww_lease_begin((uintptr_t)buf, n, &lease);
     while (done < n) {   /* like ReadFile on a disk file: everything up to the end, short only at the end */
         ssize_t r = ov ? pread(fd, (uint8_t *)buf + done, n - done, off + (off_t)done) : read(fd, (uint8_t *)buf + done, n - done);
-        if (r < 0) { if (errno == EINTR) continue; fail_errno(); if (got) *got = (DWORD)done; return FALSE; }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            fail_errno();
+            if (got) *got = (DWORD)done;
+            plat_soft_ww_lease_end(&lease, done);
+            return FALSE;
+        }
         if (r == 0) break;
         done += (size_t)r;
     }
     if (got) *got = (DWORD)done;
     if (ov) ov->InternalHigh = done;
+    plat_soft_ww_lease_end(&lease, done);
     return TRUE;
 }
 BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD n, DWORD *put, OVERLAPPED *ov) {
@@ -944,11 +1403,18 @@ BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     return TRUE;
 }
 BOOLEAN SystemFunction036(PVOID buf, ULONG n) {
+    SoftWWLease lease;
+    plat_soft_ww_lease_begin((uintptr_t)buf, n, &lease);
     for (ULONG done = 0; done < n;) {
         ssize_t r = getrandom((uint8_t *)buf + done, n - done, 0);
-        if (r < 0) { if (errno == EINTR) continue; return FALSE; }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            plat_soft_ww_lease_end(&lease, done);
+            return FALSE;
+        }
         done += (ULONG)r;
     }
+    plat_soft_ww_lease_end(&lease, n);
     return TRUE;
 }
 /* __argc / __argv as the MSVC and mingw C runtimes have them: glibc hands every constructor the program's arguments */
@@ -1039,4 +1505,383 @@ BOOL CryptGetHashParam(HCRYPTHASH h, DWORD param, BYTE *out, DWORD *n, DWORD fla
     return TRUE;
 }
 BOOL CryptDestroyHash(HCRYPTHASH h) { free((PlatHash *)h); return TRUE; }
+
+int plat_ww_backend_of(uintptr_t addr, size_t size) {
+    return ww_of(addr, size);
+}
+
+size_t plat_soft_ww_memory_used(void) {
+    size_t mem;
+    pthread_mutex_lock(&g_reg_lock);
+    mem = g_soft_ww_mem_bytes;
+    pthread_mutex_unlock(&g_reg_lock);
+    return mem;
+}
+
+size_t plat_soft_ww_budget_limit(void) {
+    size_t b;
+    pthread_mutex_lock(&g_reg_lock);
+    b = g_soft_ww_budget;
+    pthread_mutex_unlock(&g_reg_lock);
+    return b;
+}
+
+void plat_soft_ww_set_test_budget(size_t limit_bytes) {
+    pthread_mutex_lock(&g_reg_lock);
+    g_soft_ww_budget = limit_bytes ? limit_bytes : SOFT_WW_DEFAULT_BUDGET;
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+void plat_soft_ww_set_fault_inject(int fail_metadata_alloc) {
+    g_soft_ww_fault_inject = fail_metadata_alloc;
+}
+
+void plat_set_kernel_ww_state_for_test(int state) {
+    g_kernel_ww_test_override = state;
+}
+
+void plat_soft_ww_set_test_stack_range(uintptr_t base, size_t size) {
+    g_test_stack_base = base;
+    g_test_stack_size = size;
+}
+
+int plat_soft_ww_mark_dirty(uintptr_t addr, size_t size) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (!t || addr + size > t->base + t->size) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    size_t host_ps = t->pages_per_host * 4096;
+    size_t first_host = (addr - t->base) / host_ps;
+    size_t last_host = (addr + size - 1 - t->base) / host_ps;
+    if (last_host >= t->host_page_count) last_host = t->host_page_count - 1;
+
+    for (size_t h = first_host; h <= last_host; h++) {
+        uintptr_t host_base = t->base + h * host_ps;
+        if (mprotect((void *)host_base, host_ps, PROT_READ | PROT_WRITE) == 0) {
+            t->host_page_state[h] = 1;
+            size_t start_g = h * t->pages_per_host;
+            size_t end_g = start_g + t->pages_per_host;
+            for (size_t g = start_g; g < end_g; g++) {
+                soft_ww_set_guest_dirty(t, g);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_reg_lock);
+    return 1;
+}
+
+int plat_soft_ww_is_page_dirty(uintptr_t addr) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (!t) { pthread_mutex_unlock(&g_reg_lock); return 0; }
+    size_t g = (addr - t->base) / 4096;
+    int dirty = (g < t->guest_page_count) ? soft_ww_get_guest_dirty(t, g) : 0;
+    pthread_mutex_unlock(&g_reg_lock);
+    return dirty;
+}
+
+int plat_soft_ww_is_host_writable(uintptr_t addr) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (!t) { pthread_mutex_unlock(&g_reg_lock); return 0; }
+    size_t host_ps = t->pages_per_host * 4096;
+    size_t h = (addr - t->base) / host_ps;
+    int writable = (h < t->host_page_count) ? (t->host_page_state[h] == 1) : 0;
+    pthread_mutex_unlock(&g_reg_lock);
+    return writable;
+}
+
+int plat_soft_ww_get_host_lease(uintptr_t addr) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (!t) { pthread_mutex_unlock(&g_reg_lock); return 0; }
+    size_t host_ps = t->pages_per_host * 4096;
+    size_t h = (addr - t->base) / host_ps;
+    int lease = (h < t->host_page_count) ? (int)t->host_lease_count[h] : 0;
+    pthread_mutex_unlock(&g_reg_lock);
+    return lease;
+}
+
+void plat_soft_ww_set_host_lease(uintptr_t addr, uint16_t count) {
+    pthread_mutex_lock(&g_reg_lock);
+    SoftWWTracker *t = soft_ww_tracker_find_locked(addr);
+    if (t) {
+        size_t host_ps = t->pages_per_host * 4096;
+        size_t h = (addr - t->base) / host_ps;
+        if (h < t->host_page_count) t->host_lease_count[h] = count;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+uint64_t plat_ww_generation_of(uintptr_t addr) {
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(addr);
+    uint64_t gen = r ? r->generation : 0;
+    pthread_mutex_unlock(&g_reg_lock);
+    return gen;
+}
+
+int plat_ww_validate_generation(uintptr_t addr, uint64_t expected_gen) {
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(addr);
+    int valid = (r && r->generation == expected_gen && expected_gen != 0);
+    pthread_mutex_unlock(&g_reg_lock);
+    return valid;
+}
+
+static struct sigaction g_prev_segv_action;
+static int g_soft_ww_handler_installed = 0;
+static int g_soft_ww_fail_restore_for_test = 0;
+static uint64_t g_soft_ww_fault_count = 0;
+
+void plat_soft_ww_set_restore_fail_for_test(int fail) {
+    g_soft_ww_fail_restore_for_test = fail;
+}
+
+uint64_t plat_soft_ww_fault_count(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    uint64_t c = g_soft_ww_fault_count;
+    pthread_mutex_unlock(&g_reg_lock);
+    return c;
+}
+
+#if defined(__aarch64__)
+#ifndef ESR_MAGIC
+#define ESR_MAGIC 0x45535201
+struct esr_context {
+    struct _aarch64_ctx head;
+    uint64_t esr;
+};
+#endif
+
+static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
+    if (si->si_code != SEGV_ACCERR) return 0;
+    if (!ucontext) return 0;
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    uint8_t *aux = (uint8_t *)uc->uc_mcontext.__reserved;
+    while (aux) {
+        struct _aarch64_ctx *head = (struct _aarch64_ctx *)aux;
+        if (head->magic == 0 || head->size == 0) break;
+        if (head->magic == ESR_MAGIC) {
+            struct esr_context *esr_ctx = (struct esr_context *)head;
+            uint64_t esr = esr_ctx->esr;
+            uint32_t ec = (esr >> 26) & 0x3f;
+            if (ec == 0x24 || ec == 0x25) {
+                return (esr & (1ULL << 6)) != 0;
+            }
+            return 0;
+        }
+        aux += head->size;
+    }
+    return 0;
+}
+#elif defined(__x86_64__)
+static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
+    if (si->si_code != SEGV_ACCERR) return 0;
+    if (!ucontext) return 0;
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    greg_t err = uc->uc_mcontext.gregs[REG_ERR];
+    return (err & 0x02) != 0 && (err & 0x10) == 0;
+}
+#else
+static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
+    (void)si; (void)ucontext;
+    return 0;
+}
+#endif
+
+int plat_soft_ww_handle_fault(siginfo_t *si, void *ucontext) {
+    if (!si) return 0;
+    if (!is_arch_write_fault(si, ucontext)) return 0;
+
+    uintptr_t fault_addr = (uintptr_t)si->si_addr;
+    if (!fault_addr) return 0;
+
+    pthread_mutex_lock(&g_reg_lock);
+    Region *r = region_find_locked(fault_addr);
+    if (!r || r->ww != 3) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    if (!(to_prot(r->logical_prot) & PROT_WRITE)) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    SoftWWTracker *t = soft_ww_tracker_find_locked(fault_addr);
+    if (!t || t->generation != r->generation) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    if (g_soft_ww_fail_restore_for_test) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    size_t host_ps = t->pages_per_host * 4096;
+    size_t h = (fault_addr - t->base) / host_ps;
+    if (h >= t->host_page_count) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    uintptr_t host_base = t->base + h * host_ps;
+    if (mprotect((void *)host_base, host_ps, PROT_READ | PROT_WRITE) != 0) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return 0;
+    }
+
+    t->host_page_state[h] = 1;
+    size_t start_g = h * t->pages_per_host;
+    size_t end_g = start_g + t->pages_per_host;
+    for (size_t g = start_g; g < end_g; g++) {
+        soft_ww_set_guest_dirty(t, g);
+    }
+    g_soft_ww_fault_count++;
+    pthread_mutex_unlock(&g_reg_lock);
+
+    return 1;
+}
+
+static void soft_ww_sigaction(int sig, siginfo_t *si, void *uc) {
+    int saved_errno = errno;
+    if (plat_soft_ww_handle_fault(si, uc)) {
+        errno = saved_errno;
+        return;
+    }
+    errno = saved_errno;
+    if (g_prev_segv_action.sa_flags & SA_SIGINFO) {
+        if (g_prev_segv_action.sa_sigaction) {
+            g_prev_segv_action.sa_sigaction(sig, si, uc);
+            return;
+        }
+    } else if (g_prev_segv_action.sa_handler == SIG_DFL) {
+        signal(SIGSEGV, SIG_DFL);
+        raise(SIGSEGV);
+        return;
+    } else if (g_prev_segv_action.sa_handler && g_prev_segv_action.sa_handler != SIG_IGN) {
+        g_prev_segv_action.sa_handler(sig);
+        return;
+    }
+    _exit(128 + sig);
+}
+
+int plat_soft_ww_install_handler(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    if (!g_soft_ww_handler_installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = soft_ww_sigaction;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &g_prev_segv_action) != 0) {
+            pthread_mutex_unlock(&g_reg_lock);
+            return 0;
+        }
+        g_soft_ww_handler_installed = 1;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+    return 1;
+}
+
+void plat_soft_ww_uninstall_handler(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    if (g_soft_ww_handler_installed) {
+        sigaction(SIGSEGV, &g_prev_segv_action, NULL);
+        g_soft_ww_handler_installed = 0;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+static __thread void *t_owned_altstack = NULL;
+
+void plat_soft_ww_thread_setup_altstack(void) {
+    stack_t old_ss;
+    if (sigaltstack(NULL, &old_ss) == 0 && (old_ss.ss_flags & SS_DISABLE)) {
+        size_t sz = 65536;
+        void *stk = malloc(sz);
+        if (stk) {
+            stack_t ss = { .ss_sp = stk, .ss_size = sz, .ss_flags = 0 };
+            if (sigaltstack(&ss, NULL) == 0) {
+                t_owned_altstack = stk;
+            } else {
+                free(stk);
+            }
+        }
+    }
+}
+
+void plat_soft_ww_thread_teardown_altstack(void) {
+    if (t_owned_altstack) {
+        stack_t ss = { .ss_flags = SS_DISABLE };
+        sigaltstack(&ss, NULL);
+        free(t_owned_altstack);
+        t_owned_altstack = NULL;
+    }
+}
+
+static void (*g_soft_ww_invalidate_cb)(void) = NULL;
+
+void plat_soft_ww_set_invalidate_callback(void (*cb)(void)) {
+    pthread_mutex_lock(&g_reg_lock);
+    g_soft_ww_invalidate_cb = cb;
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+int plat_soft_ww_teardown(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    int ret = 0;
+    SoftWWTracker *t = g_soft_ww_trackers;
+    while (t) {
+        SoftWWTracker *next = t->next;
+        Region *r = region_find_locked(t->base);
+        int log_prot = to_prot(r ? r->logical_prot : PAGE_READWRITE);
+        if (log_prot & PROT_WRITE) {
+            size_t host_ps = t->pages_per_host * 4096;
+            for (size_t hp = 0; hp < t->host_page_count; hp++) {
+                if (t->host_page_state[hp] == 0) {  /* rearmed clean / armed as PROT_READ */
+                    uintptr_t hp_addr = t->base + hp * host_ps;
+                    if (g_soft_ww_fail_restore_for_test) {
+                        ret = -1;
+                    } else {
+#ifndef _WIN32
+                        if (mprotect((void *)hp_addr, host_ps, log_prot) != 0) {
+                            ret = -1;
+                        }
+#endif
+                    }
+                }
+            }
+        }
+        free(t->guest_dirty_bitmap);
+        free(t->host_page_state);
+        free(t->host_lease_count);
+        free(t);
+        t = next;
+    }
+    g_soft_ww_trackers = NULL;
+    g_soft_ww_mem_bytes = 0;
+
+    for (size_t i = 0; i < g_nregions; i++) {
+        if (g_regions[i].ww == 3) {
+            g_regions[i].ww = 2;
+        }
+    }
+    g_ww_soft = 0;
+    void (*cb)(void) = g_soft_ww_invalidate_cb;
+    pthread_mutex_unlock(&g_reg_lock);
+
+    plat_soft_ww_uninstall_handler();
+
+    if (cb) {
+        cb();
+    }
+    return ret;
+}
 #endif

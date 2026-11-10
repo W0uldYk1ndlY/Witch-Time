@@ -70,6 +70,12 @@ int main(int argc, char **argv) {
     r = VirtualAlloc((void *)(uintptr_t)0x7200000000ull, ps * 2,
                      MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     assert(r);
+    /* Soft write-watch production helper assertions for budget and granule eligibility */
+    assert(plat_soft_ww_budget_limit() == 16 * 1024 * 1024);
+    assert(plat_soft_ww_is_range_eligible((uintptr_t)r, ps * 2, MEM_WRITE_WATCH, ps) == 1);
+    assert(plat_soft_ww_is_range_eligible((uintptr_t)r + 1, ps * 2, MEM_WRITE_WATCH, ps) == 0);
+    assert(plat_soft_ww_is_range_eligible((uintptr_t)r, ps * 2, 0, ps) == 0);
+    assert(plat_soft_ww_is_range_eligible((uintptr_t)r, ps * 2, MEM_WRITE_WATCH, 65536) == 0);
     r[4096 + 7] = 1;
     PVOID pages[8]; ULONG_PTR count = 8; ULONG gran = 0;
     UINT ww_res = GetWriteWatch(WRITE_WATCH_FLAG_RESET, r, ps * 2, pages, &count, &gran);
@@ -87,6 +93,27 @@ int main(int argc, char **argv) {
         printf("write watch (pages test, ps=4096): unavailable (kernel tracking unsupported/disabled)\n");
     }
     assert(VirtualFree(r, 0, MEM_RELEASE));
+
+    /* Soft write watch query and reset verification under WT_WW_SOFT=1 */
+    setenv("WT_WW_SOFT", "1", 1);
+    uint8_t *r_soft = VirtualAlloc(NULL, ps * 2, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    assert(r_soft);
+    int backend = plat_ww_backend_of((uintptr_t)r_soft, ps * 2);
+    if (backend == 3) {
+        uint64_t gen = plat_ww_generation_of((uintptr_t)r_soft);
+        assert(gen > 0);
+        assert(plat_ww_validate_generation((uintptr_t)r_soft, gen));
+        assert(!plat_ww_validate_generation((uintptr_t)r_soft, gen - 1));
+        assert(plat_soft_ww_mark_dirty((uintptr_t)r_soft, 4096));
+        assert(plat_soft_ww_is_page_dirty((uintptr_t)r_soft));
+        PVOID soft_pages[8]; ULONG_PTR soft_count = 8; ULONG soft_gran = 0;
+        assert(GetWriteWatch(WRITE_WATCH_FLAG_RESET, r_soft, ps * 2, soft_pages, &soft_count, &soft_gran) == 0);
+        assert(soft_gran == 4096);
+        assert(soft_count >= 1 && soft_pages[0] == r_soft);
+        assert(!plat_soft_ww_is_page_dirty((uintptr_t)r_soft));
+    }
+    assert(VirtualFree(r_soft, 0, MEM_RELEASE));
+    unsetenv("WT_WW_SOFT");
 
     /* Non-host-aligned offsets must remain readable, and EOF is rejected. */
     char path[] = "/tmp/witchtime-page-test-XXXXXX";

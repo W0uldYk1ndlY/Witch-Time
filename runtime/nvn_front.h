@@ -153,4 +153,8 @@ const char *nvn_front_op_name(unsigned op);
 void *nvn_front_hwnd(void);
 void nvn_front_shot_step(int step);                                         /* scripted input: a key step begins (WT_SHOT_STEPS) */
 int nvn_front_take_step_shot(void);                                         /* present: step + 1 when a step screenshot is due, else 0 */
+void nvn_front_ww_invalidate(void);                                         /* write-watch loss/disable invalidation */
+int nvn_vk_writerwait_enabled(void);                                        /* WT_VK_WRITERWAIT developer switch */
+int nvn_vk_loadclear_enabled(void);                                         /* WT_VK_LOADCLEAR developer switch */
+int nvn_vk_split_threshold(void);                                          /* WT_VK_SPLIT developer switch */
 #endif
