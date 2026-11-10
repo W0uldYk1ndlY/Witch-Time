@@ -488,7 +488,14 @@ static DWORD WINAPI android_guest_main(LPVOID unused) {
 }
 #endif
 static int g_kbm_test;                       /* WT_KBM_SCRIPT set: the window counts as focused (a hidden test window never gets the focus) */
-static int has_focus(SDL_Window *w) { return g_kbm_test || (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS); }
+static int has_focus(SDL_Window *w) {
+#ifdef __ANDROID__
+    (void)w;
+    return !__atomic_load_n(&g_android_background, __ATOMIC_ACQUIRE);
+#else
+    return g_kbm_test || (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS);
+#endif
+}
 BOOL GetClientRect(HWND h, RECT *r) {
     int w = 0, hh = 0;
     memset(r, 0, sizeof *r);
@@ -502,7 +509,14 @@ BOOL GetClientRect(HWND h, RECT *r) {
     r->right = w; r->bottom = hh;
     return TRUE;
 }
-BOOL IsIconic(HWND h) { return h && (SDL_GetWindowFlags((SDL_Window *)h) & SDL_WINDOW_MINIMIZED) != 0; }
+BOOL IsIconic(HWND h) {
+#ifdef __ANDROID__
+    (void)h;
+    return __atomic_load_n(&g_android_background, __ATOMIC_ACQUIRE) != 0;
+#else
+    return h && (SDL_GetWindowFlags((SDL_Window *)h) & SDL_WINDOW_MINIMIZED) != 0;
+#endif
+}
 int GetWindowTextA(HWND h, LPSTR out, int n) { const char *t = h ? SDL_GetWindowTitle((SDL_Window *)h) : ""; snprintf(out, (size_t)n, "%s", t ? t : ""); return (int)strlen(out); }
 BOOL SetWindowTextA(HWND h, LPCSTR t) {
 #ifdef __ANDROID__
@@ -784,6 +798,12 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         pace_options();
         display_perf_thread();
         for (;;) {
+#ifdef __ANDROID__
+            if (__atomic_load_n(&g_android_background, __ATOMIC_ACQUIRE)) {
+                Sleep(50);
+                continue;
+            }
+#endif
             if (g_pace_want && !lock_tried && g_vb_state == 2) {                  /* session 14: the refresh is measured: lock to it or not */
                 lock_tried = 1;
                 int k = pace_try_lock();
@@ -890,6 +910,12 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         }
     }
     for (;;) {
+#ifdef __ANDROID__
+        if (__atomic_load_n(&g_android_background, __ATOMIC_ACQUIRE)) {
+            Sleep(50);
+            continue;
+        }
+#endif
         next.QuadPart += g_freq.QuadPart / 60;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);

@@ -36,6 +36,9 @@ int SDL_main(int argc, char **argv) {
     setenv("WT_CONFIG", "config/controllers.ini", 1);
     setenv("WT_GRAPHICS_CONFIG", "config/graphics.ini", 1);
     setenv("WT_MODS", "none", 1);
+    setenv("WT_VOLUME", "100", 1);
+    if (!getenv("WT_VK_SCALE")) setenv("WT_VK_SCALE", "0.6", 0);
+    if (!getenv("WT_VSYNC")) setenv("WT_VSYNC", "clock", 0);
     void *runtime = dlopen("libwitchtime.so", RTLD_NOW | RTLD_GLOBAL);
     if (!runtime) return fail(dlerror());
     int (*run)(int, char **) = (int (*)(int, char **))dlsym(runtime, "display_android_run");

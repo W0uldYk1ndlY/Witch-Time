@@ -354,13 +354,31 @@ static void oq_land(int si) {                     /* slot_wait: the slot's GPU w
     int n = g_oq_used[si];
     static uint64_t r[OQ_MAX];
     if (!g_oq_nev[si]) return;
+#ifdef __ANDROID__
+    if (n) {
+        /* Mobile drivers (Qualcomm Adreno) can hang indefinitely when host waits on query results with WAIT_BIT.
+         * Poll without WAIT_BIT; if incomplete, synthesize positive sample count so visibility logic does not stall. */
+        VkResult qres = vkGetQueryPoolResults(V.device, g_oq_pool, (uint32_t)(si * OQ_MAX), (uint32_t)n, sizeof r[0] * (size_t)n, r, 8, VK_QUERY_RESULT_64_BIT);
+        if (qres != VK_SUCCESS) {
+            for (int k = 0; k < n; k++) r[k] = 1000;
+        }
+    }
+#else
     if (n && vkGetQueryPoolResults(V.device, g_oq_pool, (uint32_t)(si * OQ_MAX), (uint32_t)n, sizeof r[0] * (size_t)n, r, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
         memset(r, 0, sizeof r[0] * (size_t)n);
+#endif
     for (int i = 0; i < g_oq_nev[si]; i++) {
         OqEv *e = &g_oq_ev[si][i];
         if (e->q >= 0) g_oq_run += r[e->q];
         else if (e->q == OQ_EV_RESET) g_oq_run = 0;
-        else if (e->addr) { uint64_t d[2] = {g_oq_run, vk_now_ns()}; memcpy((void *)(uintptr_t)e->addr, d, 16); R.gen++; }
+        else if (e->addr) {
+            uint64_t d[2] = {g_oq_run, vk_now_ns()};
+#ifdef __ANDROID__
+            if (!d[0]) d[0] = 1000;
+#endif
+            memcpy((void *)(uintptr_t)e->addr, d, 16);
+            R.gen++;
+        }
     }
     g_oq_nev[si] = 0;
 }
@@ -5358,7 +5376,10 @@ swap: ;
     if (progress) cmd_wait_all();
     /* The swapchain has the window texture's colour class: a blit between them then keeps the stored values (the OpenGL
      * path blits with FRAMEBUFFER_SRGB off). */
-    VkFormat want = vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+    int is_rgba = (V.format.format == VK_FORMAT_R8G8B8A8_UNORM || V.format.format == VK_FORMAT_R8G8B8A8_SRGB);
+    VkFormat want = is_rgba
+        ? (vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM)
+        : (vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM);
     if (want != V.format.format) { cmd_wait_all(); swapchain_destroy(); V.format.format = want; printf("nvn_vk: swapchain format %d (the window texture's colour class)\n", (int)want); }
     if (V.swapchain && hdr_mode_want() != V.hdr) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* [Recomps#1] finding 147: Windows' HDR switch changed for this monitor */
     uint32_t index = 0;

@@ -531,9 +531,8 @@ UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addrs, ULONG_PTR
         if (ww == 1) { *count = n; return 0; }
         start = (uintptr_t)base & ~(uintptr_t)4095;
     }
-    for (uintptr_t pg = start; pg < end && n < cap; pg += 4096) addrs[n++] = (void *)pg;   /* untracked: every page */
-    *count = n;
-    return 0;
+    /* untracked: fail so callers treat memory as unwatched instead of falsely marking every page dirty on every frame */
+    return 1;
 }
 UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     uintptr_t a;

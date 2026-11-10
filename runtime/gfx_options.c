@@ -244,6 +244,10 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     memset(o, 0, sizeof *o);
     o->bc7_textures = 1;                       /* #54: a graphics.ini from before the key */
     o->width = 1280; o->height = 720; o->scale = 1.0f; o->present = 5;      /* vsync = auto when the key is missing (track V session 14) */
+#ifdef __ANDROID__
+    o->scale = 0.6f;
+    o->present = 0;                            /* clock pacing for mobile */
+#endif
     opt_path(o->path);
     if (!arg && !getenv("WT_GRAPHICS_CONFIG") && !getenv("WT_CONFIG")) gfx_ini_refresh(o->path);      /* [witchtime] a test's file stays as it is */
     FILE *f = fopen(o->path, "rb");
@@ -317,6 +321,9 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
                o->cutscene_fps == 60 ? ": the title, menus and cutscenes run at 60 (the game's 60 fps mode; movies keep their own rate)" : ": the title, menus and cutscenes at 30, as on the console");
     }
     /* [witchtime] aspect_ratio: the game library and the renderer read RECOMPS_ASPECT; a set variable (test runs) wins */
+#ifdef __ANDROID__
+    if (o->aspect_ratio == 0.0f && !getenv("RECOMPS_ASPECT")) o->aspect_ratio = -1.0f; /* auto on Android */
+#endif
     if (o->aspect_ratio != -1.0f && (!(o->aspect_ratio >= 0.25f && o->aspect_ratio <= 8.0f) || fabsf(o->aspect_ratio - 16.0f / 9.0f) < 0.001f)) o->aspect_ratio = 0.0f;
     if (o->aspect_ratio > 0.0f && !getenv("RECOMPS_ASPECT")) { char n[32]; snprintf(n, sizeof n, "%.6f", o->aspect_ratio); _putenv_s("RECOMPS_ASPECT", n); }
     if (o->hud_centre && !getenv("RECOMPS_HUD_CENTRE")) _putenv_s("RECOMPS_HUD_CENTRE", "1");
@@ -417,9 +424,19 @@ static char *ini_read_all(const char *path, size_t *len) {
 /* [witchtime] aspect_ratio = auto: the game's screen takes the window's shape (its client size in pixels; borderless and
  * fullscreen: the monitor's), told before the game starts (display.c, before g_ready). 16:9 within 1 % stays the game's own. */
 void gfx_aspect_window(int w, int h) {
+#ifndef __ANDROID__
     if (gfx_options()->aspect_ratio != -1.0f || getenv("RECOMPS_ASPECT") || w <= 0 || h <= 0) return;
+#else
+    if (gfx_options()->aspect_ratio != -1.0f || w <= 0 || h <= 0) return;
+#endif
     float a = (float)w / (float)h;
-    if (a < 0.25f || a > 8.0f || fabsf(a / (16.0f / 9.0f) - 1.0f) < 0.01f) { printf("graphics options: aspect_ratio auto: the window is %dx%d, the game's 16:9\n", w, h); return; }
+    if (a < 0.25f || a > 8.0f || fabsf(a / (16.0f / 9.0f) - 1.0f) < 0.01f) {
+        printf("graphics options: aspect_ratio auto: the window is %dx%d, the game's 16:9\n", w, h);
+#ifdef __ANDROID__
+        _putenv_s("RECOMPS_ASPECT", "1.777778");
+#endif
+        return;
+    }
     char n[32]; snprintf(n, sizeof n, "%.6f", a); _putenv_s("RECOMPS_ASPECT", n);
     printf("graphics options: aspect_ratio auto: the window is %dx%d, the game's screen %s (width / height)\n", w, h, n);
 }
