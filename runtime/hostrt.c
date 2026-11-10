@@ -575,6 +575,9 @@ static void install_crash_handler(void) {
     struct sigaction sa = { .sa_sigaction = crash_signal, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND };
     sigemptyset(&sa.sa_mask);
     for (int sig = 0, sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT }; sig < 5; sig++) sigaction(sigs[sig], &sa, NULL);
+    if (plat_ww_soft_enabled()) {
+        plat_soft_ww_install_handler();
+    }
 }
 #else
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {

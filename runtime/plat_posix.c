@@ -481,6 +481,8 @@ static SoftWWTracker *soft_ww_tracker_find_locked(uintptr_t addr) {
     return NULL;
 }
 
+static int soft_ww_install_handler_locked(void);
+
 static SoftWWTracker *soft_ww_tracker_create(uintptr_t base, size_t size, size_t page_size, int initial_prot) {
     (void)initial_prot;
     if (g_soft_ww_fault_inject) return NULL;
@@ -523,7 +525,7 @@ static SoftWWTracker *soft_ww_tracker_create(uintptr_t base, size_t size, size_t
 
     t->base = base;
     t->size = size;
-    t->generation = ++g_soft_ww_generation;
+    t->generation = g_region_generation;
     t->guest_page_count = guest_pages;
     t->host_page_count = host_pages;
     t->pages_per_host = pages_per_host;
@@ -532,6 +534,7 @@ static SoftWWTracker *soft_ww_tracker_create(uintptr_t base, size_t size, size_t
     t->next = g_soft_ww_trackers;
     g_soft_ww_trackers = t;
     g_soft_ww_mem_bytes += total_needed;
+    soft_ww_install_handler_locked();
     pthread_mutex_unlock(&g_reg_lock);
 
     return t;
@@ -733,12 +736,13 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     void *p = mmap(addr, size, (type & MEM_COMMIT) ? to_prot(prot) : PROT_NONE, flags, -1, 0);
     if (p == MAP_FAILED || (addr && p != addr)) { if (p != MAP_FAILED) munmap(p, size); return NULL; }
     int ww = 0;
+    SoftWWTracker *tr = NULL;
     if (type & MEM_WRITE_WATCH) {
         if (ww_available()) {
             struct uffdio_register reg = { .range = { (uintptr_t)p, size }, .mode = UFFDIO_REGISTER_MODE_WP };
             ww = (ioctl(g_uffd, UFFDIO_REGISTER, &reg) == 0 && ww_protect((uintptr_t)p, size)) ? 1 : 2;
         } else if (plat_ww_soft_enabled() && plat_soft_ww_is_range_eligible((uintptr_t)p, size, type, host_page_size())) {
-            SoftWWTracker *tr = soft_ww_tracker_create((uintptr_t)p, size, host_page_size(), (type & MEM_COMMIT) ? to_prot(prot) : PROT_NONE);
+            tr = soft_ww_tracker_create((uintptr_t)p, size, host_page_size(), (type & MEM_COMMIT) ? to_prot(prot) : PROT_NONE);
             if (tr) {
                 ww = 3;
                 if ((type & MEM_COMMIT) && (to_prot(prot) & PROT_WRITE)) {
@@ -755,6 +759,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     if (g_nregions == g_cap) { g_cap = g_cap ? g_cap * 2 : 256; g_regions = realloc(g_regions, g_cap * sizeof *g_regions); }
     uint64_t gen = ++g_region_generation;
     g_regions[g_nregions++] = (Region){ (uintptr_t)p, size, ww, (type & MEM_COMMIT) ? prot : PAGE_NOACCESS, gen };
+    if (tr) tr->generation = gen;
     pthread_mutex_unlock(&g_reg_lock);
     return p;
 }
@@ -1663,10 +1668,12 @@ static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
     if (!ucontext) return 0;
     ucontext_t *uc = (ucontext_t *)ucontext;
     uint8_t *aux = (uint8_t *)uc->uc_mcontext.__reserved;
-    while (aux) {
+    uint8_t *aux_end = aux + sizeof(uc->uc_mcontext.__reserved);
+    while (aux + sizeof(struct _aarch64_ctx) <= aux_end) {
         struct _aarch64_ctx *head = (struct _aarch64_ctx *)aux;
-        if (head->magic == 0 || head->size == 0) break;
-        if (head->magic == ESR_MAGIC) {
+        if (head->magic == 0 || head->size < sizeof(struct _aarch64_ctx)) break;
+        if (aux + head->size > aux_end) break;
+        if (head->magic == ESR_MAGIC && head->size >= sizeof(struct esr_context)) {
             struct esr_context *esr_ctx = (struct esr_context *)head;
             uint64_t esr = esr_ctx->esr;
             uint32_t ec = (esr >> 26) & 0x3f;
@@ -1677,7 +1684,8 @@ static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
         }
         aux += head->size;
     }
-    return 0;
+    /* Fallback if ESR_MAGIC is not present in signal context: verify not instruction fetch */
+    return (uintptr_t)si->si_addr != (uintptr_t)uc->uc_mcontext.pc;
 }
 #elif defined(__x86_64__)
 static int is_arch_write_fault(siginfo_t *si, void *ucontext) {
@@ -1772,8 +1780,7 @@ static void soft_ww_sigaction(int sig, siginfo_t *si, void *uc) {
     _exit(128 + sig);
 }
 
-int plat_soft_ww_install_handler(void) {
-    pthread_mutex_lock(&g_reg_lock);
+static int soft_ww_install_handler_locked(void) {
     if (!g_soft_ww_handler_installed) {
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
@@ -1781,13 +1788,18 @@ int plat_soft_ww_install_handler(void) {
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         if (sigaction(SIGSEGV, &sa, &g_prev_segv_action) != 0) {
-            pthread_mutex_unlock(&g_reg_lock);
             return 0;
         }
         g_soft_ww_handler_installed = 1;
     }
-    pthread_mutex_unlock(&g_reg_lock);
     return 1;
+}
+
+int plat_soft_ww_install_handler(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    int ok = soft_ww_install_handler_locked();
+    pthread_mutex_unlock(&g_reg_lock);
+    return ok;
 }
 
 void plat_soft_ww_uninstall_handler(void) {
