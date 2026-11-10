@@ -63,6 +63,9 @@ jobs:
           "$RUNNER_TEMP/rs_pyramid_test"
           clang -O2 -Wall -I runtime tests/fsr_dither_test.c -o "$RUNNER_TEMP/fsr_dither_test"
           "$RUNNER_TEMP/fsr_dither_test"
+          clang -O2 -Wall -I runtime tests/fsr_limits_test.c -o "$RUNNER_TEMP/fsr_limits_test"
+          "$RUNNER_TEMP/fsr_limits_test"
+          python3 tests/fsr_cleanup_test.py
 
       - name: Discord Rich Presence (runtime/presence.c)
         run: |
