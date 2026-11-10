@@ -245,7 +245,6 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     o->bc7_textures = 1;                       /* #54: a graphics.ini from before the key */
     o->width = 1280; o->height = 720; o->scale = 1.0f; o->present = 5;      /* vsync = auto when the key is missing (track V session 14) */
 #ifdef __ANDROID__
-    o->scale = 0.6f;
     o->present = 0;                            /* clock pacing for mobile */
 #endif
     opt_path(o->path);
