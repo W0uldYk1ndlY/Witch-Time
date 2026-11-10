@@ -546,7 +546,13 @@ fn android_dependencies() -> Result<PathBuf, String> {
     if !path.join("include").is_dir() || !path.join("lib").is_dir() {
         return Err(format!("{}: Android dependency prefix must contain include/ and lib/", path.display()));
     }
-    fs::canonicalize(&path).map_err(|e| format!("{}: {}", path.display(), e))
+    let p = fs::canonicalize(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        Ok(PathBuf::from(stripped))
+    } else {
+        Ok(p)
+    }
 }
 
 /// The link-only stand-in exports exactly the game symbols. It is never installed or packaged.

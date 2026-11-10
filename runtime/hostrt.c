@@ -732,10 +732,14 @@ void runtime_init(const char *elf, const char *trace_path) {
 
 /* 0 = real code; 1 = empty body; 2 = only stores constants (x0 := *x0 when *sets_x0) */
 int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
+    *x0 = 0; *sets_x0 = 0;
+#if !defined(__x86_64__) && !defined(_M_X64)
+    (void)fn;
+    return 0;
+#else
     const unsigned char *p = (const unsigned char *)fn;
     int stores = 0;
     long long rax = 0;
-    *x0 = 0; *sets_x0 = 0;
     if (!p) return 0;
     for (int hop = 0; hop < 4 && p[0] == 0xE9; hop++) p = p + 5 + *(const int *)(p + 1);      /* linker thunk / tail jump */
     for (int step = 0; step < 12; step++) {
@@ -763,6 +767,7 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
         return 0;
     }
     return 0;
+#endif
 }
 
 static int audit_listed(const char *name) {

@@ -262,7 +262,9 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             char exe[MAX_PATH] = "";
             GetModuleFileNameA(NULL, exe, sizeof exe);
             const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("WT_VOLUME");
-#ifndef _WIN32
+#if defined(__ANDROID__)
+            int percent = vol ? atoi(vol) : 100;
+#elif !defined(_WIN32)
             base = strrchr(exe, '/') ? strrchr(exe, '/') + 1 : exe;      /* Linux: witch-time-game, a / path */
             int percent = vol ? atoi(vol) : !strcmp(base, "witch-time-game") ? 100 : 0;
 #else
