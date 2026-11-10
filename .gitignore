@@ -40,3 +40,6 @@
 /android/app/build/
 /android/app/.cxx/
 /android/app/src/main/jniLibs/
+/device_backup/
+/known_good_backup/
+*.log

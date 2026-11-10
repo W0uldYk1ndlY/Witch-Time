@@ -15,6 +15,7 @@ static int fail(const char *message) {
 
 int SDL_main(int argc, char **argv) {
     (void)argc; (void)argv;
+    SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
     const char *root = SDL_GetAndroidExternalStoragePath();
     if (!root || chdir(root)) return fail("Cannot open the app's private external files directory.");
     /* Android does not expose printf on logcat. Keep diagnostics before any
