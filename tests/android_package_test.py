@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 from unittest.mock import patch
 import pathlib
+import shutil
 import subprocess
 import unittest
 import xml.etree.ElementTree as ET
@@ -41,7 +42,7 @@ class AndroidPackageTests(unittest.TestCase):
             self.assertIn('setenv("' + name + '"', source)
 
     def test_packaging_script_parses(self):
-        subprocess.run(['bash', '-n', str(ROOT / 'scripts/android-package.sh')], check=True)
+        subprocess.run([shutil.which('bash') or 'bash', '-n', str(ROOT / 'scripts/android-package.sh')], check=True)
 
     def test_arm64_and_16k_alignment(self):
         gradle = (ROOT / 'android/app/build.gradle').read_text()
@@ -50,6 +51,15 @@ class AndroidPackageTests(unittest.TestCase):
         self.assertIn('max-page-size=16384', cmake)
         self.assertIn('common-page-size=16384', cmake)
         self.assertNotIn('add_library(SDL3 SHARED IMPORTED)', cmake)
+
+    def test_cmake_owns_bootstrap_without_forced_scale(self):
+        gradle = (ROOT / 'android/app/build.gradle').read_text()
+        cmake = (ROOT / 'android/app/src/main/cpp/CMakeLists.txt').read_text()
+        main = (ROOT / 'android/app/src/main/cpp/main.c').read_text()
+        self.assertIn("fileTree('src/main/jniLibs').matching { include '**/libmain.so' }.isEmpty()", gradle)
+        self.assertIn('Do not stage libmain.so', gradle)
+        self.assertIn('add_library(main SHARED main.c', cmake)
+        self.assertNotIn('setenv("WT_VK_SCALE"', main)
 
 if __name__ == '__main__':
     unittest.main()
