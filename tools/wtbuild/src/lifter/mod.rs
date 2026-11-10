@@ -600,8 +600,11 @@ impl Fn {
             return Ok(";".into());
         }
         let m2 = w & 0xfffff0ff;
-        if m2 == 0xd503305f || m2 == 0xd50330bf || m2 == 0xd503309f || m2 == 0xd50330df {
+        if m2 == 0xd503305f || m2 == 0xd50330df {
             return Ok(";".into());
+        }
+        if m2 == 0xd50330bf || m2 == 0xd503309f {
+            return Ok("dmb();".into());
         }
         un("system")
     }
@@ -744,18 +747,21 @@ impl Fn {
             let (size, o2, load, o1) = (bits(w, 31, 30), bits(w, 23, 23), b(bits(w, 22, 22)), bits(w, 21, 21));
             let nb = 8 << size;
             let rs = bits(w, 20, 16);
+            let o0 = bits(w, 15, 15);
             if o1 != 0 {
                 // [Recomps#1] ldxp / ldaxp / stxp / stlxp (see rt_ext.h)
                 if o2 != 0 || size < 2 {
                     return un("excl-pair");
                 }
                 let rt2 = bits(w, 14, 10);
+                let acq = if o0 != 0 { "dmb(); " } else { "" };
                 if size == 3 {
                     if load {
                         return Ok(format!(
                             "{{ uint64_t a = {}; c->ex_addr = a; c->ex_val = rd64(a); c->ex_val2 = rd64(a + 8); \
-                             uint64_t t1 = c->ex_val, t2 = c->ex_val2; {} {} }}",
+                             {}uint64_t t1 = c->ex_val, t2 = c->ex_val2; {} {} }}",
                             xs(rn),
+                            acq,
                             set(rt, true, "t1"),
                             set(rt2, true, "t2")
                         ));
@@ -764,8 +770,9 @@ impl Fn {
                 }
                 if load {
                     return Ok(format!(
-                        "{{ uint64_t a = {}; c->ex_addr = a; c->ex_val = rd64(a); uint64_t t = c->ex_val; {} {} }}",
+                        "{{ uint64_t a = {}; c->ex_addr = a; c->ex_val = rd64(a); {}uint64_t t = c->ex_val; {} {} }}",
                         xs(rn),
+                        acq,
                         set(rt, true, "(uint32_t)t"),
                         set(rt2, true, "t >> 32")
                     ));
@@ -783,15 +790,20 @@ impl Fn {
             }
             if o2 != 0 {
                 if load {
-                    return Ok(set(rt, true, &format!("rd{}({})", nb, xs(rn))));
+                    return Ok(set(rt, true, &format!("rd_ordered{}({})", nb, xs(rn))));
                 }
-                return Ok(format!("wr{}({}, {});", nb, xs(rn), r(rt, size == 3)));
+                return Ok(format!("wr_ordered{}({}, {});", nb, xs(rn), r(rt, size == 3)));
             }
             if load {
+                let rdn = if o0 != 0 {
+                    format!("rd_ordered{}", nb)
+                } else {
+                    format!("rd{}", nb)
+                };
                 return Ok(format!(
-                    "{{ uint64_t a = {}; c->ex_addr = a; c->ex_val = rd{}(a); {} }}",
+                    "{{ uint64_t a = {}; c->ex_addr = a; c->ex_val = {}(a); {} }}",
                     xs(rn),
-                    nb,
+                    rdn,
                     set(rt, true, "c->ex_val")
                 ));
             }
@@ -1853,6 +1865,7 @@ mod tests {
                 for want in [dst(rt, t1), dst(rt2, t2), format!("uint64_t a = c->x[{}];", rn)] {
                     assert!(s.contains(&want), "ldaxp {:08x}: {} lacks {}", 0x887F8000 | ins, s, want);
                 }
+                assert!(s.contains("dmb();"), "ldaxp {:08x}: {} lacks dmb();", 0x887F8000 | ins, s);
                 for rs in 0..32 {
                     let e = if sf {
                         format!("stx128(c, c->x[{}], {}, {})", rn, x(rt), x(rt2))
@@ -1862,6 +1875,120 @@ mod tests {
                     let want = if rs == 31 { format!("(void)({});", e) } else { format!("c->x[{}] = (uint32_t)({});", rs, e) };
                     let (s, _) = lift_word(0x88208000 | rs << 16 | ins, 0x7101000000, 0x7100000000, 0x7102000000);
                     assert!(s.contains(&want), "stlxp {:08x}: {} lacks {}", 0x88208000 | rs << 16 | ins, s, want);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guest_ordering_regressions() {
+        let x = |n: u32| if n == 31 { "0ULL".to_string() } else { format!("c->x[{}]", n) };
+        let w = |n: u32| if n == 31 { "0U".to_string() } else { format!("(uint32_t)c->x[{}]", n) };
+
+        // 1. DMB / DSB emit dmb(); and reject old emission ";"
+        for crm in 0..16u32 {
+            let dmb_w = 0xd50330bf | (crm << 8);
+            let (s, _) = lift_word(dmb_w, 0x7100000000, 0x7100000000, 0x7100000004);
+            assert_eq!(s, "dmb();", "DMB {:08x} should emit dmb();", dmb_w);
+
+            let dsb_w = 0xd503309f | (crm << 8);
+            let (s, _) = lift_word(dsb_w, 0x7100000000, 0x7100000000, 0x7100000004);
+            assert_eq!(s, "dmb();", "DSB {:08x} should emit dmb();", dsb_w);
+
+            let isb_w = 0xd50330df | (crm << 8);
+            let (s, _) = lift_word(isb_w, 0x7100000000, 0x7100000000, 0x7100000004);
+            assert_eq!(s, ";", "ISB {:08x} should remain ;", isb_w);
+        }
+        let (s_clrex, _) = lift_word(0xd503305f, 0x7100000000, 0x7100000000, 0x7100000004);
+        assert_eq!(s_clrex, ";", "CLREX should remain ;");
+
+        // 2. LDAR / STLR all widths, register 31, and reject old plain rd/wr
+        for size in 0..4u32 {
+            let nb = 8 << size;
+            for &rn in &[0u32, 1, 30, 31] {
+                for &rt in &[0u32, 1, 30, 31] {
+                    // LDAR: size[31:30] 001000 1 1 0 11111 1 11111 rn[9:5] rt[4:0] -> 0x08dffc00
+                    let ldar_w = (size << 30) | 0x08dffc00 | (rn << 5) | rt;
+                    let (s, _) = lift_word(ldar_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                    let want_load = format!("rd_ordered{}(c->x[{}])", nb, rn);
+                    assert!(s.contains(&want_load), "LDAR {:08x} lacked {}", ldar_w, want_load);
+                    assert!(!s.contains(&format!("rd{}(c->x[{}])", nb, rn)), "LDAR {:08x} unexpectedly had plain rd", ldar_w);
+                    if rt == 31 {
+                        assert!(s.contains(&format!("(void)({});", want_load)));
+                    } else {
+                        assert!(s.contains(&format!("c->x[{}] = (uint64_t)({});", rt, want_load)));
+                    }
+
+                    // STLR: size[31:30] 001000 1 0 0 11111 1 11111 rn[9:5] rt[4:0] -> 0x089ffc00
+                    let stlr_w = (size << 30) | 0x089ffc00 | (rn << 5) | rt;
+                    let (s, _) = lift_word(stlr_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                    let val_expr = if size == 3 { x(rt) } else { w(rt) };
+                    let want_store = format!("wr_ordered{}(c->x[{}], {});", nb, rn, val_expr);
+                    assert_eq!(s, want_store, "STLR {:08x} mismatch", stlr_w);
+                    assert!(!s.contains(&format!("wr{}(c->x[{}],", nb, rn)), "STLR {:08x} unexpectedly had plain wr", stlr_w);
+                }
+            }
+        }
+
+        // 3. Acquire-exclusive scalar loads (LDAXR) vs plain exclusive loads (LDXR)
+        for size in 0..4u32 {
+            let nb = 8 << size;
+            for &rn in &[0u32, 1, 31] {
+                for &rt in &[0u32, 1, 31] {
+                    // LDXR: size[31:30] 001000 0 1 0 11111 0 11111 rn[9:5] rt[4:0] -> 0x085f7c00
+                    let ldxr_w = (size << 30) | 0x085f7c00 | (rn << 5) | rt;
+                    let (s, _) = lift_word(ldxr_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                    let want_plain = format!("c->ex_val = rd{}(a);", nb);
+                    assert!(s.contains(&want_plain), "LDXR {:08x} lacked {}", ldxr_w, want_plain);
+                    assert!(!s.contains("rd_ordered"), "LDXR {:08x} unexpectedly had rd_ordered", ldxr_w);
+
+                    // LDAXR: size[31:30] 001000 0 1 0 11111 1 11111 rn[9:5] rt[4:0] -> 0x085ffc00
+                    let ldaxr_w = (size << 30) | 0x085ffc00 | (rn << 5) | rt;
+                    let (s, _) = lift_word(ldaxr_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                    let want_ordered = format!("c->ex_val = rd_ordered{}(a);", nb);
+                    assert!(s.contains(&want_ordered), "LDAXR {:08x} lacked {}", ldaxr_w, want_ordered);
+                    assert!(!s.contains(&want_plain), "LDAXR {:08x} unexpectedly had plain rd", ldaxr_w);
+
+                    // Destination register handling:
+                    if rt == 31 {
+                        assert!(s.contains("(void)(c->ex_val);"), "LDAXR {:08x} rt=31 should discard", ldaxr_w);
+                    } else {
+                        assert!(s.contains(&format!("c->x[{}] = (uint64_t)(c->ex_val);", rt)), "LDAXR {:08x} rt={} should set", ldaxr_w, rt);
+                    }
+                }
+            }
+        }
+
+        // 4. Acquire-exclusive pairs (LDAXP) vs plain pairs (LDXP)
+        for &sf in &[false, true] {
+            let size = if sf { 3u32 } else { 2u32 };
+            let (t1, t2) = if sf { ("t1", "t2") } else { ("(uint32_t)t", "t >> 32") };
+            for &rn in &[0u32, 1, 31] {
+                for &rt in &[0u32, 1, 31] {
+                    for &rt2 in &[0u32, 2, 31] {
+                        let ins = (size << 30) | (rt2 << 10) | (rn << 5) | rt;
+
+                        // LDXP (o0 = 0): 0x087f0000
+                        let ldxp_w = 0x087f0000 | ins;
+                        let (s_ldxp, _) = lift_word(ldxp_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                        assert!(!s_ldxp.contains("dmb();"), "LDXP {:08x} unexpectedly had dmb();", ldxp_w);
+
+                        // LDAXP (o0 = 1): 0x087f8000
+                        let ldaxp_w = 0x087f8000 | ins;
+                        let (s_ldaxp, _) = lift_word(ldaxp_w, 0x7100000000, 0x7100000000, 0x7100000004);
+                        assert!(s_ldaxp.contains("dmb(); "), "LDAXP {:08x} lacked dmb();", ldaxp_w);
+
+                        if rt == 31 {
+                            assert!(s_ldaxp.contains(&format!("(void)({});", t1)));
+                        } else {
+                            assert!(s_ldaxp.contains(&format!("c->x[{}] = (uint64_t)({});", rt, t1)));
+                        }
+                        if rt2 == 31 {
+                            assert!(s_ldaxp.contains(&format!("(void)({});", t2)));
+                        } else {
+                            assert!(s_ldaxp.contains(&format!("c->x[{}] = (uint64_t)({});", rt2, t2)));
+                        }
+                    }
                 }
             }
         }

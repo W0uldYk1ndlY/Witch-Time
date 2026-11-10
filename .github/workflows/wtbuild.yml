@@ -7,7 +7,7 @@ name: wtbuild
 on:
   pull_request:
     paths: ['tools/wtbuild/**', 'lifter/**', 'runtime/gen_static/**', 'runtime/freestanding/**',
-            'runtime/*.h', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
+            'runtime/*.h', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'android/app/src/main/cpp/main.c', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
   workflow_dispatch:
 
 jobs:
@@ -68,6 +68,20 @@ jobs:
         run: |
           clang -O2 -Wall -I runtime -I runtime/posix '-D__declspec(x)=' tests/presence_test.c -lpthread -o "$RUNNER_TEMP/presence_test"
           "$RUNNER_TEMP/presence_test"
+
+      - name: Ordered memory helpers and publication channel (runtime/runtime.h, tests/ordered_helpers_test.c)
+        run: |
+          clang -O2 -Wall -I runtime tests/ordered_helpers_test.c -lpthread -o "$RUNNER_TEMP/ordered_helpers_test"
+          "$RUNNER_TEMP/ordered_helpers_test"
+
+      - name: Compute buffer coherency and write-check harness (runtime/nvn_vk_draw.c, tests/compute_buffer_coherency_test.py)
+        run: python3 tests/compute_buffer_coherency_test.py
+
+      - name: Android bootstrap hint order and failure test (android/app/src/main/cpp/main.c, tests/android_bootstrap_test.py)
+        run: python3 tests/android_bootstrap_test.py
+
+      - name: Flash detector policy and capture guard test (runtime/nvn_vk_flash.c, tests/flash_detector_policy_test.py)
+        run: python3 tests/flash_detector_policy_test.py
 
   lifter-check:
     # the shipped lifter against Unicorn: random words of the forms added to the lifter, run in Unicorn and as their lifted C

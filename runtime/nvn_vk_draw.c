@@ -13,6 +13,7 @@
 #include <math.h>
 #include "tex_decode.h"
 #include "nvn_vk_requirements.h"
+#include "diag.h"
 void rpt_begin(void); void rpt_end(void); int rpt_printf(const char *fmt, ...);     /* hostrt.c: [Recomps#1] the reports in one write each */
 static int have_targets_live(void);
 
@@ -544,7 +545,15 @@ static void slot_wait(Slot *s) {
     VKC(vkResetFences(V.device, 1, &s->fence));
     if (g_ts_on > 0) {                             /* WT_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
         uint64_t ts[2] = {0, 0};
-        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) { double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod; g_ts_ns += ns; g_ts_n++; if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6); }
+        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
+            double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod;
+            g_ts_ns += ns;
+            g_ts_n++;
+            if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6);
+            diag_stream_gpu_sample((int64_t)s->ts_frame, (int64_t)ns, (int64_t)(s - R.slot), 0 /* COMPLETED */);
+        } else {
+            diag_stream_gpu_sample((int64_t)s->ts_frame, -1, (int64_t)(s - R.slot), 3 /* QUERY_FAILED */);
+        }
         int si = (int)(s - R.slot);
         if (g_pt_on > 0 && g_pt_slot[si].n) {      /* WT_VK_PASSTIME: the segments of this command buffer */
             static uint64_t pt[PT_MAX];
@@ -560,6 +569,7 @@ static void slot_wait(Slot *s) {
     oq_land((int)(s - R.slot));                    /* [Recomps#1] counter reports of this command buffer */
     lr_land((int)(s - R.slot));                    /* [Recomps#1] finding 118: texels the game reads on the CPU */
     s->pending = 0;
+    diag_hook_gpu_complete((int64_t)(s - R.slot), (int64_t)s->serial, (int64_t)(tk() - t0), (int64_t)g_ts_ns);
     if (s->serial > R.done) { R.done = s->serial; nvn_front_done_moved(); }      /* finding 138: a game thread waiting for this fence goes on */
 }
 static void garbage_collect(void);
@@ -654,6 +664,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (signal) { sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &signal; }
     sb.commandBufferCount = ncb; sb.pCommandBuffers = cbs;
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
+    diag_hook_gpu_submit((int64_t)(s - R.slot), (int64_t)(R.serial + 1), (int64_t)R.flushes, (int64_t)ncb);
     s->pending = 1; s->serial = ++R.serial;
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
@@ -2934,6 +2945,34 @@ static int gpucount_on(void) {
     }
     return g_gpucount;
 }
+
+static int g_writerwait = -1;
+static int writerwait_on(void) {
+    if (g_writerwait < 0) {
+        const char *e = getenv("WT_VK_WRITERWAIT");
+        g_writerwait = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return g_writerwait;
+}
+int nvn_vk_writerwait_enabled(void) { return writerwait_on(); }
+
+static int g_loadclear = -1;
+static int loadclear_on(void) {
+    if (g_loadclear < 0) {
+        const char *e = getenv("WT_VK_LOADCLEAR");
+        g_loadclear = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return g_loadclear;
+}
+int nvn_vk_loadclear_enabled(void) { return loadclear_on(); }
+
+int nvn_vk_split_threshold(void) {
+    if (g_split < 0) {
+        const char *e = getenv("WT_VK_SPLIT");
+        g_split = e ? atoi(e) : VK_SPLIT_DEFAULT;
+    }
+    return g_split;
+}
 static int gpu_written(uint64_t addr, uint64_t size) {       /* a CB of this batch holds the range and the CPU would wait to read it */
     if (!gpucount_on() || !g_cb_live || g_gpu_writes == g_gpu_writes_seen) return 0;
     CB *c = cb_inside(addr, size);
@@ -5192,10 +5231,14 @@ static void present_flush(void) {
     if (!g_pend.on) return;
     g_pend.on = 0;
     display_present_flushed();
-    if (g_pend.sc != V.swapchain || !V.swapchain) return;      /* the swapchain was made again meanwhile: the image went with it */
+    if (g_pend.sc != V.swapchain || !V.swapchain) {
+        diag_hook_present_discard(g_cur_frame > 0 ? g_cur_frame - 1 : 0, (int64_t)g_pend.index, 1, g_diag_surface_gen);
+        return;      /* the swapchain was made again meanwhile: the image went with it */
+    }
     VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &g_pend.rend; pr.swapchainCount = 1; pr.pSwapchains = &g_pend.sc; pr.pImageIndices = &g_pend.index;
     VkResult r = vkQueuePresentKHR(V.queue, &pr);
+    diag_hook_present_called(g_cur_frame > 0 ? g_cur_frame - 1 : 0, (int64_t)g_pend.index, (int64_t)r, 0);
     display_present_done(g_pend.fight);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || g_pend.suboptimal) g_pend.recreate = 1;
     else vk_ok("vkQueuePresentKHR", r);
@@ -5212,7 +5255,11 @@ void nvn_vk_android_resume(void) {
     if (!V.alive) { generation = current; return; }
     if (current == generation && !V.android_surface_lost) return;
     generation = current;
-    if (g_pend.on) { g_pend.on = 0; display_present_flushed(); }
+    if (g_pend.on) {
+        diag_hook_present_discard(g_cur_frame > 0 ? g_cur_frame - 1 : 0, (int64_t)g_pend.index, 2, g_diag_surface_gen);
+        g_pend.on = 0;
+        display_present_flushed();
+    }
     g_pend.recreate = 0;
     cmd_wait_all();
     swapchain_destroy();
@@ -5337,6 +5384,7 @@ static void vk_present2(void *arg, int progress) {
     if (g_skip_fr_n) { g_skip_frames++; printf("nvn_vk_skipf: frame %lld (%s): %lld draws left out (shader_wait = skip)\n", (long long)frame, g_in_fight ? "fight" : "no fight", (long long)g_skip_fr_n); g_skip_fr_n = 0; }
     if (shot == -2) { shot = getenv("WT_SHOT") ? atoi(getenv("WT_SHOT")) : -1; every = getenv("WT_SHOT_EVERY") ? atoi(getenv("WT_SHOT_EVERY")) : 0; shot_from = getenv("WT_SHOT_FROM") ? atoi(getenv("WT_SHOT_FROM")) : 0; shot_to = getenv("WT_SHOT_TO") ? atoi(getenv("WT_SHOT_TO")) : 0x7fffffff; }
     pass_end();
+    diag_hook_render_end(frame, (int64_t)R.frame_draws, (int64_t)R.frame_skipped, (int64_t)R.frame_clears);
     if (g_dump_on && frame == g_dump_frame) dump_flush();      /* [Recomps#1] TEST ONLY: WT_VK_DUMPTEX */
     { int step = nvn_front_take_step_shot(); if (step && vt) { char path[300]; const char *dir = getenv("WT_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp_vk(path, vt); } }
     nvn_front_draw_tag_clear();
@@ -5423,7 +5471,11 @@ swap: ;
         if (ok && r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); ok = 0; }
     }
     tp[7] = tk();
-    if (!ok) { InterlockedIncrement64(&g_vk_skipped); cmd_submit(NULL, NULL); }
+    if (!ok) {
+        diag_hook_present_discard(frame, (int64_t)index, (int64_t)r, g_diag_surface_gen);
+        InterlockedIncrement64(&g_vk_skipped);
+        cmd_submit(NULL, NULL);
+    }
     else {
         int suboptimal = r == VK_SUBOPTIMAL_KHR;
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -5489,10 +5541,12 @@ swap: ;
         g_wd_where = 4;
         if (!progress && display_present_defer()) {      /* session 14: the finished frame goes to the window AT THE TICK (display.c): kept here, presented by present_flush */
             g_pend.sc = V.swapchain; g_pend.index = index; g_pend.rend = rend; g_pend.suboptimal = suboptimal; g_pend.fight = g_in_fight; g_pend.on = 1;
+            diag_hook_present_queued(frame, (int64_t)index, (int64_t)g_defer_target, (int64_t)g_in_fight);
             if (display_present_due()) present_flush();
             r = VK_SUCCESS;
         } else {
         r = vkQueuePresentKHR(V.queue, &pr);
+        diag_hook_present_called(frame, (int64_t)index, (int64_t)r, (int64_t)progress);
         if (!progress) display_present_done(g_in_fight);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
         else vk_ok("vkQueuePresentKHR", r);
@@ -5518,6 +5572,13 @@ swap: ;
             if (!t_first) t_first = t_now;
             if (!battle && R.frame_draws <= 60 && frame > 600) { if (!t_load) t_load = t_now; } else if (!battle && R.frame_draws > 60) t_load = 0;      /* t_load: the start of the run of loading-screen frames before the battle */
             if (battle && !said) { said = 1; printf("nvn_vk: first battle frame is frame %lld, %.1f s after the first present; the loading screen before it lasted %.1f s\n", (long long)frame, (double)(t_now - t_first) / (double)fq.QuadPart, t_load ? (double)(t_now - t_load) / (double)fq.QuadPart : 0.0); }
+        }
+        {
+            LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            int64_t wall_ns = t_prev && fq.QuadPart > 0 ? (int64_t)(((t_now - t_prev) * 1000000000ULL) / fq.QuadPart) : 0;
+            int64_t cpu_ns = fq.QuadPart > 0 ? (int64_t)(((tp[6] - t_present) * 1000000000ULL) / fq.QuadPart) : 0;
+            int64_t flags = (battle ? 1 : 0) | (progress ? 2 : 0) | 4 /* completed */;
+            diag_stream_frame_sample(frame, cpu_ns, wall_ns, flags);
         }
         if (frame >= 0 && frame < FRSTAT_N) {
             LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);

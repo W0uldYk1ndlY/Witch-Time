@@ -30,7 +30,17 @@ static struct {
     LONG64 jumps, flashes;
 } g_fl = {.on = -1};
 
-static int fl_on(void) { if (g_fl.on < 0) { const char *e = getenv("WT_VK_FLASHLOG"); g_fl.on = e ? atoi(e) : 1; } return g_fl.on; }
+static int fl_on(void) {
+    if (g_fl.on < 0) {
+        const char *e = getenv("WT_VK_FLASHLOG");
+#ifdef __ANDROID__
+        g_fl.on = e ? atoi(e) : 0;
+#else
+        g_fl.on = e ? atoi(e) : 1;
+#endif
+    }
+    return g_fl.on;
+}
 /* pass_begin: one entry per pass of the frame being drawn */
 static void fl_pass(int w, int h, int fmt, int win, int ncol, int depth) {
     if (!fl_on()) return;

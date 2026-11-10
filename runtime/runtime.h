@@ -46,6 +46,32 @@ void guest_svc(Ctx *c, uint32_t number);
     static inline void wr##bits(uint64_t a, uint##bits##_t v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 
+/* Ordered memory access helpers and memory barrier for inter-thread guest ordering. */
+#if defined(__aarch64__)
+#define DEF_ORDERED_MEM(bits) \
+    static inline uint##bits##_t rd_ordered##bits(uint64_t a) { \
+        return __atomic_load_n((const uint##bits##_t *)(uintptr_t)a, __ATOMIC_SEQ_CST); \
+    } \
+    static inline void wr_ordered##bits(uint64_t a, uint##bits##_t v) { \
+        __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_SEQ_CST); \
+    }
+static inline void dmb(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+#else
+#define DEF_ORDERED_MEM(bits) \
+    static inline uint##bits##_t rd_ordered##bits(uint64_t a) { return rd##bits(a); } \
+    static inline void wr_ordered##bits(uint64_t a, uint##bits##_t v) { wr##bits(a, v); }
+static inline void dmb(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+#elif defined(_MSC_VER)
+    _ReadWriteBarrier();
+#endif
+}
+#endif
+DEF_ORDERED_MEM(8) DEF_ORDERED_MEM(16) DEF_ORDERED_MEM(32) DEF_ORDERED_MEM(64)
+
 /* STXR: store only if the location still holds the value the matching LDXR read. Returns 0 on success. */
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);
 #define DEF_STX(bits) \

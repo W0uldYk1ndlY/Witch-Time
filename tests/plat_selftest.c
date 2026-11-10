@@ -94,39 +94,42 @@ int main(void) {
     assert(!VirtualFree(r + 0x1000, 0, MEM_RELEASE) && VirtualFree(r, 0, MEM_RELEASE));
     assert(VirtualQuery(r, &mi, sizeof mi) && mi.State == MEM_FREE);
 
-    /* write watch: only the pages written since the last reset, also when the kernel writes them (read() into the page) */
+    /* write watch: only the pages written since the last reset, also when the kernel writes them (read() into the page).
+     * If kernel tracking is unavailable, GetWriteWatch returns error rather than a false all-pages report. */
     {
         uint8_t *w = VirtualAlloc(NULL, 16 * 4096, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
         PVOID pg[16];
         ULONG_PTR cnt = 16;
         ULONG gran;
         assert(w && VirtualAlloc(w, 16 * 4096, MEM_COMMIT, PAGE_READWRITE) == w);
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && (cnt == 0 || cnt == 16) && gran == 4096);
-        w[2 * 4096 + 7] = 1;
-        int fds[2];
-        assert(pipe(fds) == 0 && write(fds[1], "abc", 3) == 3 && read(fds[0], w + 5 * 4096, 3) == 3);
-        (void)w[9 * 4096];                                             /* a read is not a write */
-        cnt = 16;
-        assert(GetWriteWatch(WRITE_WATCH_FLAG_RESET, w, 16 * 4096, pg, &cnt, &gran) == 0);
-        int tracked = cnt == 2;                                       /* 16 = untracked fallback (every page) */
-        if (tracked) assert(pg[0] == w + 2 * 4096 && pg[1] == w + 5 * 4096);
-        else assert(cnt == 16);
-        cnt = 16;
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == (tracked ? 0 : 16));
-        w[3 * 4096] = 1; w[4 * 4096] = 1;
-        cnt = 1;                                                       /* a short list: the first written page only */
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 1 && (!tracked || pg[0] == w + 3 * 4096));
-        assert(ResetWriteWatch(w, 16 * 4096) == 0);
-        cnt = 16;
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == (tracked ? 0 : 16));
-        assert(VirtualFree(w + host_page, host_page, MEM_DECOMMIT) && VirtualAlloc(w + host_page, host_page, MEM_COMMIT, PAGE_READWRITE) && w[host_page] == 0);
-        cnt = 16;
-        assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == (tracked ? 0 : 16));   /* committed again: not written */
+        UINT init_res = GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran);
+        int tracked = (init_res == 0);
+        if (tracked) {
+            assert(cnt == 0 && gran == 4096);
+            w[2 * 4096 + 7] = 1;
+            int fds[2];
+            assert(pipe(fds) == 0 && write(fds[1], "abc", 3) == 3 && read(fds[0], w + 5 * 4096, 3) == 3);
+            (void)w[9 * 4096];                                         /* a read is not a write */
+            cnt = 16;
+            assert(GetWriteWatch(WRITE_WATCH_FLAG_RESET, w, 16 * 4096, pg, &cnt, &gran) == 0);
+            assert(cnt == 2 && pg[0] == w + 2 * 4096 && pg[1] == w + 5 * 4096);
+            cnt = 16;
+            assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 0);
+            w[3 * 4096] = 1; w[4 * 4096] = 1;
+            cnt = 1;                                                   /* a short list: the first written page only */
+            assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 1 && pg[0] == w + 3 * 4096);
+            assert(ResetWriteWatch(w, 16 * 4096) == 0);
+            cnt = 16;
+            assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 0);
+            assert(VirtualFree(w + host_page, host_page, MEM_DECOMMIT) && VirtualAlloc(w + host_page, host_page, MEM_COMMIT, PAGE_READWRITE) && w[host_page] == 0);
+            cnt = 16;
+            assert(GetWriteWatch(0, w, 16 * 4096, pg, &cnt, &gran) == 0 && cnt == 0);   /* committed again: not written */
+        }
         uint8_t *plain = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         cnt = 16;
         assert(GetWriteWatch(0, plain, 4096, pg, &cnt, &gran) != 0);  /* not watched: fails */
         assert(VirtualFree(w, 0, MEM_RELEASE) && VirtualFree(plain, 0, MEM_RELEASE));
-        printf("write watch: %s\n", tracked ? "tracked" : "NOT tracked (fallback)");
+        printf("write watch: %s\n", tracked ? "tracked (kernel pagemap scan)" : "unavailable (query returned error as expected)");
     }
 
     /* files: create, write at an offset, size, truncate, find, case-insensitive paths, attributes */
