@@ -2,6 +2,9 @@ plugins { id 'com.android.application' }
 def sdlSource = providers.environmentVariable('WT_SDL_SOURCE').orNull
 def nativePrefix = providers.environmentVariable('WTBUILD_ANDROID_DEPS').orNull
 if (!sdlSource || !nativePrefix) throw new GradleException('Set WT_SDL_SOURCE to SDL 3 source and WTBUILD_ANDROID_DEPS to the Android dependency prefix.')
+// A staged bootstrap can silently retain obsolete environment overrides.
+if (!fileTree('src/main/jniLibs').matching { include '**/libmain.so' }.isEmpty())
+    throw new GradleException('Do not stage libmain.so in jniLibs: move it out and let Gradle/CMake build the bootstrap from source.')
 android {
     namespace 'org.witchtime.android'
     compileSdk 35

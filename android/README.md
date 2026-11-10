@@ -39,6 +39,8 @@ Do not use nonexistent legacy Python commands (such as `recomp.py`, `sdklift.py`
 
 Run `scripts/android-package.sh` only after the complete Android runtime and personal `libgame.so` exist in `build/android-arm64`. It deliberately fails instead of producing a misleading launcher-only APK. It stages native libraries and runs `gradle :app:assembleDebug`. Install the resulting debug APK locally using `adb install` (no device is connected by this repository).
 
+`libmain.so` is built from the bootstrap sources by Gradle/CMake, not supplied through `jniLibs`. The build rejects staged copies: move any old `jniLibs/<abi>/libmain.so` outside that directory. An old bootstrap can force `WT_VK_SCALE=0.6` even when `graphics.ini` says `resolution_scale=1.0`. Do not skip Gradle's native build tasks when assembling an APK after bootstrap changes.
+
 ## Local game files
 
 The application uses its own external files directory, normally:
