@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include "diag.h"
 /* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -267,8 +268,10 @@ static int android_surface_create(int wait) {
 static void wait_last_submit(void);
 static int hdr_mode_want(void);                          /* nvn_vk_draw.c, finding 147: 0 SDR, 1 HDR10, 2 scRGB */
 static void hdr_views(int make);                         /* nvn_vk_draw.c: the swapchain images' views (1) / they and the 8-bit picture go (0) */
+static int64_t g_diag_surface_gen = 0;
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
+    diag_hook_surface_gen(g_diag_surface_gen, 0, 0, 0);
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
     hdr_views(0);
@@ -330,6 +333,8 @@ static int swapchain_create(void) {
     V.extent = ext;
     V.hdr = hdr;
     if (hdr) hdr_views(1);
+    g_diag_surface_gen++;
+    diag_hook_surface_gen(g_diag_surface_gen, (int64_t)ext.width, (int64_t)ext.height, (int64_t)sf.format);
     return 1;
 }
 

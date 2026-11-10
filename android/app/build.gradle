@@ -18,6 +18,32 @@ android {
         ndk { abiFilters 'arm64-v8a' }
         externalNativeBuild { cmake { arguments "-DWT_ANDROID_DEPS=${nativePrefix}" } }
     }
+    buildFeatures {
+        buildConfig = true
+    }
+    buildTypes {
+        debug {
+            buildConfigField "boolean", "WT_DIAGNOSTIC_ENABLED", "false"
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+            buildConfigField "boolean", "WT_DIAGNOSTIC_ENABLED", "false"
+        }
+        diagnostic {
+            initWith release
+            matchingFallbacks = ['release']
+            buildConfigField "boolean", "WT_DIAGNOSTIC_ENABLED", "true"
+            ndk {
+                debugSymbolLevel 'SYMBOL_TABLE'
+            }
+            externalNativeBuild {
+                cmake {
+                    cFlags "-DWT_DIAGNOSTIC_ENABLED=1"
+                }
+            }
+        }
+    }
     sourceSets.main {
         java.srcDir "${sdlSource}/android-project/app/src/main/java"
         jniLibs.srcDirs = ['src/main/jniLibs']

@@ -1,0 +1,80 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run_20261110_190000_a1b2",
+  "diagnostic_version": "1.0.0",
+  "toolchain": {
+    "ndk_version": "27.2.12479018",
+    "rustc_version": "1.85.0",
+    "clang_version": "clang version 18.0.1",
+    "host_os": "windows"
+  },
+  "source": {
+    "git_commit": "5b6d8d9c0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b",
+    "is_dirty": true,
+    "local_diff_digest": "sha256_01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+  },
+  "build_identity": {
+    "package_id": "com.retro.witchtime",
+    "apk_hash": "sha256_4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce",
+    "runtime_lib_hash": "sha256_4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+    "game_shim_hash": "sha256_ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+    "main_executable_hash": "sha256_e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "generated_sdk_identity": "sdk-gen-20261110",
+    "build_variant": "diagnostic"
+  },
+  "device": {
+    "model": "OPPO Find N5",
+    "manufacturer": "OPPO",
+    "android_version": "15",
+    "api_level": 35,
+    "driver_version": "0.512.744.0",
+    "vulkan_driver": "Qualcomm Adreno 830",
+    "page_size": 16384,
+    "abi": "arm64-v8a"
+  },
+  "fixtures": {
+    "save_fixture_id": "shibuya_clean",
+    "save_hash": "sha256_c775e7b757ede630cd0aa1113bd102661ab38829ca52a6422ab782862f268646",
+    "replay_fixture_id": "shibuya_p1_v1",
+    "replay_hash": "sha256_2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+    "scenario_hash": "sha256_fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9"
+  },
+  "cache": {
+    "cache_class": "app_cache_cold",
+    "shader_cache_path": "files/diagnostics/run_20261110_190000_a1b2/cache/shader",
+    "vk_cache_path": "files/diagnostics/run_20261110_190000_a1b2/cache/vk",
+    "seed_hash": null,
+    "os_driver_cache": "unknown"
+  },
+  "effective_paths": {
+    "session_root": "files/diagnostics/run_20261110_190000_a1b2",
+    "save_dir": "files/diagnostics/run_20261110_190000_a1b2/userdata",
+    "config_file": "files/diagnostics/run_20261110_190000_a1b2/graphics.ini",
+    "shader_cache_dir": "files/diagnostics/run_20261110_190000_a1b2/cache/shader",
+    "vk_cache_dir": "files/diagnostics/run_20261110_190000_a1b2/cache/vk",
+    "artifacts_dir": "files/diagnostics/run_20261110_190000_a1b2/artifacts"
+  },
+  "effective_settings": {
+    "resolution": [1600, 900],
+    "fps_target": 60.0,
+    "audio_mode": "output",
+    "input_source_policy": "synthetic_fullkey_player1",
+    "input_mapping_policy": "default_type_a",
+    "menu_confirm_policy": "native_a"
+  },
+  "capabilities": {
+    "gpu_timing": {
+      "status": "supported",
+      "reason": null
+    },
+    "thermal": {
+      "status": "supported",
+      "reason": null
+    },
+    "perfetto_trace": {
+      "status": "unavailable",
+      "reason": "PERFETTO_PERMISSION_REQUIRED"
+    }
+  },
+  "mismatches": []
+}

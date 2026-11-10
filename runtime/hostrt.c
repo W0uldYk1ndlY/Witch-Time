@@ -5,6 +5,7 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#include "diag.h"
 
 #define FILE_OFF 0x1000ULL
 #include "sdklift.h"               /* [Recomps#1] SDK_BASE / SDK_IMAGE_SIZE for the dispatch range below */
@@ -510,6 +511,13 @@ void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kerne
 #include <signal.h>
 /* Linux: the same report from a signal handler, on a stack of its own (a guest stack overflow lands here too) */
 static void crash_signal(int sig, siginfo_t *si, void *uc) {
+    if (diag_is_enabled()) {
+        /* Task 6.1: In diagnostic sessions, preserve platform crash reporting without
+         * executing the legacy report/unwinder fatal path. Rely on raw async-safe breadcrumbs
+         * and chain to default signal handler so debuggerd/tombstones run cleanly. */
+        diag_handle_fatal_signal(sig, si, uc);
+        return;
+    }
     (void)uc;
     printf("\nHOST SIGNAL %d (%s) at address 0x%llx\n", sig, strsignal(sig), (unsigned long long)(uintptr_t)si->si_addr);
     dump_guest_registers();
@@ -581,6 +589,11 @@ static void install_crash_handler(void) {
 }
 #else
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    if (diag_is_enabled()) {
+        /* Task 6.1: Write breadcrumb and allow platform exception handling */
+        diag_handle_fatal_signal(0, ep, NULL);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)

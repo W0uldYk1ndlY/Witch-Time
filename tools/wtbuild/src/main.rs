@@ -1,4 +1,5 @@
 mod compile;
+pub mod diag;
 mod fake;
 mod fps_census;
 mod freestanding_check;
@@ -220,6 +221,12 @@ fn main() {
         Some("sha256") if args.len() == 2 => {
             // the launcher's updater checks a downloaded release with it
             println!("{}", util::sha256_file(Path::new(&args[1])).unwrap_or_else(|e| die(format!("{}: {}", args[1], e))));
+        }
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("wtbuild: Witch Time build pipeline and developer tooling");
+            println!("usage: wtbuild <command> [options]");
+            println!("commands: setup, check-freestanding, compile, link, tables, lift, nso2elf, perf-bench, sha256");
+            println!("see tools/wtbuild/README.md for details");
         }
         _ => die("usage: see tools/wtbuild/README.md"),
     }

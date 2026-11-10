@@ -51,6 +51,7 @@ static struct {
     const char *exts[16]; uint32_t next;
     int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, has_fault, debug;
     int has_gpl, ext_gpl, ext_so;
+    uint32_t fsr_push_descriptors; int fsr_compute_quad;
     int dyn_a2c;                                   /* [issue 50] alpha to coverage is dynamic state (else part of the pipeline key) */
     VkPhysicalDeviceDriverProperties drv;
     VkPhysicalDeviceMemoryProperties mp;
@@ -140,6 +141,13 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &p11; p11.pNext = &p12;
         vkGetPhysicalDeviceProperties2(V.gpu, &p2);
+        D.fsr_compute_quad = (p11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && (p11.subgroupSupportedOperations & (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT)) == (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT);
+        if (D.has_push) {
+            VkPhysicalDevicePushDescriptorPropertiesKHR push = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+            p2.pNext = &push;
+            vkGetPhysicalDeviceProperties2(V.gpu, &p2);
+            D.fsr_push_descriptors = push.maxPushDescriptors;
+        }
         const char *missing = nvn_vk_requirement_error(&D.f2.features, &D.f12, &D.f13, &p11, &p12);
         if (missing) vkd_fail("unsupported GPU %s: requires %s; Vulkan 1.3 alone is insufficient", V.props.deviceName, missing);
     }

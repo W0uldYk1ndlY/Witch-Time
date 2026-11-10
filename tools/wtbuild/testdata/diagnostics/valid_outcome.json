@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run_20261110_190000_a1b2",
+  "execution_outcome": "completed",
+  "reason_code": "CLEAN_COMPLETION",
+  "exit_status": {
+    "clean_exit": true,
+    "exit_code": 0,
+    "signal": null,
+    "termination_origin": "process"
+  },
+  "last_confirmed_checkpoint": "cp_combat_end",
+  "covered_segments": [
+    "boot",
+    "continue_menu",
+    "shibuya_intro",
+    "shibuya_fight"
+  ],
+  "checkpoints": [
+    {
+      "checkpoint_id": "cp_boot_done",
+      "occurrence": 1,
+      "status": "passed",
+      "target_segment": "boot",
+      "elapsed_host_ms": 3200.0,
+      "elapsed_game_ms": 3150.0,
+      "reason_code": null,
+      "evidence_ref": "events-001.jsonl:10"
+    },
+    {
+      "checkpoint_id": "cp_continue_press",
+      "occurrence": 1,
+      "status": "passed",
+      "target_segment": "continue_menu",
+      "elapsed_host_ms": 5400.0,
+      "elapsed_game_ms": 5350.0,
+      "reason_code": null,
+      "evidence_ref": "events-001.jsonl:45"
+    },
+    {
+      "checkpoint_id": "cp_combat_end",
+      "occurrence": 1,
+      "status": "passed",
+      "target_segment": "shibuya_fight",
+      "elapsed_host_ms": 65000.0,
+      "elapsed_game_ms": 64800.0,
+      "reason_code": null,
+      "evidence_ref": "events-002.jsonl:1200"
+    }
+  ],
+  "correctness_assertions": [
+    {
+      "assertion_id": "visual_no_black_screen",
+      "kind": "visual",
+      "required": true,
+      "status": "passed",
+      "observation_boundary": "framebuffer_texture",
+      "tolerance": "brightness_min_0.05",
+      "reason_code": null,
+      "evidence_ref": "metrics-001.jsonl:80"
+    },
+    {
+      "assertion_id": "audio_output_active",
+      "kind": "audio",
+      "required": true,
+      "status": "passed",
+      "observation_boundary": "output_backend",
+      "tolerance": null,
+      "reason_code": null,
+      "evidence_ref": "metrics-001.jsonl:110"
+    }
+  ],
+  "storage_exhausted": false,
+  "incomplete_recovery": false
+}

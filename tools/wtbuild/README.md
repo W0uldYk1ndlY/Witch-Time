@@ -77,8 +77,8 @@ Mostly for developers; `--repo <folder>` names the checkout (default: the curren
   the folder); the formats are in `docs/RE_NOTES.md` section 4.
 - `fps-census <census at 60> <census above 60> [<fps_sites.txt>] [--all]` (`docs/STATUS.md`, "Frame rates above 60").
 - `lprof <lprof.txt> [threads (6)] [functions per list (25)]`: an `WT_LPROF` sample file (Linux).
-- `perf-bench run <scene> <scale> [--tag T] [--save DIR] [--desktop-scale F] [--secs N] [--env K=V]...` and
-  `perf-bench report <run dir>...` (Linux only: repeatable performance runs of the built game and their table,
+- `perf-bench run <scene> <scale> [--tag T] [--save DIR] [--desktop-scale F] [--secs N] [--env K=V]...` (Linux desktop runner) and
+  `perf-bench report <run dir>...` (Linux and Windows offline report analysis: repeatable performance runs of the built game and their table,
   `docs/STATUS.md`, "Performance report").
 
 ## Mods
@@ -212,6 +212,11 @@ files in `testdata/golden`, made from stand-in programs with no game or sdk code
 | `pchtxt::tests::random_mod_folders` | 60 random mod folders against a synthetic NSO and ELF: tree lines with and without the main, apply output and patched ELF, errors included (shown equal to `pchtxt.py` on 300 folders); plus unit tests of unescape, IPS, `mods.ini` keys and build IDs | `pchtxt_mods.txt` |
 | `text::tests::random_message_banks` | 10 made-up message banks in a stand-in `ui_000.pkz`: the archive's sha256 and the output, plus the archive's invariants (shown equal to `pc_settings_mod.py` on 30 archives) | `text_banks.txt` |
 | `perf_bench::tests::report_matches_the_python` | `perf-bench report` on four made-up runs | `perf_bench_report.md` |
+
+Intentional report format changes documented in `perf_bench_report.md`:
+- Legacy runs lacking `manifest.json` are explicitly qualified as `(legacy)` in the run column.
+- Absent GPU timing statistics output `-` instead of fabricating zero-valued `0.0 / 0.0 / 0.0` percentiles.
+- Runs with 0 frames in the window are marked `incomplete (0 frames)` in the bottleneck column rather than fabricating a completed scenario or asserting a CPU-side bottleneck.
 
 Other tests pin the compile and table flags (`compile::tests::lifted_flags_unchanged`, `link::tests::table_flags_unchanged`)
 and check the smaller commands one by one.
