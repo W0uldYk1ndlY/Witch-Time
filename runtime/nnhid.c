@@ -15,6 +15,7 @@
 #include "hostrt.h"
 #include "nnpad.h"
 #include "diag_replay.h"
+#include "diag_writer.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -628,6 +629,10 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
             diag_replay_poll(sess, g_anchor, (uint32_t)since, &buttons, &lx16, &ly16, &rx16, &ry16, &attr);
             lx = lx16; ly = ly16; rx = rx16; ry = ry16;
             wired = (attr & DIAG_REPLAY_ATTR_WIRED) != 0;
+            if (sess->is_eof) {
+                diag_writer_write_outcome("completed", "REPLAY_FINISHED", "cp_combat_end");
+                report_and_exit(0);
+            }
         }
         prompts_used = 0; /* Controller origin, never keyboard prompts */
     } else {

@@ -1,3 +1,16 @@
+import os
+
+def find_bash():
+    if os.name == 'nt':
+        for cand in [
+            r'C:\msys64\usr\bin\bash.exe',
+            r'C:\Program Files\Git\bin\bash.exe',
+            r'C:\Program Files\Git\usr\bin\bash.exe',
+        ]:
+            if os.path.isfile(cand):
+                return cand
+    return shutil.which('bash') or 'bash'
+
 """Dump-free packaging regression checks. Run with Python 3."""
 import importlib.util
 import tempfile
@@ -42,7 +55,7 @@ class AndroidPackageTests(unittest.TestCase):
             self.assertIn('setenv("' + name + '"', source)
 
     def test_packaging_script_parses(self):
-        subprocess.run([shutil.which('bash') or 'bash', '-n', str(ROOT / 'scripts/android-package.sh')], check=True)
+        subprocess.run([find_bash(), '-n', str(ROOT / 'scripts/android-package.sh')], check=True)
 
     def test_arm64_and_16k_alignment(self):
         gradle = (ROOT / 'android/app/build.gradle').read_text()

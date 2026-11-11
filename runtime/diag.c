@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -68,6 +69,8 @@ static uint64_t g_diag_total_emitted = 0;
 static uint64_t g_diag_total_dropped = 0;
 static char g_diag_run_id[128] = {0};
 static int g_diag_gfx_prod = -1;
+static int g_diag_fs_prod = -1;
+static int g_diag_audio_prod = -1;
 
 /* Continuous atomic counters state */
 static uint64_t g_cont_wait_events = 0;
@@ -173,12 +176,16 @@ int diag_init(const char *run_id) {
 
     DIAG_ATOMIC_STORE(&g_diag_enabled, 1, DIAG_ORDER_SEQ_CST);
     g_diag_gfx_prod = diag_register_producer("gfx");
+    g_diag_fs_prod = diag_register_producer("fs");
+    g_diag_audio_prod = diag_register_producer("audio");
     return 0;
 }
 
 void diag_shutdown(void) {
     DIAG_ATOMIC_STORE(&g_diag_enabled, 0, DIAG_ORDER_SEQ_CST);
     g_diag_gfx_prod = -1;
+    g_diag_fs_prod = -1;
+    g_diag_audio_prod = -1;
     for (int i = 0; i < DIAG_MAX_PRODUCERS; i++) {
         diag_spsc_ring_t *ring = &g_diag_rings[i];
         DIAG_ATOMIC_STORE(&ring->active, 0, DIAG_ORDER_RELEASE);
@@ -411,7 +418,7 @@ void diag_hook_shader_queue(int64_t queued_jobs, int64_t completed_jobs, int64_t
 }
 
 void diag_hook_file_op(uint32_t op_type, int64_t duration_ns, int64_t bytes_transferred, int32_t status) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled() || g_diag_fs_prod < 0) return;
     if (duration_ns != DIAG_MEASUREMENT_UNAVAILABLE && duration_ns >= 0) {
         DIAG_ATOMIC_ADD(&g_cont_file_ops, 1, DIAG_ORDER_RELAXED);
         DIAG_ATOMIC_ADD(&g_cont_file_duration_ns, (uint64_t)duration_ns, DIAG_ORDER_RELAXED);
@@ -419,7 +426,7 @@ void diag_hook_file_op(uint32_t op_type, int64_t duration_ns, int64_t bytes_tran
     if (bytes_transferred > 0) {
         DIAG_ATOMIC_ADD(&g_cont_file_bytes, (uint64_t)bytes_transferred, DIAG_ORDER_RELAXED);
     }
-    diag_emit(g_diag_gfx_prod, DIAG_EV_FILE_OP, (int64_t)op_type, duration_ns, bytes_transferred, (int64_t)status);
+    diag_emit(g_diag_fs_prod, DIAG_EV_FILE_OP, (int64_t)op_type, duration_ns, bytes_transferred, (int64_t)status);
 }
 
 void diag_hook_mem_stream(int64_t compare_bytes, int64_t copy_bytes, int64_t stream_bytes, int64_t uploads) {
@@ -445,12 +452,12 @@ void diag_hook_mem_alloc(int64_t current_allocated_bytes, int64_t peak_allocated
 }
 
 void diag_hook_audio_counters(int64_t appended_frames, int64_t released_frames, int64_t underruns, int64_t starved) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled() || g_diag_audio_prod < 0) return;
     if (appended_frames >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_appended, appended_frames, DIAG_ORDER_RELAXED);
     if (released_frames >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_released, released_frames, DIAG_ORDER_RELAXED);
     if (underruns >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_underruns, underruns, DIAG_ORDER_RELAXED);
     if (starved >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_starved, starved, DIAG_ORDER_RELAXED);
-    diag_emit(g_diag_gfx_prod, DIAG_EV_AUDIO_COUNTERS, appended_frames, released_frames, underruns, starved);
+    diag_emit(g_diag_audio_prod, DIAG_EV_AUDIO_COUNTERS, appended_frames, released_frames, underruns, starved);
 }
 
 void diag_get_continuous_counters(diag_continuous_counters_t *out_counters) {
@@ -666,7 +673,10 @@ int diag_init_crash_channel(const char *session_dir) {
 #if defined(_WIN32)
     g_crash_fd = _open(path, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
 #else
-    g_crash_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    g_crash_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (g_crash_fd >= 0) {
+        chmod(path, 0666);
+    }
 #endif
     return g_crash_fd >= 0 ? 0 : -1;
 }

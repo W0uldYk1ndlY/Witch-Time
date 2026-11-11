@@ -51,8 +51,10 @@ static void test_producer_registration_bounds(void) {
     assert(diag_init("test-continuous-session") == 0);
     assert(diag_is_enabled());
 
-    /* Unregister default gfx producer to test full range 0..15 */
-    diag_unregister_producer(0);
+    /* Unregister default producers to test full range 0..15 */
+    for (int p = 0; p < DIAG_MAX_PRODUCERS; p++) {
+        diag_unregister_producer(p);
+    }
 
     int ids[DIAG_MAX_PRODUCERS];
     for (int i = 0; i < DIAG_MAX_PRODUCERS; i++) {

@@ -39,6 +39,8 @@ MOCK_HEADERS = {
 int SDL_SetHint(const char *name, const char *value);
 const char *SDL_GetAndroidExternalStoragePath(void);
 void SDL_LogError(int category, const char *fmt, ...);
+void SDL_LogWarn(int category, const char *fmt, ...);
+void SDL_LogInfo(int category, const char *fmt, ...);
 int SDL_ShowSimpleMessageBox(unsigned flags, const char *title, const char *message, void *window);
 """,
     "SDL3/SDL_main.h": """#pragma once
@@ -59,7 +61,13 @@ int setenv(const char *name, const char *value, int overwrite);
 char *getenv(const char *name);
 """,
     "sys/stat.h": """#pragma once
+#if defined(_WIN32)
+#include <direct.h>
+int test_record_mkdir(const char *path);
+#define mkdir(p, m) test_record_mkdir(p)
+#else
 int mkdir(const char *path, int mode);
+#endif
 """,
 }
 
@@ -122,6 +130,16 @@ void SDL_LogError(int category, const char *fmt, ...) {
     record(EV_LOG_ERROR, "log_error", fmt);
 }
 
+void SDL_LogWarn(int category, const char *fmt, ...) {
+    (void)category;
+    (void)fmt;
+}
+
+void SDL_LogInfo(int category, const char *fmt, ...) {
+    (void)category;
+    (void)fmt;
+}
+
 int SDL_ShowSimpleMessageBox(unsigned flags, const char *title, const char *message, void *window) {
     (void)flags; (void)window;
     record(EV_MESSAGE_BOX, title, message);
@@ -143,11 +161,18 @@ int access(const char *path, int mode) {
     return 0;
 }
 
+#if defined(_WIN32)
+int test_record_mkdir(const char *path) {
+    record(EV_MKDIR, path, NULL);
+    return 0;
+}
+#else
 int mkdir(const char *path, int mode) {
     (void)mode;
     record(EV_MKDIR, path, NULL);
     return 0;
 }
+#endif
 
 int setenv(const char *name, const char *value, int overwrite) {
     (void)overwrite;
@@ -243,6 +268,14 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
         main_content = MAIN_C.read_text(encoding="utf-8")
         (cls.tmppath / "main_tested.c").write_text(main_content, encoding="utf-8")
 
+        # Copy bootstrap diagnostic sources
+        diag_h = MAIN_C.parent / "diag_bootstrap.h"
+        diag_c = MAIN_C.parent / "diag_bootstrap.c"
+        if diag_h.is_file():
+            (cls.tmppath / "diag_bootstrap.h").write_text(diag_h.read_text(encoding="utf-8"), encoding="utf-8")
+        if diag_c.is_file():
+            (cls.tmppath / "diag_bootstrap.c").write_text(diag_c.read_text(encoding="utf-8"), encoding="utf-8")
+
         # Write test driver
         (cls.tmppath / "driver.c").write_text(TEST_DRIVER_C, encoding="utf-8")
 
@@ -253,6 +286,7 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
             "-Wall",
             f"-I{cls.tmppath}",
             str(cls.tmppath / "driver.c"),
+            str(cls.tmppath / "diag_bootstrap.c"),
             "-o",
             str(cls.exe),
         ]

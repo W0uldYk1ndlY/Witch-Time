@@ -158,6 +158,15 @@ fn android_run(args: &[String]) {
     let val: serde_json::Value = serde_json::from_slice(&req_bytes).unwrap_or_else(|e| die(format!("invalid request JSON: {}", e)));
     let run_id = val["run_id"].as_str().unwrap_or_else(|| die("request.json missing run_id")).to_string();
 
+    if let Some(dl) = val.get("scenario").and_then(|s| s.get("deadlines")) {
+        if let Some(s) = dl.get("startup_deadline_secs").and_then(|v| v.as_f64()) {
+            startup_deadline = s;
+        }
+        if let Some(s) = dl.get("scenario_deadline_secs").and_then(|v| v.as_f64()) {
+            scenario_deadline = s;
+        }
+    }
+
     let host_out = out_dir.unwrap_or_else(|| PathBuf::from("build").join("diagnostics").join(&run_id));
 
     let cfg = crate::diag::AndroidRunnerConfig {

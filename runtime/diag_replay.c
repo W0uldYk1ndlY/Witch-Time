@@ -310,6 +310,10 @@ bool diag_replay_poll(diag_replay_session_t *session,
         session->current_pos++;
     }
 
+    if (session->current_pos >= session->record_count && session->record_count > 0) {
+        session->is_eof = true;
+    }
+
     if (session->current_pos > 0) {
         const diag_replay_record_t *active = &session->records[session->current_pos - 1];
         if (out_buttons) *out_buttons = active->buttons;

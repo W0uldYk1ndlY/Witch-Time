@@ -79,6 +79,9 @@ int  diag_writer_flush_chunks(void);
 /* Atomically publish status.json */
 int  diag_writer_write_status(void);
 
+/* Atomically publish outcome.json */
+int  diag_writer_write_outcome(const char *outcome, const char *reason, const char *last_checkpoint);
+
 /* Write first-incident data using the disk reserve */
 int  diag_writer_write_incident(const char *name, const void *data, size_t size);
 
