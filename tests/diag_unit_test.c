@@ -76,7 +76,10 @@ static void test_registration_and_reuse(void) {
     printf("[3/6] Testing producer registration limits and reuse...\n");
     assert(diag_init("test-run-session") == 0);
     assert(diag_is_enabled());
-    diag_unregister_producer(0); /* release default gfx producer slot */
+    /* Release pre-registered default producers to test full range 0..15 */
+    for (int p = 0; p < DIAG_MAX_PRODUCERS; p++) {
+        diag_unregister_producer(p);
+    }
 
     int ids[DIAG_MAX_PRODUCERS];
     for (int i = 0; i < DIAG_MAX_PRODUCERS; i++) {

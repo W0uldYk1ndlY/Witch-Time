@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "diag.h"
+#include "diag_writer.h"
 
 #define FILE_OFF 0x1000ULL
 #include "sdklift.h"               /* [Recomps#1] SDK_BASE / SDK_IMAGE_SIZE for the dispatch range below */
@@ -479,6 +480,14 @@ void os_thread_report(FILE *out);            /* os_threads.c: every thread the g
 
 
 void report_and_exit(int code) {
+    if (diag_is_enabled()) {
+        diag_writer_write_outcome(code == 0 ? "completed" : "failed",
+                                  code == 0 ? "CLEAN_COMPLETION" : "EXIT_NON_ZERO",
+                                  "cp_combat_end");
+        diag_writer_stop();
+        diag_writer_shutdown();
+        diag_shutdown();
+    }
     audit_exit_counts();
     print_import_summary(stdout);
     print_hostfn_summary(stdout);

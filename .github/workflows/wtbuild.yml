@@ -7,7 +7,8 @@ name: wtbuild
 on:
   pull_request:
     paths: ['tools/wtbuild/**', 'lifter/**', 'runtime/gen_static/**', 'runtime/freestanding/**',
-            'runtime/*.h', 'runtime/plat_posix.c', 'runtime/nvn_gl.c', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'android/app/src/main/cpp/main.c', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tests/treatment_controls_test.py', 'tests/soft_ww_metadata_test.py', 'tests/soft_ww_query_reset_test.py', 'tests/soft_ww_transaction_test.py', 'tests/soft_ww_fault_handler_test.py', 'tests/soft_ww_chaining_test.py', 'tests/soft_ww_lease_test.py', 'tests/soft_ww_consumer_test.py', 'tests/producer_wait_test.py', 'tests/loadclear_command_test.py', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
+            'runtime/nvn_vk_fsr.c', 'runtime/nvn_vk_sgsr.c', 'runtime/nvn_vk_upscale.c', 'runtime/gfx_options.c', 'runtime/pcmenu.c', 'runtime/third_party/fsr3/**', 'runtime/third_party/sgsr2/**', 'tests/fsr_*', 'tests/sgsr_*', 'tests/upscale_*', 'tests/upscaler_config_test.py', 'tests/pcmenu_selftest.c', 'tests/rs_store_test.py', 'tests/rs_store_coverage_test.c',
+            'runtime/*.h', 'runtime/plat_posix.c', 'runtime/nvn_gl.c', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'runtime/diag.c', 'runtime/diag_writer.c', 'runtime/diag_replay.c', 'runtime/game_shim.c', 'android/app/src/main/cpp/main.c', 'android/app/src/main/cpp/diag_bootstrap.c', 'android/app/src/main/cpp/diag_bootstrap.h', 'scripts/android-package.sh', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tests/treatment_controls_test.py', 'tests/soft_ww_metadata_test.py', 'tests/soft_ww_query_reset_test.py', 'tests/soft_ww_transaction_test.py', 'tests/soft_ww_fault_handler_test.py', 'tests/soft_ww_chaining_test.py', 'tests/soft_ww_lease_test.py', 'tests/soft_ww_consumer_test.py', 'tests/producer_wait_test.py', 'tests/loadclear_command_test.py', 'tests/diag_*', 'tests/gfx_diag_hook_test.c', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
   workflow_dispatch:
 
 jobs:
@@ -65,7 +66,32 @@ jobs:
           "$RUNNER_TEMP/fsr_dither_test"
           clang -O2 -Wall -I runtime tests/fsr_limits_test.c -o "$RUNNER_TEMP/fsr_limits_test"
           "$RUNNER_TEMP/fsr_limits_test"
+          clang -O2 -Wall -I runtime tests/fsr_evidence_test.c -o "$RUNNER_TEMP/fsr_evidence_test"
+          "$RUNNER_TEMP/fsr_evidence_test"
+          clang -O2 -Wall -I runtime tests/upscale_scene_test.c -o "$RUNNER_TEMP/upscale_scene_test"
+          "$RUNNER_TEMP/upscale_scene_test"
+          clang -O2 -Wall -I runtime tests/upscale_route_test.c -o "$RUNNER_TEMP/upscale_route_test"
+          "$RUNNER_TEMP/upscale_route_test"
+          clang -O2 -Wall -I runtime tests/sgsr_params_test.c -o "$RUNNER_TEMP/sgsr_params_test"
+          "$RUNNER_TEMP/sgsr_params_test"
+          python3 tests/fsr_evidence_wiring_test.py
           python3 tests/fsr_cleanup_test.py
+          python3 tests/sgsr_cleanup_test.py
+          python3 tests/sgsr_resources_test.py
+          python3 tests/fsr_image_usage_test.py
+          python3 tests/upscaler_config_test.py
+          python3 tests/upscale_lifecycle_wiring_test.py
+          python3 tests/upscale_scale_test.py
+          python3 tests/rs_store_test.py
+          clang -O2 -Wall tests/rs_store_coverage_test.c -o "$RUNNER_TEMP/rs_store_coverage_test"
+          "$RUNNER_TEMP/rs_store_coverage_test"
+          if command -v glslc >/dev/null && command -v spirv-dis >/dev/null; then
+            python3 tests/fsr_shader_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
+            python3 tests/sgsr_shader_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
+            python3 tests/sgsr_source_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
+          else
+            echo 'FSR shader reflection skipped: glslc or spirv-dis is unavailable'
+          fi
 
       - name: Discord Rich Presence (runtime/presence.c)
         run: |
@@ -115,6 +141,33 @@ jobs:
 
       - name: Leading colour clear pass folding (runtime/nvn_vk_draw.c, tests/loadclear_command_test.py)
         run: python3 tests/loadclear_command_test.py
+
+      - name: Lightweight Android diagnostics, streaming, replay, crash, and input policy suites
+        run: |
+          clang -O2 -Wall -I runtime tests/diag_unit_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_unit_test"
+          "$RUNNER_TEMP/diag_unit_test"
+          clang -O2 -Wall -I runtime -I android/app/src/main/cpp tests/diag_bootstrap_test.c -o "$RUNNER_TEMP/diag_bootstrap_test"
+          "$RUNNER_TEMP/diag_bootstrap_test"
+          clang -O2 -Wall -I runtime tests/diag_writer_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_writer_test"
+          "$RUNNER_TEMP/diag_writer_test"
+          clang -O2 -Wall -I runtime tests/diag_streaming_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_streaming_test"
+          "$RUNNER_TEMP/diag_streaming_test"
+          clang -O2 -Wall -I runtime tests/diag_incident_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_incident_test"
+          "$RUNNER_TEMP/diag_incident_test"
+          clang -O2 -Wall -I runtime tests/diag_crash_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_crash_test"
+          "$RUNNER_TEMP/diag_crash_test"
+          clang -O2 -Wall -I runtime tests/diag_continuous_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_continuous_test"
+          "$RUNNER_TEMP/diag_continuous_test"
+          clang -O2 -Wall -I runtime tests/diag_live_status_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_live_status_test"
+          "$RUNNER_TEMP/diag_live_status_test"
+          clang -O2 -Wall -I runtime tests/diag_semantic_shim_test.c runtime/game_shim.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_semantic_shim_test"
+          "$RUNNER_TEMP/diag_semantic_shim_test"
+          clang -O2 -Wall -I runtime tests/diag_input_policy_test.c runtime/diag_replay.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_input_policy_test"
+          "$RUNNER_TEMP/diag_input_policy_test"
+          clang -O2 -Wall -I runtime tests/diag_replay_test.c runtime/diag_replay.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_replay_test"
+          "$RUNNER_TEMP/diag_replay_test"
+          clang -O2 -Wall -I runtime tests/gfx_diag_hook_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/gfx_diag_hook_test"
+          "$RUNNER_TEMP/gfx_diag_hook_test" 
 
   lifter-check:
     # the shipped lifter against Unicorn: random words of the forms added to the lifter, run in Unicorn and as their lifted C

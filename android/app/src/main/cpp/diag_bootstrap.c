@@ -5,12 +5,11 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <sys/stat.h>
-
 #if defined(_WIN32)
 #include <direct.h>
 #include <windows.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -148,15 +147,47 @@ int diag_bootstrap_compute_sha256(const uint8_t *data, size_t len, char *out_hex
     return 0;
 }
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <dirent.h>
+#endif
+
 /* -------------------------------------------------------------------------------------------------
  * File and Environment Helpers
  * ------------------------------------------------------------------------------------------------- */
+
+#if !defined(_WIN32)
+static void make_accessible_recursive(const char *dir_path) {
+    if (!dir_path) return;
+    chmod(dir_path, 0777);
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+    struct dirent *de;
+    char sub[512];
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        snprintf(sub, sizeof(sub), "%s/%s", dir_path, de->d_name);
+        struct stat st;
+        if (stat(sub, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                chmod(sub, 0777);
+                make_accessible_recursive(sub);
+            } else {
+                chmod(sub, 0666);
+            }
+        }
+    }
+    closedir(d);
+}
+#endif
 
 static int make_dir(const char *path) {
 #if defined(_WIN32)
     return _mkdir(path);
 #else
-    return mkdir(path, 0700);
+    int res = mkdir(path, 0777);
+    if (res == 0) chmod(path, 0777);
+    return res;
 #endif
 }
 
@@ -370,6 +401,9 @@ int diag_bootstrap_write_acknowledgement(const char *run_dir, const char *run_id
 
     fflush(f);
     fclose(f);
+#if !defined(_WIN32)
+    chmod(path, 0666);
+#endif
     return DIAG_BOOTSTRAP_OK;
 }
 
@@ -392,11 +426,18 @@ int diag_bootstrap_write_outcome_rejection(const char *run_dir, const char *run_
 
     fflush(f);
     fclose(f);
+#if !defined(_WIN32)
+    chmod(path, 0666);
+#endif
     return DIAG_BOOTSTRAP_OK;
 }
 
 int diag_bootstrap_apply_session_environment(const char *run_dir, const char *run_id) {
     if (!run_dir || !run_id) return -1;
+
+#if !defined(_WIN32)
+    umask(0000);
+#endif
 
     char subpath[512];
     make_dir(run_dir);
@@ -434,10 +475,48 @@ int diag_bootstrap_apply_session_environment(const char *run_dir, const char *ru
     set_env_var("WT_MODS", "none");
     set_env_var("WT_VOLUME", "100");
 
+    /* Determine scenario timeout from request.json if present */
+    char req_file[512];
+    snprintf(req_file, sizeof(req_file), "%s/request.json", run_dir);
+    FILE *f_req = fopen(req_file, "r");
+    if (f_req) {
+        char rline[256];
+        int set_sec = 0;
+        while (fgets(rline, sizeof(rline), f_req)) {
+            char *p = strstr(rline, "\"scenario_deadline_secs\":");
+            if (!p) p = strstr(rline, "\"scenario_deadline_secs\" :");
+            if (p) {
+                p = strchr(p, ':');
+                if (p) {
+                    double d = atof(p + 1);
+                    if (d > 5.0) {
+                        int run_secs = (int)(d - 10.0);
+                        if (run_secs < 5) run_secs = 5;
+                        char sbuf[32];
+                        snprintf(sbuf, sizeof(sbuf), "%d", run_secs);
+                        set_env_var("WT_SECONDS", sbuf);
+                        set_sec = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        fclose(f_req);
+        if (!set_sec) {
+            set_env_var("WT_SECONDS", "30");
+        }
+    } else {
+        set_env_var("WT_SECONDS", "30");
+    }
+
     /* Redirect output to session.log */
     snprintf(subpath, sizeof(subpath), "%s/session.log", run_dir);
     freopen(subpath, "a", stdout);
     freopen(subpath, "a", stderr);
+#if !defined(_WIN32)
+    chmod(subpath, 0666);
+    make_accessible_recursive(run_dir);
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 

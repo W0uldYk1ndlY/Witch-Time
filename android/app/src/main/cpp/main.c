@@ -36,6 +36,9 @@ int SDL_main(int argc, char **argv) {
     }
 
     if (diag_mode) {
+#if !defined(_WIN32)
+        umask(0000);
+#endif
         char run_dir[256];
         snprintf(run_dir, sizeof(run_dir), "diagnostics/%s", run_id);
 

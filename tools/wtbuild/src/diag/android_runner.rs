@@ -198,6 +198,9 @@ impl<'a> AndroidRunner<'a> {
         let mut recovery_attempts: usize = 0;
         let mut reconnected_without_relaunch = false;
 
+        // Ensure remote session directory exists
+        let _ = self.transport.shell(&serial, &["mkdir", "-p", &remote_session_root]);
+
         // Stage active lease
         let lease_json = format!(
             "{{\"run_id\":\"{}\",\"package\":\"{}\"}}",
@@ -231,6 +234,9 @@ impl<'a> AndroidRunner<'a> {
         }
         let _ = std::fs::remove_file(&temp_req);
 
+        // Ensure diagnostic directory and staged request are world-accessible by app user
+        let _ = self.transport.shell(&serial, &["chmod", "-R", "777", &remote_diag_root]);
+
         let expected_digest = compute_request_digest(&self.config.request_bytes);
 
         // Launch Intent
@@ -240,6 +246,10 @@ impl<'a> AndroidRunner<'a> {
             &[
                 "am",
                 "start",
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER",
                 "-n",
                 &comp,
                 "--es",
@@ -422,7 +432,7 @@ impl<'a> AndroidRunner<'a> {
                         reconnected_without_relaunch = true;
                     }
                     transport_lost_time = None;
-                    if out.exit_code == 0 && out.stdout.contains("\"status\"") {
+                    if out.exit_code == 0 && (out.stdout.contains("\"execution_outcome\"") || out.stdout.contains("\"status\"")) {
                         if observed_phases.last() != Some(&ObserverPhase::Completed) {
                             observed_phases.push(ObserverPhase::Completed);
                         }
@@ -453,7 +463,18 @@ impl<'a> AndroidRunner<'a> {
                 }
                 transport_lost_time = None;
                 if p_out.stdout.trim().is_empty() {
-                    // Confirmed process death
+                    // Check if outcome.json was written before process exit
+                    let outcome_check = self.transport.shell(&serial, &["cat", &remote_outcome]);
+                    if let Ok(chk) = outcome_check {
+                        if chk.exit_code == 0 && (chk.stdout.contains("\"completed\"") || chk.stdout.contains("\"clean_completion\"")) {
+                            if observed_phases.last() != Some(&ObserverPhase::Completed) {
+                                observed_phases.push(ObserverPhase::Completed);
+                            }
+                            final_status = RunnerExitStatus::Completed;
+                            break;
+                        }
+                    }
+                    // Confirmed unexpected process death
                     if observed_phases.last() != Some(&ObserverPhase::ConfirmedDeath) {
                         observed_phases.push(ObserverPhase::ConfirmedDeath);
                     }
@@ -476,6 +497,9 @@ impl<'a> AndroidRunner<'a> {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        // Ensure remote session artifacts are readable by shell
+        let _ = self.transport.shell(&serial, &["chmod", "-R", "777", &remote_session_root]);
+
         // Pull artifacts to host output dir
         let _ = std::fs::create_dir_all(&self.config.host_output_dir);
         let local_manifest = self.config.host_output_dir.join("manifest.json");
@@ -486,6 +510,20 @@ impl<'a> AndroidRunner<'a> {
 
         let local_status = self.config.host_output_dir.join("status.json");
         let _ = self.transport.pull(&serial, &remote_status, &local_status);
+
+        let remote_session_log = format!("{}/session.log", remote_session_root);
+        let local_session_log = self.config.host_output_dir.join("session.log");
+        let _ = self.transport.pull(&serial, &remote_session_log, &local_session_log);
+
+        // Pull event chunks
+        for i in 1..=200 {
+            let chunk_name = format!("events-{:06}.jsonl", i);
+            let remote_chunk = format!("{}/{}", remote_session_root, chunk_name);
+            let local_chunk = self.config.host_output_dir.join(&chunk_name);
+            if self.transport.pull(&serial, &remote_chunk, &local_chunk).is_err() {
+                break;
+            }
+        }
 
         let local_breadcrumb = self.config.host_output_dir.join("crash_breadcrumb.bin");
         if self.transport.pull(&serial, &remote_breadcrumb, &local_breadcrumb).is_ok() {

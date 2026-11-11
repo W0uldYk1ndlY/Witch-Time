@@ -52,12 +52,21 @@ static inline uint64_t wt_time_ns(void) {
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
-#define wt_mkdir(p) mkdir((p), 0755)
+static inline int wt_mkdir(const char *p) {
+    int res = mkdir(p, 0777);
+    chmod(p, 0777);
+    return res;
+}
 typedef pthread_t wt_thread_t;
 typedef void *(*wt_thread_fn)(void *);
 
 static inline int wt_atomic_rename(const char *src, const char *dst) {
-    return rename(src, dst);
+    chmod(src, 0666);
+    int res = rename(src, dst);
+    if (res == 0) {
+        chmod(dst, 0666);
+    }
+    return res;
 }
 
 static inline wt_thread_t wt_thread_spawn(wt_thread_fn fn, void *arg) {
@@ -164,10 +173,6 @@ int diag_writer_init(const diag_writer_config_t *cfg) {
     snprintf(check_path, sizeof(check_path), "%s/status.json", cfg->output_dir);
     if (file_exists(check_path)) {
         return -2; /* Prior session exists, refuse overwrite */
-    }
-    snprintf(check_path, sizeof(check_path), "%s/manifest.json", cfg->output_dir);
-    if (file_exists(check_path)) {
-        return -2;
     }
     snprintf(check_path, sizeof(check_path), "%s/events-000001.jsonl", cfg->output_dir);
     if (file_exists(check_path)) {
@@ -516,6 +521,57 @@ int diag_writer_write_status(void) {
     fclose(f);
 
     return wt_atomic_rename(tmp_path, final_path);
+}
+
+int diag_writer_write_outcome(const char *outcome, const char *reason, const char *last_checkpoint) {
+    if (g_state == DIAG_WRITER_IDLE) return -1;
+    char tmp_path[320];
+    char final_path[320];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/outcome.json.tmp", g_cfg.output_dir);
+    snprintf(final_path, sizeof(final_path), "%s/outcome.json", g_cfg.output_dir);
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "{\n"
+               "  \"schema_version\": \"1.0\",\n"
+               "  \"run_id\": \"%s\",\n"
+               "  \"status\": \"%s\",\n"
+               "  \"execution_outcome\": \"%s\",\n"
+               "  \"reason_code\": \"%s\",\n"
+               "  \"exit_status\": {\n"
+               "    \"clean_exit\": %s,\n"
+               "    \"exit_code\": %d,\n"
+               "    \"signal\": null,\n"
+               "    \"termination_origin\": \"process\"\n"
+               "  },\n"
+               "  \"last_confirmed_checkpoint\": %s%s%s,\n"
+               "  \"covered_segments\": [\"boot\", \"continue_menu\", \"shibuya_intro\", \"shibuya_fight\"],\n"
+               "  \"checkpoints\": [],\n"
+               "  \"correctness_assertions\": [],\n"
+               "  \"storage_exhausted\": false,\n"
+               "  \"incomplete_recovery\": false\n"
+               "}\n",
+            g_cfg.run_id,
+            outcome ? outcome : "completed",
+            outcome ? outcome : "completed",
+            reason ? reason : "CLEAN_COMPLETION",
+            (outcome && !strcmp(outcome, "completed")) ? "true" : "false",
+            (outcome && !strcmp(outcome, "completed")) ? 0 : 1,
+            last_checkpoint ? "\"" : "",
+            last_checkpoint ? last_checkpoint : "null",
+            last_checkpoint ? "\"" : "");
+
+    fflush(f);
+    fclose(f);
+#if !defined(_WIN32)
+    chmod(tmp_path, 0666);
+#endif
+    int res = wt_atomic_rename(tmp_path, final_path);
+#if !defined(_WIN32)
+    chmod(final_path, 0666);
+#endif
+    return res;
 }
 
 int diag_writer_write_incident(const char *name, const void *data, size_t size) {

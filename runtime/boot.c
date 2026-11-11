@@ -13,6 +13,9 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"           /* [Recomps#1] graphics.ini read before the game starts (frame_rate) */
+#include "diag.h"
+#include "diag_writer.h"
+#include "diag_replay.h"
 
 #include "image_layout.h"          /* [Recomps#1] entry points of our main, by exported name */
 #define NNINIT_STARTUP (GUEST_BASE + NNINIT_STARTUP_OFF)
@@ -305,6 +308,42 @@ static int b3_main(int argc, char **argv) {
     }
     cxxrt_install_data();
     runtime_init(g_elf, getenv("WT_TRACE") ? getenv("WT_TRACE") : "boot_trace.txt");
+
+    /* If running under diagnostic orchestration, initialize diagnostic runtime & writer */
+    {
+        const char *diag_run = getenv("WT_DIAG_RUN_ID");
+        const char *diag_dir = getenv("WT_DIAG_DIR");
+        if (diag_run && diag_dir && diag_run[0] && diag_dir[0]) {
+            diag_init(diag_run);
+            diag_writer_config_t wcfg = {0};
+            strncpy(wcfg.output_dir, diag_dir, sizeof(wcfg.output_dir) - 1);
+            strncpy(wcfg.run_id, diag_run, sizeof(wcfg.run_id) - 1);
+            wcfg.storage_budget_bytes = 128 * 1024 * 1024;
+            wcfg.incident_reserve_bytes = 16 * 1024 * 1024;
+            wcfg.chunk_record_limit = 1000;
+            wcfg.flush_interval_ms = 500;
+            diag_writer_init(&wcfg);
+            diag_writer_start();
+
+            /* If replay fixture is specified or present in session, load it */
+            const char *diag_replay_env = getenv("WT_DIAG_REPLAY");
+            char replay_path[512] = {0};
+            if (diag_replay_env && diag_replay_env[0]) {
+                strncpy(replay_path, diag_replay_env, sizeof(replay_path) - 1);
+            } else {
+                snprintf(replay_path, sizeof(replay_path), "%s/replay.wtrp", diag_dir);
+            }
+            static diag_replay_session_t s_session_replay;
+            if (diag_replay_load(replay_path,
+                                 DIAG_REPLAY_SOURCE_SYNTHETIC_FULLKEY_P1,
+                                 DIAG_REPLAY_MAPPING_DEFAULT_TYPE_A,
+                                 DIAG_REPLAY_CONFIRM_A,
+                                 &s_session_replay) == DIAG_REPLAY_OK) {
+                diag_input_enable_synthetic_player1(true);
+                diag_input_set_active_replay(&s_session_replay);
+            }
+        }
+    }
     register_imports(base_imports, (int)(sizeof base_imports / sizeof base_imports[0]));
     register_sdk_imports();
     register_cxx_imports();
@@ -334,7 +373,8 @@ static int b3_main(int argc, char **argv) {
     if (argc > 3 && !strcmp(argv[2], "--pkz-dump")) { int pkz_dump(const char *, char **, int); return pkz_dump(argv[3], argv + 4, argc - 4); }
     display_init();
     { void presence_start(void); presence_start(); }      /* [witchtime] Discord Rich Presence */
-    int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */
+    const char *sec_env = getenv("WT_SECONDS");
+    int seconds = (sec_env && sec_env[0]) ? atoi(sec_env) : (argc > 2 ? atoi(argv[2]) : 0);
     /* the lifted code uses the host stack for every guest call: give it plenty */
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("WT_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
@@ -343,7 +383,8 @@ static int b3_main(int argc, char **argv) {
     lprof_start();
 #endif         /* prof15.c: WT_PROF15, every busy thread (test only; nothing without the variable) */
     DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
-    {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
+    if (!diag_is_enabled()) {
+        unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
         for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
     }
     if (wr == WAIT_TIMEOUT) {
@@ -414,6 +455,12 @@ static int b3_main(int argc, char **argv) {
             }
         }
         report_and_exit(0);
+    }
+    if (diag_is_enabled()) {
+        diag_writer_write_outcome("completed", "CLEAN_COMPLETION", "cp_combat_end");
+        diag_writer_stop();
+        diag_writer_shutdown();
+        diag_shutdown();
     }
     return 0;
 }
