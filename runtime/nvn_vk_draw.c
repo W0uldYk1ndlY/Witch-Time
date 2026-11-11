@@ -37,8 +37,11 @@ static PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR;
 static PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
 static PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
 static PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
+static PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2;
+static PFN_vkGetPhysicalDeviceImageFormatProperties vkGetPhysicalDeviceImageFormatProperties;
 static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
+static int fsr_query_output_format(VkFormat format);
 #define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fatal(#call, r_); } while (0)
 
 static struct {
@@ -52,6 +55,7 @@ static struct {
     int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, has_fault, debug;
     int has_gpl, ext_gpl, ext_so;
     uint32_t fsr_push_descriptors; int fsr_compute_quad;
+    int fsr_output_rgba16, fsr_output_packed;
     int dyn_a2c;                                   /* [issue 50] alpha to coverage is dynamic state (else part of the pipeline key) */
     VkPhysicalDeviceDriverProperties drv;
     VkPhysicalDeviceMemoryProperties mp;
@@ -74,6 +78,8 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2");
     vkGetPhysicalDeviceProperties2 = vk_sym("vkGetPhysicalDeviceProperties2");
     vkGetPhysicalDeviceFormatProperties = vk_sym("vkGetPhysicalDeviceFormatProperties");
+    vkGetPhysicalDeviceFormatProperties2 = vk_sym("vkGetPhysicalDeviceFormatProperties2");
+    vkGetPhysicalDeviceImageFormatProperties = vk_sym("vkGetPhysicalDeviceImageFormatProperties");
     vkGetPhysicalDeviceMemoryProperties = vk_sym("vkGetPhysicalDeviceMemoryProperties");
     vkGetDeviceProcAddr = vk_sym("vkGetDeviceProcAddr");
     D.debug = getenv("WT_VK_DEBUG") && atoi(getenv("WT_VK_DEBUG"));
@@ -103,6 +109,8 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     }
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("WT_VK_PUSH") && !atoi(getenv("WT_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
+    D.fsr_output_rgba16 = fsr_query_output_format(VK_FORMAT_R16G16B16A16_SFLOAT);
+    D.fsr_output_packed = fsr_query_output_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32);
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
     D.has_pv = D.has_pv && D.pv.provokingVertexLast; D.has_iu8 = D.has_iu8 && D.iu8.indexTypeUint8; D.has_plr = D.has_plr && D.plr.primitiveTopologyListRestart;
     D.has_fault = D.has_fault && D.fault.deviceFault; D.fault.deviceFaultVendorBinary = VK_FALSE;      /* (the binary dump is not read: not asked for) */
@@ -851,7 +859,7 @@ static LONG64 g_rs_bytes;                          /* PR #8 review: device memor
  * The upscaler mode is latched here with both scales, so a change applies with rs_apply (the PC panel's A_SCALE rows). */
 static float g_rs_r = -1.0f;                        /* render scale: rs_scale() / FSR's ratio, never below 1.0 (fs5548 and fs1693 store kept
                                                        images at the game's pixels: a raster smaller than the game's leaves texels out) */
-static int g_rs_mode;                               /* gfx_options()->upscaler as latched: 0 off, 1 FSR native, 2 .. 5 quality .. ultra performance */
+static int g_rs_mode;                               /* latched: 0 off, 1..5 FSR, 6..8 SGSR */
 static float fsr_ratio(int mode);                   /* nvn_vk_fsr.c */
 static float rs_scale(void) {
     if (g_rs < 0) {
@@ -863,8 +871,15 @@ static float rs_scale(void) {
          * targets' memory grows with the square of the scale and a failed vkAllocateMemory is fatal (vmem_alloc -> vkd_fail) */
         if (v > RS_MAX) v = RS_MAX;
         g_rs_mode = gfx_options()->upscaler;
+        if (g_rs_mode >= 6 && g_rs_mode <= 8) {
+            int variant = gfx_sgsr_variant();
+            if (variant != 0) printf("nvn_vk_upscale: SGSR mode %d variant %d unavailable (%s); using native rendering\n", g_rs_mode, variant, variant < 0 ? "invalid WT_SGSR_VARIANT" : "compute backend not integrated");
+            else printf("nvn_vk_upscale: SGSR 2-pass-fs selected; experimental HDR, native scene scale until reduced-store qualification\n");
+        }
         float r = v / fsr_ratio(g_rs_mode);
         g_rs_r = r >= 1.0f ? r : v < 1.0f ? v : 1.0f;
+        if (r < g_rs_r)
+            printf("nvn_vk_upscale: requested scene scale %.3f is limited to %.3f (full-grid store coverage is not qualified below this scale)\n", (double)r, (double)g_rs_r);
         MemoryBarrier();                            /* the workers read RS_ON: both scales before g_rs says they are made */
         g_rs = v;
     }
@@ -919,7 +934,8 @@ static void rs_size(int gw, int gh, int post, int *w, int *h) {
     float base = post ? rs_scale() : rs_render_scale();
     float sc = rs_extra_class(gw, gh) ? rs_extra_scale(base) : base, xs = rs_169_class(gw, gh) ? rs_xstretch() : 1.0f;
     *w = (int)((float)gw * sc * xs + 0.5f); *h = (int)((float)gh * sc + 0.5f);
-    if (*w < 1) *w = 1; if (*h < 1) *h = 1;
+    if (*w < 1) *w = 1;
+    if (*h < 1) *h = 1;
 }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { double r = floor((double)v * s + 0.5); return r < 0 ? 0 : r > max ? max : (int)r; }      /* [Recomps#1] clamped before the conversion (finding 83: rs_rect) */
@@ -1271,13 +1287,17 @@ static VTex *vt_get(Tex *t) { return vt_get2(t, 1); }
  * not draw them all again: a paused scene is a picture it drew once); R.col and R.depth name textures, so the next pass takes
  * the new images. When the scale leaves or reaches 1.0 the fragment stages change translation (g_rs_flips): each is looked up
  * again at its next draw, held like the first run at a scale when it was never made. */
+static void upscale_mode_changed(int before, int after);
 static void rs_apply(void) {
     float was = rs_scale(), was_r = rs_render_scale();
+    int mode_before = g_rs_mode;
     int n = 0, was_on = RS_ON;
     LONG64 t0 = tk();
     LARGE_INTEGER fq;
     g_rs = -1;
-    if (rs_scale() == was && rs_render_scale() == was_r) return;      /* (the upscaler mode is latched again either way) */
+    rs_scale();
+    upscale_mode_changed(mode_before, g_rs_mode);
+    if (rs_scale() == was && rs_render_scale() == was_r) return;
     if (was_on != RS_ON) g_rs_flips++;
     for (VTex *vt = g_vtex_all, *next; vt; vt = next) {      /* a new image goes to the head of the list: not met here */
         Tex *t = vt->t;
@@ -1861,8 +1881,14 @@ static VkImageView target_view(const TargetRef *r, VTex *vt) {
     return vt_view(vt, &e, -1, 1);
 }
 static void fl_pass(int w, int h, int fmt, int win, int ncol, int depth);      /* nvn_vk_flash.c (session 13) */
-static void fsr_draw(VStage *fs); static void fsr_present(void); static void fsr_shutdown(void);      /* [witchtime] nvn_vk_fsr.c (issue 118) */
+#include "upscale_scene.h"
+static UpscaleScene U = UPSCALE_SCENE_INITIALIZER;
+static void upscale_draw(VStage *fs); static void fsr_present(void); static void fsr_shutdown(void);      /* nvn_vk_upscale.c / nvn_vk_fsr.c */
+static void sgsr_shutdown(void);
+static void sgsr_present(void);
+static void fsr_evidence_prepare(void); static void fsr_evidence_sample(int stage, Tex *tex, VkImageView view); static void fsr_evidence_draw(void);
 static VkImageView fsr_dither_view(int s, unsigned u, Tex *t, VTex *vt, const View *view); static VkImageView fsr_up_view(int s, Tex *t, VTex *vt, const View *view);
+static VkImageView sgsr_up_view(int s, Tex *t, VTex *vt, const View *view);
 static int g_vk_test;                              /* session 13, TEST ONLY: WT_VK_TEST (see the dynamic state) */
 static int g_dp_potential;                         /* [witchtime] issues 132, 133: draw_prepare for an indirect draw whose count or records the GPU decides */
 static int g_dp_fs_stores;                         /* [witchtime] issue 147: the draw just prepared has a fragment stage that stores into images */
@@ -2114,6 +2140,7 @@ static void resolve_sampler(int s, VStage *v, int i) {
         VTex *vt = vt_get(t);
         VkImageView dither = fsr_dither_view(s, u, t, vt, &view);      /* [witchtime] issue 118: this frame's phase of the dither while FSR runs (may end the pass) */
         if (!dither) dither = fsr_up_view(s, t, vt, &view);           /* [witchtime] issue 118: FSR's output for a tonemap at the picture's scale (may end the pass) */
+        VkImageView sgsr_output = dither ? VK_NULL_HANDLE : sgsr_up_view(s, t, vt, &view);
         if (g_ptm_on > 0) { LONG64 x = tk(); g_ptr[1] += x - rt0; rt0 = x; }
         if (s == 1) { if (vt->rs || rs_keep_has(t)) g_fs_screen = 1; else if (t->b.width <= 64 && t->b.height <= 64) g_fs_small = 1; }      /* [witchtime] the dither */
         EView e;
@@ -2129,6 +2156,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
             else vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout;
             if (dither && dim == DIM_2D) { g_dtex[g_ndtex].view = dither; g_dtex[g_ndtex].layout = VK_IMAGE_LAYOUT_GENERAL; }
+            if (sgsr_output && dim == DIM_2D) { g_dtex[g_ndtex].view = sgsr_output; g_dtex[g_ndtex].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
+            fsr_evidence_sample(s, t, g_dtex[g_ndtex].view);
         } else { static int n; R.dummy_kind++;
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
@@ -3672,6 +3701,7 @@ static LONG64 g_tess_draws, g_tess_pipes;          /* [witchtime] */
 static CB *g_storing_cbs[16];
 static int g_nstoring_cbs = 0;
 static int draw_prepare(unsigned prim) {
+    fsr_evidence_prepare();
     g_nstoring_cbs = 0;
     g_dp_fs_stores = 0;
     if (g_ptm_on < 0) g_ptm_on = getenv("WT_VK_PREPTIME") && atoi(getenv("WT_VK_PREPTIME"));
@@ -3733,7 +3763,7 @@ static int draw_prepare(unsigned prim) {
     if (tess) { sv[nsv] = tcs; sx[nsv++] = 3; sv[nsv] = tes; sx[nsv++] = 4; }
 
     PT(0);
-    if (!g_dp_potential) fsr_draw(fs);             /* [witchtime] issue 118: FSR before the first draw that reads the finished scene (may end the pass); not from a draw the GPU may cull (g_dp_potential) */
+    if (!g_dp_potential) upscale_draw(fs);         /* before the first draw that reads the finished scene; not a draw the GPU may cull */
     /* 1. textures (may upload, change layouts, end the pass) */
     g_ndtex = 0;
     g_movie_y = 0; g_fs_screen = g_fs_small = 0;
@@ -4639,6 +4669,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_DRAW_ARRAYS:
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } shlog_draw(ok, m, 0); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
+        if (a[2] && a[4]) fsr_evidence_draw();
         ckpt(2, NULL, NULL, NULL);
         primlog_add(0, a[2] * (a[4] ? a[4] : 1));
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
@@ -4654,6 +4685,7 @@ static void exec(const Cmd *m, int depth) {
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } shlog_draw(ok, m, 1); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
+        if (a[6]) fsr_evidence_draw();
         ckpt(2, NULL, NULL, NULL);
         primlog_add(1, (uint64_t)count * (a[6] ? a[6] : 1));
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
@@ -4770,6 +4802,7 @@ static void exec(const Cmd *m, int depth) {
             if (elements && (d[2] < lo || (uint64_t)d[2] + d[0] > hi)) continue;      /* outside the bound range (only after a fallback of the whole-buffer binding) */
             if (elements) vkCmdDrawIndexed(R.cmd, d[0], d[1], (uint32_t)(d[2] - lo), (int32_t)d[3], d[4]);
             else vkCmdDraw(R.cmd, d[0], d[1], d[2], d[3]);
+            fsr_evidence_draw();
             R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
         }
         if (rec_owned) free(rec_owned);
@@ -5569,6 +5602,7 @@ static void vk_present2(void *arg, int progress) {
         if (wt > 0 && frame == wt && !progress) { printf("nvn_vk_watchdog: TEST: the render thread is held %d s at frame %lld (WT_VK_WD_TEST)\n", ws, (long long)frame); fflush(stdout); wt = -1; Sleep((DWORD)ws * 1000); }
     }
     if (progress) goto swap;
+    sgsr_present();
     fsr_present();                                 /* [witchtime] issue 118 */
     if (g_tl_t0 && g_tl_first) { LONG64 now = tk(); g_tl_sum[0] += g_tl_first - g_tl_t0; g_tl_sum[1] += g_tl_last - g_tl_t0; g_tl_sum[2] += now - g_tl_t0; g_tl_n++; g_tl_first = 0; }
     if (g_pt_on > 0 && g_in_fight) g_pt_frames++;
@@ -6100,7 +6134,7 @@ static void vkd_init(void) {
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
     R.ring_size = 256ull << 20;
-    R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, &R.ring_mem);      /* [witchtime] indirect: records (gpucount_on); transfer dst: GPU copies (gcp_patch) */
+    R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, &R.ring_mem);      /* uniforms: owned SGSR constants; indirect: records; transfer dst: GPU copies */
     R.zero = vbuf_new(65536 + 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &R.zero_mem);
     memset(R.zero_mem.map, 0, 65536 + 64);
     { float f1 = 1.0f; uint32_t i1 = 1; memcpy((uint8_t *)R.zero_mem.map + 65536 + 12, &f1, 4); memcpy((uint8_t *)R.zero_mem.map + 65536 + 28, &i1, 4); }
@@ -6213,6 +6247,7 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < 16; i++) if (g_sem_img[i]) { vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL; }
     fl_shutdown();
     fsr_shutdown();                                /* [witchtime] issue 118 (its images went with g_vtex_all) */
+    sgsr_shutdown();
     hdr_views(0);                                  /* [Recomps#1] finding 147: the HDR pass */
     if (g_hdr.pipe) vkDestroyPipeline(V.device, g_hdr.pipe, NULL);
     if (g_hdr.pl) { vkDestroyPipelineLayout(V.device, g_hdr.pl, NULL); vkDestroyDescriptorSetLayout(V.device, g_hdr.dl, NULL); vkDestroyDescriptorPool(V.device, g_hdr.dp, NULL); vkDestroySampler(V.device, g_hdr.smp, NULL); }

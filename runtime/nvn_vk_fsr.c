@@ -15,6 +15,7 @@
 
 __declspec(dllimport) extern volatile int game_fsr_w, game_fsr_h, game_fsr_phases;      /* game_shim_eh.c h_cam_upload: the jitter's pixel size (0 = none) and its phase count */
 #include "fsr_limits.h"
+#include "fsr_evidence.h"
 
 /* AMD's Fsr3UpscalerConstants (ffx_fsr3upscaler_private.h), the std140 block cbFSR3Upscaler */
 typedef struct {
@@ -211,16 +212,16 @@ static struct {
     VkPipeline pipe[P_N]; VkPipelineLayout pl[P_N]; VkDescriptorSetLayout dl[P_N]; VkSampler smp[2];
     VkBuffer ubo; VMem ubo_mem; uint32_t ubo_pos, ubo_al, cb_off[3];
     int w, h, uw, uh, blit; FImg img[FI_N];        /* w, h: the scene's (render) size; uw, uh: the output's; blit: the output is RGBA16F (no storage for the scene's format) */
-    Tex *col; LONG64 up_frame, missed;             /* col: the scene colour of the last run; up_frame: FI_OUT filled from it without FSR (fsr_up_view) */
+    LONG64 missed;
     FsrConst k; uint32_t res_index; int fresh;    /* fresh: resources just made: clear them, reset */
     double prev_vp[16]; float prev_fwd[3], prev_pos[3]; int have_prev;
-    LONG64 frame, ran, depth_frame, cam_frame; LONG64 t_last;
-    Tex *depth; float c3[64]; int cam_jit;           /* cam_jit: the c3 kept this frame carries our jitter ([1][2] != 0: Halton(k, 3) - 0.5 never is) */
+    LONG64 t_last;
     VkImageView col_view, depth_view; VkImageLayout col_layout, depth_layout;
     LONG64 runs, resets;
+    FsrEvidence evidence, evidence_last; int evidence_pending, evidence_support, evidence_have_last, evidence_last_mode, evidence_last_requested, evidence_logged; char evidence_why[96];
 } F;
 
-static int fsr_want(void) { rs_scale(); return g_rs_mode >= 1 && F.ok >= 0; }      /* the mode as latched with the scales (rs_scale) */
+static int fsr_want(void) { rs_scale(); return g_rs_mode >= 1 && g_rs_mode <= 5 && F.ok >= 0; }      /* the mode as latched with the scales (rs_scale) */
 /* the scene's scale is the picture's / this (AMD's ratios); 1 where FSR cannot run, so the scene is never left small without it */
 static const char *fsr_unable(void);
 static float fsr_ratio(int mode) {
@@ -261,15 +262,43 @@ static void fsr_img(FImg *im, VkFormat f, int w, int h, int levels, int storage)
     for (int l = 0; l < 6; l++) im->lvl[l] = l < levels ? fsr_view(vt, l, 1) : im->all;
 }
 
+static int fsr_image_usage(VkFormat format, int storage, int width, int height, int levels) {
+    VkImageFormatProperties image;
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    return vkGetPhysicalDeviceImageFormatProperties(V.gpu, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &image) == VK_SUCCESS &&
+           (width <= 0 || (uint32_t)width <= image.maxExtent.width) && (height <= 0 || (uint32_t)height <= image.maxExtent.height) &&
+           image.maxExtent.depth >= 1 && levels > 0 && (uint32_t)levels <= image.maxMipLevels && image.maxArrayLayers >= 1 && (image.sampleCounts & VK_SAMPLE_COUNT_1_BIT);
+}
+static int fsr_query_output_format(VkFormat format) {
+    VkFormatProperties3 p3 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 p2 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+    p2.pNext = &p3;
+    vkGetPhysicalDeviceFormatProperties2(V.gpu, format, &p2);
+    VkFormatFeatureFlags2 need = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+    int features = (p3.optimalTilingFeatures & need) == need;
+    int image_supported = features && fsr_image_usage(format, 1, 0, 0, 1);
+    return fsr_output_writable(image_supported, D.f2.features.shaderStorageImageWriteWithoutFormat != 0,
+                               (p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) != 0);
+}
+static int fsr_output_format(VkFormat format) {
+    return format == VK_FORMAT_R16G16B16A16_SFLOAT ? D.fsr_output_rgba16 :
+           format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? D.fsr_output_packed : 0;
+}
+
 static const char *fsr_unable(void) {               /* what the device lacks for FSR, NULL when nothing (physical-device queries only: any thread) */
-    static char m[96];
+    static _Thread_local char m[96];
     if (!D.has_push) return "the device has no VK_KHR_push_descriptor";
     const VkPhysicalDeviceLimits *limits = &V.props.limits;
-    const char *limit_error = fsr_limit_error(limits->maxComputeWorkGroupInvocations, limits->maxComputeWorkGroupSize[0], limits->maxComputeWorkGroupSize[1], limits->maxComputeSharedMemorySize, limits->maxPerStageDescriptorStorageImages, limits->maxDescriptorSetStorageImages, D.fsr_push_descriptors, D.fsr_compute_quad, fmt_supported(VK_FORMAT_R16_SNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT));
+    /* The selected Lanczos permutation does not sample the LUT; shader reflection tests guard that assumption. */
+    const char *limit_error = fsr_limit_error(limits->maxComputeWorkGroupInvocations, limits->maxComputeWorkGroupSize[0], limits->maxComputeWorkGroupSize[1], limits->maxComputeSharedMemorySize, limits->maxPerStageDescriptorStorageImages, limits->maxDescriptorSetStorageImages, D.fsr_push_descriptors, D.fsr_compute_quad, fsr_lut_supported(fmt_supported(VK_FORMAT_R16_SNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT), fmt_supported(VK_FORMAT_R16_SNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT), 0));
     if (limit_error) return limit_error;
-    if (!D.f2.features.shaderStorageImageWriteWithoutFormat) return "the device has no shaderStorageImageWriteWithoutFormat";
-    for (int i = 0; i < FI_N; i++)
-        if (k_fi[i].f && i != FI_LUT && !fmt_supported(k_fi[i].f, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { snprintf(m, sizeof m, "no storage images of format %d", (int)k_fi[i].f); return m; }
+    if (!fsr_descriptor_limits(limits->maxPerStageDescriptorSampledImages, limits->maxDescriptorSetSampledImages, limits->maxPerStageDescriptorUniformBuffers, limits->maxDescriptorSetUniformBuffers, limits->maxPerStageDescriptorSamplers, limits->maxDescriptorSetSamplers, limits->maxPerStageResources)) return "insufficient sampled-image, uniform, sampler or per-stage resource limits for FSR";
+    if (!fsr_output_format(VK_FORMAT_R16G16B16A16_SFLOAT) && !fsr_output_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32)) return "no sampled storage output supports formatless writes";
+    for (int i = 0; i < FI_N; i++) if (k_fi[i].f) {
+        int storage = i != FI_LUT;
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | (storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : 0);
+        if (!fmt_supported(k_fi[i].f, need) || !fsr_image_usage(k_fi[i].f, storage, 0, 0, 1)) { snprintf(m, sizeof m, "unsupported image usage for format %d", (int)k_fi[i].f); return m; }
+    }
     {   /* The current shader permutation linearly samples these internal formats. */
         const VkFormat filtered[] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
         for (unsigned i = 0; i < sizeof filtered / sizeof filtered[0]; i++)
@@ -295,11 +324,13 @@ static int fsr_setup(void) {                       /* render thread, once: sampl
         VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = i ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; si.mipmapMode = i ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; si.maxLod = VK_LOD_CLAMP_NONE;
-        VKC(vkCreateSampler(V.device, &si, NULL, &F.smp[i]));
+        VkResult r = vkCreateSampler(V.device, &si, NULL, &F.smp[i]);
+        if (r != VK_SUCCESS) { printf("nvn_vk_fsr: sampler %d: vkCreateSampler failed: %s (%d)\n", i, vk_result_name(r), (int)r); fsr_release_setup(); fsr_off("vkCreateSampler failed"); return 0; }
     }
     F.ubo_al = (uint32_t)V.props.limits.minUniformBufferOffsetAlignment; if (F.ubo_al < 256) F.ubo_al = 256;
     F.ubo = vbuf_new(64u << 10, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &F.ubo_mem);      /* far more than the 8 submissions that may be in flight */
     for (int p = 0; p < P_N; p++) {
+        char what[96]; snprintf(what, sizeof what, "FSR pass %s", k_fpass[p].file ? k_fpass[p].file : "camera motion vectors");
         VkDescriptorSetLayoutBinding lb[18];
         int n = 0;
         for (int i = 0; i < k_fpass[p].n; i++) {
@@ -312,20 +343,21 @@ static int fsr_setup(void) {                       /* render thread, once: sampl
         if (p != P_MV) for (int i = 0; i < 2; i++) { VkDescriptorSetLayoutBinding b = {1000u + (uint32_t)i, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; lb[n++] = b; }
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR; li.bindingCount = (uint32_t)n; li.pBindings = lb;
-        VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &F.dl[p]));
+        VkResult r = vkCreateDescriptorSetLayout(V.device, &li, NULL, &F.dl[p]);
+        if (r != VK_SUCCESS) { printf("nvn_vk_fsr: %s: vkCreateDescriptorSetLayout failed: %s (%d)\n", what, vk_result_name(r), (int)r); fsr_release_setup(); fsr_off("vkCreateDescriptorSetLayout failed"); return 0; }
         VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1; pli.pSetLayouts = &F.dl[p];
-        VKC(vkCreatePipelineLayout(V.device, &pli, NULL, &F.pl[p]));
+        r = vkCreatePipelineLayout(V.device, &pli, NULL, &F.pl[p]);
+        if (r != VK_SUCCESS) { printf("nvn_vk_fsr: %s: vkCreatePipelineLayout failed: %s (%d)\n", what, vk_result_name(r), (int)r); fsr_release_setup(); fsr_off("vkCreatePipelineLayout failed"); return 0; }
         FsrStr src = {0};
         if (k_fpass[p].file) fsr_emit(&src, k_fpass[p].file, 1); else fsr_put(&src, k_fsr_mv, sizeof k_fsr_mv - 1);
         uint64_t h;
-        char what[96]; snprintf(what, sizeof what, "FSR pass %s", k_fpass[p].file ? k_fpass[p].file : "camera motion vectors");
         VkShaderModule mod = src.p ? module_from_glsl(5, src.p, what, &h) : NULL;
         free(src.p);
         if (!mod) { fsr_release_setup(); fsr_off("a pass did not compile (the line before names it)"); return 0; }
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = mod; ci.stage.pName = "main"; ci.layout = F.pl[p];
-        VkResult r = vkCreateComputePipelines(V.device, g_pcache, 1, &ci, NULL, &F.pipe[p]);
+        r = vkCreateComputePipelines(V.device, g_pcache, 1, &ci, NULL, &F.pipe[p]);
         vkDestroyShaderModule(V.device, mod, NULL);
         if (r != VK_SUCCESS) { printf("nvn_vk_fsr: %s: vkCreateComputePipelines failed: %s (%d)\n", what, vk_result_name(r), (int)r); fsr_release_setup(); fsr_off("vkCreateComputePipelines failed"); return 0; }
     }
@@ -335,12 +367,28 @@ static int fsr_setup(void) {                       /* render thread, once: sampl
     return 1;
 }
 
+static void fsr_image_size(int i, int w, int h, int uw, int uh, int *iw, int *ih, int *levels) {
+    int s = k_fi[i].size;
+    *iw = s == 0 ? w : s == 4 ? uw : s == 1 ? w / 2 : s == 3 ? 128 : 1;
+    *ih = s == 0 ? h : s == 4 ? uh : s == 1 ? h / 2 : 1;
+    *levels = 1;
+    if (i == FI_SPD) { int m = *iw > *ih ? *iw : *ih; while (m > 1) { m >>= 1; (*levels)++; } }
+}
+static int fsr_images_fit(int w, int h, int uw, int uh, VkFormat col) {
+    VkFormat out = fsr_output_format(col) ? col : VK_FORMAT_R16G16B16A16_SFLOAT;
+    for (int i = 0; i < FI_N; i++) {
+        int iw, ih, levels;
+        fsr_image_size(i, w, h, uw, uh, &iw, &ih, &levels);
+        if (iw <= 0 || ih <= 0 || !fsr_image_usage(i == FI_OUT ? out : k_fi[i].f, i != FI_LUT, iw, ih, levels)) return 0;
+    }
+    return 1;
+}
 static void fsr_resize(int w, int h, int uw, int uh, VkFormat col) {      /* the scene's and the output's sizes: every resource made again, history reset */
     for (int i = 0; i < FI_N; i++) if (F.img[i].vt) { vt_garbage(F.img[i].vt); F.img[i].vt = NULL; }
-    F.blit = !fmt_supported(col, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    F.blit = !fsr_output_format(col);
     for (int i = 0; i < FI_N; i++) {
-        int s = k_fi[i].size, iw = s == 0 ? w : s == 4 ? uw : s == 1 ? w / 2 : s == 3 ? 128 : 1, ih = s == 0 ? h : s == 4 ? uh : s == 1 ? h / 2 : 1, lv = 1;
-        if (i == FI_SPD) { int m = iw > ih ? iw : ih; while (m > 1) { m >>= 1; lv++; } }      /* AMD: the whole chain */
+        int iw, ih, lv;
+        fsr_image_size(i, w, h, uw, uh, &iw, &ih, &lv);
         fsr_img(&F.img[i], i == FI_OUT ? (F.blit ? VK_FORMAT_R16G16B16A16_SFLOAT : col) : k_fi[i].f, iw, ih, lv, i != FI_LUT);      /* (size 4 also holds the locks and the history) */
     }
     {   /* AMD's Lanczos-2 table (fsr3upscalerCreate): bound by the accumulate pass */
@@ -448,28 +496,43 @@ static void fsr_inv4(const double *m, double *o) {      /* 4x4 inverse, row majo
 
 /* render thread, at a draw whose fragment stage reads `col` (the scene's colour) with `depth` the scene's depth */
 static void fsr_run(Tex *col, Tex *depth, int fx) {
+    F.evidence.eligible = 1;
     VTex *vc = vt_get(col), *vd = vt_get(depth);
     int w = vc->w, h = vc->h, uw = w, uh = h;
-    if (vd->w != w || vd->h != h) return;
+    if (vd->w != w || vd->h != h) { F.evidence.input_mismatch = 1; return; }
+    if (!fsr_output_format(vc->fmt) && !fsr_output_format(VK_FORMAT_R16G16B16A16_SFLOAT)) { F.evidence.output_unsupported = 1; fsr_off("no compatible formatless output for this scene"); if (rs_render_scale() != rs_scale()) rs_apply(); return; }
     if (vc->rs) rs_size(col->b.width, col->b.height, 1, &uw, &uh);      /* the output: as the tonemap's target, which has the scene's game size at the picture's scale */
     if (uw < w || uh < h) uw = w, uh = h;
+    if (w <= 0 || h <= 0 || uw <= 0 || uh <= 0 || !fsr_dispatch_fits((unsigned)uw, (unsigned)uh, V.props.limits.maxComputeWorkGroupCount[0], V.props.limits.maxComputeWorkGroupCount[1])) {
+        F.evidence.output_unsupported = 1; fsr_off("FSR output exceeds the supported dispatch grid"); if (rs_render_scale() != rs_scale()) rs_apply(); return;
+    }
+    int needs_resize = w != F.w || h != F.h || uw != F.uw || uh != F.uh || !F.img[FI_OUT].vt || F.blit != !fsr_output_format(vc->fmt) || (!F.blit && F.img[FI_OUT].vt->fmt != vc->fmt);
+    if (needs_resize && !fsr_images_fit(w, h, uw, uh, vc->fmt)) {
+        F.evidence.output_unsupported = 1; fsr_off("an FSR image size, mip count or usage is unsupported"); if (rs_render_scale() != rs_scale()) rs_apply(); return;
+    }
+    if (!fsr_output_format(vc->fmt) || uw != w || uh != h) {
+        VkFormat out = fsr_output_format(vc->fmt) ? vc->fmt : VK_FORMAT_R16G16B16A16_SFLOAT;
+        VkFormatFeatureFlags src = VK_FORMAT_FEATURE_BLIT_SRC_BIT | ((uw != w || uh != h) ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT : 0);
+        if (!fmt_supported(out, src) || !fmt_supported(vc->fmt, VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+            F.evidence.output_unsupported = 1; fsr_off("no supported output-to-scene blit"); if (rs_render_scale() != rs_scale()) rs_apply(); return;
+        }
+    }
     if (F.ok == 0 && !fsr_setup()) { if (rs_render_scale() != rs_scale()) rs_apply(); return; }      /* a quality mode without FSR: the scene back at the picture's scale (fsr_ratio is 1 now) */
     pass_end();
     cmd_begin();
     pt_mark(w, h, 0, 0x118, 0, 0, 1);              /* WT_VK_PASSTIME: FSR (and its copy) as a kind of its own, "format 0x118" */
     fsr_barrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);      /* FI_OUT: an earlier tonemap's read, fsr_up_view's blit */
-    if (w != F.w || h != F.h || uw != F.uw || uh != F.uh || !F.img[FI_OUT].vt || (!F.blit && F.img[FI_OUT].vt->fmt != vc->fmt)) fsr_resize(w, h, uw, uh, vc->fmt);
-    F.col = col;
+    if (needs_resize) fsr_resize(w, h, uw, uh, vc->fmt);
+    U.col = col; U.output_larger = uw != w || uh != h;
     LONG64 now = tk();
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     double dt = F.t_last ? (double)(now - F.t_last) / (double)fq.QuadPart : 1.0 / 60.0;
     F.t_last = now;
 
     /* the camera of the scene's draws: c3 rows (h_cam_upload): [0..15] view, [16..31] projection, [32..47] VP, [48..63] inverse view */
-    const float *m = F.c3;
-    double jx = m[30] != 0.0f ? (double)m[18] / m[30] : 0.0, jy = m[30] != 0.0f ? (double)m[22] / m[30] : 0.0;      /* the projection's [0][2], [1][2]: 0 but for our jitter */
-    if (fabs(jx) * w > 1.15 || fabs(jy) * h > 1.15) jx = jy = 0.0;      /* an off-centre projection of the game's own, not our jitter (1.15: a camera
-                                                                         jittered for the last, smaller dynamic-resolution size reaches 1.09) */
+    const float *m = U.c3;
+    double jx, jy;
+    upscale_scene_jitter(&U, w, h, &jx, &jy);
     double vp[16], inv[16], mm[16];
     for (int i = 0; i < 16; i++) vp[i] = m[32 + i];
     for (int c = 0; c < 4; c++) { vp[c] -= jx * vp[12 + c]; vp[4 + c] -= jy * vp[12 + c]; }      /* without the jitter: row 0 / 1 -= j * row 3 */
@@ -481,8 +544,8 @@ static void fsr_run(Tex *col, Tex *depth, int fx) {
         float dx = pos[0] - F.prev_pos[0], dy = pos[1] - F.prev_pos[1], dz = pos[2] - F.prev_pos[2];
         cut = dot < 0.9f || dx * dx + dy * dy + dz * dz > 25.0f;      /* shortcut: a camera cut is guessed (25 degrees or 5 units in a frame); a game signal would be exact */
     }
-    int reset = F.fresh || !F.have_prev || F.ran != F.frame - 1 || cut;
-    F.ran = F.frame;
+    int reset = upscale_scene_reset(&U, F.fresh, F.have_prev, cut, g_diag_surface_gen);
+    U.ran = U.frame;
     {   /* our motion vectors: M = previous VP x inverse(VP) (both without jitter), uploaded column major */
         float u[20];
         if (reset) { for (int i = 0; i < 16; i++) mm[i] = i % 5 == 0; }
@@ -553,6 +616,8 @@ static void fsr_run(Tex *col, Tex *depth, int fx) {
     fsr_dispatch(P_REACT, src_x, src_y);
     fsr_dispatch(P_INST, src_x, src_y);
     fsr_dispatch(P_ACC, (uint32_t)(uw + 7) / 8, (uint32_t)(uh + 7) / 8);      /* at the output's size (AMD: dispatchDst) */
+    F.evidence.dispatched = 1;
+    U.surface_generation = g_diag_surface_gen; U.have_surface = 1;
     F.res_index = (F.res_index + 1) % 16;
 
     /* the result into the scene's colour: the bloom reads it there (a 2 x 2 gather that needs the scene's size); at another size
@@ -615,7 +680,7 @@ static VkImageView fsr_dither_view(int s, unsigned u, Tex *t, VTex *vt, const Vi
     {   /* TEST ONLY: WT_FSR_DITHER=0 keeps the game's fixed pattern; =alt: fixed in every other 30 frames (an A/B in one run) */
         static int mode = -1;
         if (mode < 0) { const char *e = getenv("WT_FSR_DITHER"); mode = !e ? 1 : !strcmp(e, "alt") ? 2 : atoi(e) != 0; }
-        if (game_fsr_w <= 0 || !fsr_want() || !mode || (mode == 2 && (F.frame / 30) % 2)) return NULL;
+        if (game_fsr_w <= 0 || !fsr_want() || !mode || (mode == 2 && (U.frame / 30) % 2)) return NULL;
     }
     EView e;
     eview_of(t, vt, view, &e);
@@ -660,19 +725,19 @@ static VkImageView fsr_dither_view(int s, unsigned u, Tex *t, VTex *vt, const Vi
         fsr_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         printf("nvn_vk_fsr: dither pattern %d: %d phases made\n", i + 1, FSR_DN);
     }
-    return d->ph[0] ? d->view[fsr_dither_phase_of(F.frame)] : NULL;
+    return d->ph[0] ? d->view[fsr_dither_phase_of(U.frame)] : NULL;
 }
 /* nvn_vk_draw.c resolve_sampler: a tonemap (FX_GRAIN) into a target at the picture's scale (rs_promote) reads FSR's output in place
  * of the scene colour (the 2:1 bloom reads the scene colour at its own size, see fsr_run). In a frame FSR did not run, a linear
  * enlargement of the scene colour (counted: the 1800-run line). NULL: the game's image. */
 static VkImageView fsr_up_view(int s, Tex *t, VTex *vt, const View *view) {
-    if (s != 1 || t != F.col || !F.img[FI_OUT].vt || (F.uw == F.w && F.uh == F.h) || !R.prog[1] || stage_fx(&R.prog[1]->st[1]) != FX_GRAIN || !R.ncol || !R.col[0].tex || !fsr_want()) return NULL;
+    if (s != 1 || t != U.col || !F.img[FI_OUT].vt || (F.uw == F.w && F.uh == F.h) || !R.prog[1] || stage_fx(&R.prog[1]->st[1]) != FX_GRAIN || !R.ncol || !R.col[0].tex || !fsr_want()) return NULL;
     Tex *c = R.col[0].tex;
     if (!rs_post_has(c) && !(c->vk && ((VTex *)c->vk)->post)) return NULL;      /* (a promoted target has no image until its pass) */
     EView e;
     eview_of(t, vt, view, &e);
     if (e.format != t->b.format || e.lvl0 != 0 || e.swz[0] != 2 || e.swz[1] != 3 || e.swz[2] != 4 || e.swz[3] != 5) return NULL;
-    if (F.ran != F.frame && F.up_frame != F.frame) {
+    if (U.ran != U.frame && U.up_frame != U.frame) {
         if (vt->w != F.w || vt->h != F.h || !fmt_supported(F.img[FI_OUT].vt->fmt, VK_FORMAT_FEATURE_BLIT_DST_BIT) || rs_filter(vt) != VK_FILTER_LINEAR) return NULL;
         pass_end(); cmd_begin();
         fsr_barrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);      /* an earlier frame's reads and writes of FI_OUT */
@@ -682,58 +747,47 @@ static VkImageView fsr_up_view(int s, Tex *t, VTex *vt, const View *view) {
         b.srcOffsets[1].x = vt->w; b.srcOffsets[1].y = vt->h; b.dstOffsets[1].x = F.uw; b.dstOffsets[1].y = F.uh; b.srcOffsets[1].z = b.dstOffsets[1].z = 1;
         vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, F.img[FI_OUT].vt->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
         fsr_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        F.up_frame = F.frame; F.missed++;
+        U.up_frame = U.frame; F.missed++;
+        F.evidence.fallback = 1;
     }
     return F.img[FI_OUT].all;
-}
-static int fsr_reads(VStage *fs, Tex *want) {      /* the fragment stage samples this texture at some unit */
-    for (int i = 0; fs && i < fs->nsmp; i++) {
-        Tex *t = NULL; View view; SamplerParams sp;
-        if (fs->smp[i].unit < 32 && (nvn_front_handle(R.tpool, R.spool, R.nvn_tex[1][fs->smp[i].unit], &t, &view, &sp) & 1) && t == want) return 1;
-    }
-    return 0;
-}
-
-/* nvn_vk_draw.c draw_prepare, before its textures: notes the scene's draws (depth and camera), runs FSR at the first draw that
- * reads the finished scene (the first bloom downsample, or the tonemap) */
-static void fsr_draw(VStage *fs) {
-    if (!fsr_want()) return;
-    Tex *c = R.ncol ? R.col[0].tex : NULL, *d = R.depth.tex;
-    if (c && d && !c->dead && !d->dead && c->vk && d->vk && c->b.width == d->b.width && c->b.height == d->b.height && c->b.width >= 640 && !wintex_is(c)) {
-        VTex *vc = c->vk, *vd = d->vk;
-        if (fsr_hdr(vc) && (vd->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && vc->samples == 1 && vd->samples == 1) {      /* a draw of the scene (opaque or transparent) */
-            const Range *u = &R.ubo[0][0];
-            F.depth = d; F.depth_frame = F.frame;
-            if (u->addr && u->size >= 64 * 4) {
-                const float *q = (const float *)P(u->addr);
-                int jit = q[22] != 0.0f;      /* a perspective camera (projection row 3 = 0, 0, -1, 0); a jittered one wins over another in the frame */
-                if (q[28] == 0.0f && q[29] == 0.0f && q[30] < -0.5f && q[31] == 0.0f && (F.cam_frame != F.frame || jit || !F.cam_jit)) { memcpy(F.c3, q, sizeof F.c3); F.cam_frame = F.frame; F.cam_jit = jit; }
-            }
-            return;
-        }
-    }
-    int fx = fs && R.prog[1] ? stage_fx(&R.prog[1]->st[1]) : 0;
-    if ((fx == FX_GRAIN || fx == FX_DOWN) && F.ran != F.frame && F.depth && F.depth_frame == F.frame && F.cam_frame == F.frame && !F.depth->dead)
-        for (int i = 0; i < fs->nsmp; i++) {
-            unsigned un = fs->smp[i].unit;
-            Tex *t = NULL; View view; SamplerParams sp;
-            if (un >= 32 || !(nvn_front_handle(R.tpool, R.spool, R.nvn_tex[1][un], &t, &view, &sp) & 1) || !t || t->dead || !t->vk) continue;
-            if (t != c && t->b.width == F.depth->b.width && t->b.height == F.depth->b.height && fsr_hdr(t->vk) && ((VTex *)t->vk)->samples == 1) { fsr_run(t, F.depth, fx); break; }
-        }
-    /* upscaling: the target of a tonemap that reads FSR's scene colour goes to the picture's scale (before this draw's pass) */
-    if (fx == FX_GRAIN && c && !c->dead && c->vk && !((VTex *)c->vk)->post && F.col && (F.uw != F.w || F.uh != F.h) && fsr_reads(fs, F.col)) rs_promote(c);
 }
 /* nvn_vk_draw.c, at shutdown (the GPU is idle; the images went with the others) */
 static void fsr_shutdown(void) {
     fsr_release_setup();
     memset(&F, 0, sizeof F);
+    U = (UpscaleScene)UPSCALE_SCENE_INITIALIZER;
 }
+static void fsr_evidence_prepare(void) { F.evidence_pending = 0; }
+static void fsr_evidence_sample(int stage, Tex *tex, VkImageView view) {
+    if (stage != 1 || !F.evidence.dispatched || tex != U.col || !R.prog[1] || stage_fx(&R.prog[1]->st[1]) != FX_GRAIN) return;
+    if ((F.uw != F.w || F.uh != F.h) && (!F.img[FI_OUT].vt || view != F.img[FI_OUT].all)) return;
+    F.evidence.output_bound = F.evidence_pending = 1;
+}
+static void fsr_evidence_draw(void) { if (F.evidence_pending) F.evidence.draw_recorded = 1; }
 /* nvn_vk_draw.c vk_present2: a frame ends */
 static void fsr_present(void) {
-    if (F.ran != F.frame) game_fsr_w = game_fsr_h = 0;      /* a frame without FSR: the game stops jittering (a later run starts it again, with a reset) */
+    rs_scale();
+    int requested = gfx_options()->upscaler;
+    F.evidence.selected = g_rs_mode >= 1 && g_rs_mode <= 5;
+    if (F.evidence.selected && !F.evidence_support) {
+        const char *why = fsr_unable();
+        F.evidence_support = why ? -1 : 1;
+        if (why) snprintf(F.evidence_why, sizeof F.evidence_why, "%s", why);
+    }
+    F.evidence.supported = F.evidence.selected && F.evidence_support > 0;
+    F.evidence.initialized = F.ok == 1;
+    F.evidence.camera_conflict = U.camera_conflict && U.scene_frame == U.frame;
+    const char *result = fsr_evidence_result(&F.evidence);
+    if (F.evidence_logged < 32 && (requested != F.evidence_last_requested || g_rs_mode != F.evidence_last_mode || !F.evidence_have_last || memcmp(&F.evidence_last, &F.evidence, sizeof F.evidence_last))) {
+        printf("nvn_vk_fsr: evidence frame=%lld requested=%d latched=%d effective=%d supported=%d initialized=%d eligible=%d camera_conflict=%d dispatched=%d bound=%d consumer_recorded=%d fallback=%d result=%s reason=%s (recorded commands, not GPU completion)\n", (long long)U.frame, requested, g_rs_mode, F.evidence.initialized && F.evidence.selected ? g_rs_mode : 0, F.evidence.supported, F.evidence.initialized, F.evidence.eligible, U.camera_conflict && U.scene_frame == U.frame, F.evidence.dispatched, F.evidence.output_bound, F.evidence.draw_recorded, F.evidence.fallback, result, F.evidence_support < 0 ? F.evidence_why : "none");
+        F.evidence_last = F.evidence; F.evidence_have_last = 1; F.evidence_last_mode = g_rs_mode; F.evidence_last_requested = requested; F.evidence_logged++;
+    }
+    if (U.ran != U.frame) game_fsr_w = game_fsr_h = 0;      /* a frame without FSR: the game stops jittering (a later run starts it again, with a reset) */
     if (!fsr_want() && F.img[FI_OUT].vt) {                  /* turned off: its images go (the frames in flight keep them alive, vt_garbage) */
         for (int i = 0; i < FI_N; i++) if (F.img[i].vt) vt_garbage(F.img[i].vt);
         memset(F.img, 0, sizeof F.img); F.w = F.h = 0;
     }
-    F.frame++;
+    U.frame++;
+    memset(&F.evidence, 0, sizeof F.evidence);
 }

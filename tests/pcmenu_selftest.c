@@ -123,11 +123,22 @@ int main(int argc, char **argv) {
     assert(gfx_ini_get("film_grain", buf, sizeof buf) && !strcmp(buf, "off"));
     change(9, -1, 0); assert(!gfx_options()->no_film_grain);
     assert(!gfx_options()->upscaler && g_cur[10] == 0);      /* issue 118: not in the file: off */
+    setenv("WT_UPSCALER", "fsr3_quality", 1);
+    assert(gfx_option_set("upscaler", "sgsr2_performance") && gfx_options()->upscaler == 2);
+    assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_performance"));
+    unsetenv("WT_UPSCALER");
+    assert(gfx_option_set("upscaler", "off") && !gfx_options()->upscaler);
+    setenv("WT_SGSR_VARIANT", "bad", 1); assert(gfx_sgsr_variant() == -1);
+    setenv("WT_SGSR_VARIANT", "2-pass-cs", 1); assert(gfx_sgsr_variant() == 1);
+    unsetenv("WT_SGSR_VARIANT"); assert(gfx_sgsr_variant() == 0);
     pcmenu_take_work(); change(10, 1, 0); assert(gfx_options()->upscaler == 1 && row_restart(10) && !(g_work & 4));      /* applies when the panel closes */
     assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "fsr3"));
     change(10, 1, 0); change(10, 1, 0); change(10, 1, 0); change(10, 1, 0); assert(gfx_options()->upscaler == 5 && !strcmp(val_name(10), "Ultra Performance"));
     assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "fsr3_ultra_performance"));
-    for (int k = 0; k < 5; k++) change(10, -1, 0);
+    change(10, 1, 0); assert(gfx_options()->upscaler == 6 && !strcmp(val_name(10), "SGSR Native AA"));
+    change(10, 1, 0); assert(gfx_options()->upscaler == 7 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_quality"));
+    change(10, 1, 0); assert(gfx_options()->upscaler == 8 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_performance"));
+    for (int k = 0; k < 8; k++) change(10, -1, 0);
     assert(!gfx_options()->upscaler);
     change(2, 1, 0); assert(gfx_options()->present == 4 && g_vsync_applied == 1 && (g_work & 2));      /* auto -> display */
     change(3, 1, 0); assert(game_cutscene_fps == 60);
