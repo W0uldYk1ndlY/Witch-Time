@@ -210,3 +210,5 @@ This section does not certify preceding diagnostics results or a phone installat
 ### 2026-11-12 — SGSR headless follow-up
 
 `python tests/sgsr_gpu_test.py <NDK glslc.exe> <spirv-dis.exe>` passed nineteen RTX 5070 Ti cases after adding three patterned-input cases with per-pixel CPU reconstruction references and four raw-HDR history/intensity transitions. Patterned tests cover native 17×13, odd 17×13→25×19 and 1×1. Transitions cover current/history 1000/4, 4/1000, 60000/0 and 0/60000 with reset disabled. This remains a separate host harness without Khronos validation, moving geometry, game exposure metadata or production renderer lifetime qualification; tasks 4.3 and 4.4 remain open. No device package was installed and no performance result is claimed.
+
+After an independent test review, the final ping-pong destination is poisoned with NaN after its previous history read and preserved with attachment LOAD. Both missing-final-draw negative controls (seeded history and black/reset) now fail readback as expected; all nineteen normal cases pass. This prevents preinitialized history from masquerading as a completed final draw.
