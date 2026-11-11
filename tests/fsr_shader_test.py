@@ -38,16 +38,26 @@ def descriptor_types(assembly):
     images = {i: ("S" if sampled == "1" else "U") for i, sampled in
               re.findall(r'(%\S+)\s*=\s*OpTypeImage\s+%\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([12])\s+\S+', assembly)}
     samplers = set(re.findall(r'(%\S+)\s*=\s*OpTypeSampler\b', assembly))
+    combined = set(re.findall(r'(%\S+)\s*=\s*OpTypeSampledImage\b', assembly))
     result = {}
     for var, binding in decorations:
         assert sets.get(var) == 0, f"binding {binding} is not in descriptor set 0"
+        assert int(binding) not in result, f"duplicate descriptor binding {binding} in set 0"
         storage, target = pointers[variables[var]]
-        result[int(binding)] = "C" if storage == "Uniform" else "sampler" if target in samplers else images.get(target)
+        result[int(binding)] = "C" if storage == "Uniform" else "sampler" if target in samplers else "combined" if target in combined else images.get(target)
     return result
 
 
 def main(glslc, dis):
     host = HOST.read_text(encoding="utf-8")
+    image_names = re.search(r'enum \{ (FI_ACC1,.*?)\s*\};', host, re.S).group(1)
+    names = [item.strip() for item in image_names.split(",") if item.strip() != "FI_N"]
+    image_table = host.split("k_fi[FI_N] =", 1)[1].split("\n};", 1)[0]
+    formats = re.findall(r'\{(VK_FORMAT_\w+),\s*\d+\}', image_table)
+    assert len(names) == len(formats), "FSR image table and enum differ"
+    image_formats = dict(zip(names, formats))
+    for history in ("FI_UP1", "FI_UP2", "FI_LH1", "FI_LH2"):
+        assert image_formats[history] == "VK_FORMAT_R16G16B16A16_SFLOAT", f"{history}: unexpected history format"
     const_decl = host.split("/* AMD's Fsr3UpscalerConstants", 1)[1].split("typedef struct {", 1)[1].split("} FsrConst;", 1)[0]
     fields = []
     for declaration in const_decl.split(";"):
@@ -71,6 +81,7 @@ def main(glslc, dis):
     passes = re.findall(r'\{"([^\"]+\.glsl)",\s*(\d+),\s*\{(.*?)\}\}', passes_block, re.S)
     assert len(passes) == 7, "expected seven vendored FSR passes"
     linear_inputs = set()
+    linear_formats = set()
     with tempfile.TemporaryDirectory(prefix="fsr-reflect-") as temp:
         temp = Path(temp)
         for name, count, host_bindings in passes:
@@ -83,9 +94,15 @@ def main(glslc, dis):
             assembly = subprocess.run([dis, str(spv)], check=True, capture_output=True, text=True).stdout
             capabilities = set(re.findall(r'OpCapability\s+(\w+)', assembly))
             loads = dict(re.findall(r'(%\S+)\s*=\s*OpLoad\s+%\S+\s+(%\S+)', assembly))
+            shader_bindings = {var: int(binding) for var, binding in re.findall(r'OpDecorate\s+(%\S+)\s+Binding\s+(\d+)', assembly)}
+            host_resources = {int(binding): resource for binding, resource in re.findall(r'S_\(\s*(\d+)\s*,\s*(\w+)\s*\)', host_bindings)}
+            aliases = {"R_ACC_S": "FI_ACC1", "R_LH_S": "FI_LH1", "R_LUMA_C": "FI_LUMA1"}
             for image, sampler in re.findall(r'%\S+\s*=\s*OpSampledImage\s+%\S+\s+(%\S+)\s+(%\S+)', assembly):
                 if loads.get(sampler) == "%s_LinearClamp":
-                    linear_inputs.add(loads.get(image, image))
+                    resource = loads.get(image, image)
+                    linear_inputs.add(resource)
+                    host_resource = host_resources[shader_bindings[resource]]
+                    linear_formats.add(image_formats[aliases.get(host_resource, host_resource)])
             assert "StorageImageReadWithoutFormat" not in capabilities, f"{name}: unexpected formatless read"
             if "pyramid_pass" in name:
                 assert {"GroupNonUniform", "GroupNonUniformQuad"} <= capabilities, f"{name}: missing subgroup capability"
@@ -124,6 +141,9 @@ def main(glslc, dis):
                        "%r_luma_history", "%r_current_luma", "%r_transparency_and_composition_mask",
                        "%r_accumulation", "%r_shading_change", "%r_spd_mips"}
     assert linear_inputs == expected_linear, f"linear-filtered inputs changed: {linear_inputs ^ expected_linear}"
+    filter_block = host.split("const VkFormat filtered[] =", 1)[1].split(";", 1)[0]
+    checked_formats = set(re.findall(r'VK_FORMAT_\w+', filter_block))
+    assert linear_formats == checked_formats, f"linear format checks differ from shader inputs: {linear_formats ^ checked_formats}"
     print("FSR shaderc reflection passed (runtime glslang and GPU not checked)")
 
 

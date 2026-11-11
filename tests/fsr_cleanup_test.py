@@ -10,7 +10,7 @@ source = (ROOT / "runtime" / "nvn_vk_fsr.c").read_text(encoding="utf-8")
 match = re.search(r'static void fsr_release_setup\(void\) \{.*?\n\}', source, re.S)
 assert match, "production cleanup function not found"
 setup = source.split("static int fsr_setup(void)", 1)[1].split("static void fsr_resize", 1)[0]
-assert setup.count("fsr_release_setup(); fsr_off(") == 2, "compile and pipeline failures must clean up"
+assert setup.count("fsr_release_setup(); fsr_off(") == 5, "setup failure paths must clean up"
 
 harness = r'''
 #include <assert.h>

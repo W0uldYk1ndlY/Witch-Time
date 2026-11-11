@@ -35,9 +35,10 @@ typedef struct {
     int hud_centre;         /* [witchtime] hud_area = screen (0: wider than 16:9 the HUD's corners go to the screen's edges) | 16:9 (1: kept in the middle);
                              * handed on as RECOMPS_HUD_CENTRE=1 (game_shim_eh.c h_ui_element) */
     int upscaler;           /* [witchtime] issue 118: upscaler = off (0) | fsr3 (1: FSR 3.1 as anti-aliasing, nvn_vk_fsr.c) | fsr3_quality (2) | fsr3_balanced (3)
-                               | fsr3_performance (4) | fsr3_ultra_performance (5): FSR 3.1 upscaling to the internal resolution; env WT_UPSCALER wins */
+                               | fsr3_performance (4) | fsr3_ultra_performance (5) | sgsr2 (6) | sgsr2_quality (7) | sgsr2_performance (8); WT_UPSCALER wins */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
+int gfx_sgsr_variant(void);               /* WT_SGSR_VARIANT: 0 FS, 1 two-pass CS, 2 three-pass CS, -1 invalid */
 int gfx_pace_rate(void);                  /* [Recomps#1] the rate display.c paces the game at: 60, or frame_rate above 60 (WT_PACE_120=0: 60 and the lifted limiter) */
 int gfx_ini_refresh(const char *path);                   /* [witchtime] a new version's comments and keys in the player's file, values kept; 1 = rewritten */
 void gfx_aspect_window(int w, int h);     /* [witchtime] aspect_ratio = auto: the window's client size, before the game starts (display.c) */

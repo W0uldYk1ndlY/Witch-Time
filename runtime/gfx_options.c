@@ -162,6 +162,8 @@ static const char *const k_default_ini =
 "film_grain = on\r\n"
 "\r\n"
 "; upscaler = off | fsr3 | fsr3_quality | fsr3_balanced | fsr3_performance | fsr3_ultra_performance      (Vulkan; experimental)\r\n"
+";   SGSR selections: sgsr2 | sgsr2_quality | sgsr2_performance; WT_SGSR_VARIANT = 2-pass-fs | 2-pass-cs | 3-pass-cs.\r\n"
+";   SGSR is unavailable until its backend is initialized; unsupported or invalid variants use native rendering.\r\n"
 ";   fsr3: AMD FSR 3.1 as anti-aliasing at the internal resolution: jagged edges, shimmer and the screen-door of fading\r\n"
 ";   objects are smoothed over frames.\r\n"
 ";   Characters and effects that move on their own can leave faint trails. About 0.5 to 2 ms of\r\n"
@@ -233,9 +235,16 @@ static void opt_path(char *out) {
     if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
 }
 static int upscaler_of(const char *v) {      /* [witchtime] issue 118: GfxOptions.upscaler; an unknown value is off */
-    static const char *const k[] = {"off", "fsr3", "fsr3_quality", "fsr3_balanced", "fsr3_performance", "fsr3_ultra_performance"};
-    for (int i = 1; i < 6; i++) if (!_stricmp(v, k[i])) return i;
+    static const char *const k[] = {"off", "fsr3", "fsr3_quality", "fsr3_balanced", "fsr3_performance", "fsr3_ultra_performance", "sgsr2", "sgsr2_quality", "sgsr2_performance"};
+    for (int i = 1; i < 9; i++) if (!_stricmp(v, k[i])) return i;
     return 0;
+}
+int gfx_sgsr_variant(void) {
+    const char *v = getenv("WT_SGSR_VARIANT");
+    if (!v || !_stricmp(v, "2-pass-fs")) return 0;
+    if (!_stricmp(v, "2-pass-cs")) return 1;
+    if (!_stricmp(v, "3-pass-cs")) return 2;
+    return -1;
 }
 static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     (void)once; (void)ctx;
