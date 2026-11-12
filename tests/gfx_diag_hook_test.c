@@ -18,7 +18,7 @@ static void test_deferred_flush(void) {
 
     /* Drain and verify QUEUED event is present */
     diag_record_t recs[8];
-    size_t n = diag_drain_producer(0, recs, 8); /* gfx producer is slot 0 */
+    size_t n = diag_drain_producer(0, recs, 8); /* First calling thread claims slot 0. */
     assert(n == 1);
     assert(recs[0].type == DIAG_EV_PRESENT_QUEUED);
     assert(recs[0].payload[0] == 1);     /* frame */
@@ -152,6 +152,76 @@ static void test_render_end(void) {
     printf("      Render-end draw/clear metrics published (passed)\n");
 }
 
+static void test_temporal_observations(void) {
+    diag_hook_temporal(NULL);
+    assert(diag_init("run_gfx_temporal") == 0);
+    diag_temporal_observation_t o = {
+        .scene_frame = 17, .selected_mode = 7, .effective_mode = 0, .variant = 1,
+        .scene_width = 853, .scene_height = 479, .output_width = 1280, .output_height = 720,
+        .surface_generation = 3, .flags = DIAG_TEMPORAL_SKIPPED,
+        .motion_support = 1, .reset_reason = 2, .fallback_reason = 4,
+        .failing_pass = 1, .error_code = -3,
+    };
+    diag_hook_temporal(&o);
+    diag_record_t recs[8];
+    assert(diag_drain_producer(0, recs, 8) == 4);
+    for (int i = 0; i < 4; i++) {
+        assert(recs[i].type == DIAG_EV_TEMPORAL_SELECTION + (uint32_t)i);
+        assert(recs[i].payload[0] == 17);
+    }
+    assert(recs[0].payload[1] == 7 && recs[0].payload[2] == 0 && recs[0].payload[3] == 1);
+    assert((uint64_t)recs[1].payload[1] == ((uint64_t)853 << 32 | 479));
+    assert((uint64_t)recs[1].payload[2] == ((uint64_t)1280 << 32 | 720));
+    assert(recs[1].payload[3] == 3);
+    assert(recs[2].payload[1] == DIAG_TEMPORAL_SKIPPED && recs[2].payload[3] == 2);
+    assert(recs[3].payload[1] == 4 && recs[3].payload[2] == 1 && recs[3].payload[3] == -3);
+    o.effective_mode = 7;
+    o.flags = DIAG_TEMPORAL_SUPPORTED | DIAG_TEMPORAL_INITIALIZED | DIAG_TEMPORAL_DISPATCHED | DIAG_TEMPORAL_CONSUMED;
+    o.fallback_reason = 0;
+    diag_hook_temporal(&o);
+    assert(diag_drain_producer(0, recs, 8) == 4);
+    assert(recs[2].payload[1] == 15 && recs[3].payload[1] == 0);
+    diag_shutdown();
+    diag_hook_temporal(&o);
+    assert(diag_drain_producer(0, recs, 8) == 0);
+}
+
+static void test_temporal_decisions_and_components(void) {
+    diag_temporal_observation_t o = {0};
+    diag_temporal_decide(&o, 2, 0, 0, 0);
+    assert(o.fallback_reason == DIAG_TEMPORAL_NO_SCENE && !o.effective_mode);
+    o = (diag_temporal_observation_t){0};
+    diag_temporal_decide(&o, 2, 1, 0, 0);
+    assert(o.fallback_reason == DIAG_TEMPORAL_UNSUPPORTED);
+    o = (diag_temporal_observation_t){.flags = DIAG_TEMPORAL_SUPPORTED};
+    diag_temporal_decide(&o, 2, 1, 0, 0);
+    assert(o.fallback_reason == DIAG_TEMPORAL_SETUP_FAILED);
+    o = (diag_temporal_observation_t){.flags = DIAG_TEMPORAL_SUPPORTED | DIAG_TEMPORAL_INITIALIZED | DIAG_TEMPORAL_DISPATCHED};
+    diag_temporal_decide(&o, 2, 1, 1, 0);
+    assert(o.fallback_reason == DIAG_TEMPORAL_NO_CONSUMER && !(o.flags & DIAG_TEMPORAL_CONSUMED));
+    o.fallback_reason = 0;
+    diag_temporal_decide(&o, 2, 1, 1, 1);
+    assert(o.effective_mode == 2 && (o.flags & DIAG_TEMPORAL_CONSUMED) && !(o.flags & DIAG_TEMPORAL_SKIPPED));
+    o = (diag_temporal_observation_t){.flags = DIAG_TEMPORAL_SUPPORTED | DIAG_TEMPORAL_INITIALIZED | DIAG_TEMPORAL_DISPATCHED};
+    diag_temporal_decide(&o, 7, 1, 0, 0); /* SGSR scene copy is not output-consumer evidence. */
+    assert(o.fallback_reason == DIAG_TEMPORAL_NO_CONSUMER && !o.effective_mode);
+
+    assert(diag_init("run_components") == 0);
+    diag_record_t records[8];
+    for (uint32_t state = 0; state < 8; state++) diag_stream_gpu_component(42, 3, 99, 0, state);
+    assert(diag_drain_producer(0, records, 8) == 8);
+    for (uint32_t state = 0; state < 8; state++) {
+        assert(records[state].type == DIAG_EV_GPU_COMPONENT && records[state].payload[0] == 42);
+        assert((uint64_t)records[state].payload[1] == ((uint64_t)3 << 32 | state));
+        assert(records[state].payload[2] == 99);
+        assert(records[state].payload[3] == (state == 0 || state == 4 ? 0 : -1));
+    }
+    diag_stream_gpu_component(43, 2, 100, -1, 0);
+    assert(diag_drain_producer(0, records, 8) == 1);
+    assert((uint32_t)records[0].payload[1] == 3 && records[0].payload[3] == -1);
+    diag_shutdown();
+}
+
 int main(void) {
     printf("=== Witch-Time GFX Diagnostics Instrumentation Test ===\n");
     test_deferred_flush();
@@ -159,6 +229,8 @@ int main(void) {
     test_progress_held_image_repetition();
     test_no_first_frame_startup();
     test_render_end();
-    printf("=== All 5 GFX Diagnostics Tests Passed ===\n");
+    test_temporal_observations();
+    test_temporal_decisions_and_components();
+    printf("=== All 7 GFX Diagnostics Tests Passed ===\n");
     return 0;
 }

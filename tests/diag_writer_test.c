@@ -302,6 +302,110 @@ static void test_truncated_last_chunk_recovery(void) {
     printf("      Truncated last chunk handling (passed)\n");
 }
 
+static void test_outcome_does_not_infer_coverage(void) {
+    const char *test_dir = "tests/disp_writer_outcome";
+    clean_dir(test_dir);
+    diag_init("run_outcome");
+    diag_writer_config_t cfg = {0};
+    strncpy(cfg.output_dir, test_dir, sizeof(cfg.output_dir) - 1);
+    strncpy(cfg.run_id, "run_outcome", sizeof(cfg.run_id) - 1);
+    assert(diag_writer_init(&cfg) == 0);
+
+    const char *reasons[] = {"CLEAN_COMPLETION", "REPLAY_FINISHED", "PROCESS_EXIT"};
+    for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); i++) {
+        assert(diag_writer_write_outcome("completed", reasons[i], NULL) == 0);
+        FILE *f = fopen("tests/disp_writer_outcome/outcome.json", "r");
+        assert(f != NULL);
+        char buf[2048];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        assert(strstr(buf, "\"last_confirmed_checkpoint\": null") != NULL);
+        assert(strstr(buf, "\"covered_segments\": []") != NULL);
+        assert(strstr(buf, "\"checkpoints\": []") != NULL);
+        assert(strstr(buf, "cp_combat_end") == NULL);
+        assert(strstr(buf, reasons[i]) != NULL);
+    }
+
+    /* A future observer can still supply a genuinely confirmed checkpoint. */
+    assert(diag_writer_write_outcome("completed", "CLEAN_COMPLETION", "cp_observed") == 0);
+    FILE *f = fopen("tests/disp_writer_outcome/outcome.json", "r");
+    assert(f != NULL);
+    char buf[2048];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    assert(strstr(buf, "\"last_confirmed_checkpoint\": \"cp_observed\"") != NULL);
+    assert(strstr(buf, "\"covered_segments\": []") != NULL);
+    diag_writer_stop();
+    diag_writer_shutdown();
+    diag_shutdown();
+    clean_dir(test_dir);
+    printf("      Outcome coverage requires observation (passed)\n");
+}
+
+static void test_configured_drain_and_stop(uint32_t limit) {
+    const char *test_dir = "tests/disp_writer_drain";
+    clean_dir(test_dir);
+    diag_init("run_drain");
+    diag_writer_config_t cfg = {0};
+    strncpy(cfg.output_dir, test_dir, sizeof(cfg.output_dir) - 1);
+    strncpy(cfg.run_id, "run_drain", sizeof(cfg.run_id) - 1);
+    cfg.chunk_record_limit = limit;
+    assert(diag_writer_init(&cfg) == 0);
+    int prod = diag_register_producer("prod_drain");
+    assert(prod >= 0);
+    const size_t count = DIAG_RING_CAPACITY - 1;
+    for (size_t i = 0; i < count; i++) {
+        diag_emit(prod, DIAG_EV_CUSTOM, (int64_t)i, 0, 0, 0);
+    }
+    assert(diag_get_total_emitted() == count);
+    assert(diag_get_total_dropped() == 0);
+    assert(diag_writer_flush_chunks() == 0);
+    diag_writer_stats_t stats;
+    diag_writer_get_stats(&stats);
+    size_t batch = limit ? limit : 1000;
+    if (batch > DIAG_RING_CAPACITY) batch = DIAG_RING_CAPACITY;
+    assert(stats.total_records_written == (batch < count ? batch : count));
+    assert(stats.chunks_committed == 1);
+
+    /* One stop must drain the tail even with a small configured chunk size. */
+    diag_writer_stop();
+    diag_writer_get_stats(&stats);
+    assert(stats.total_records_written == count);
+    assert(stats.chunks_committed == (count + batch - 1) / batch);
+    assert(diag_get_total_dropped() == 0);
+    size_t seen = 0;
+    unsigned long long previous_seq = 0;
+    for (uint32_t chunk = 1; chunk <= stats.chunks_committed; chunk++) {
+        char path[320], line[512];
+        snprintf(path, sizeof(path), "%s/events-%06u.jsonl", test_dir, chunk);
+        FILE *f = fopen(path, "r");
+        assert(f != NULL);
+        assert(fgets(line, sizeof(line), f) != NULL);
+        size_t chunk_count = 0;
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long seq;
+            long long payload;
+            assert(sscanf(line, "{\"seq\":%llu", &seq) == 1);
+            const char *p0 = strstr(line, "\"p0\":");
+            assert(p0 != NULL);
+            assert(sscanf(p0, "\"p0\":%lld", &payload) == 1);
+            assert(seq > previous_seq);
+            assert(payload == (long long)seen);
+            previous_seq = seq;
+            seen++;
+            chunk_count++;
+        }
+        assert(chunk_count > 0 && chunk_count <= batch);
+        fclose(f);
+    }
+    assert(seen == count);
+    diag_writer_shutdown();
+    diag_shutdown();
+    clean_dir(test_dir);
+}
+
 int main(void) {
     printf("=== Witch-Time Runtime Diag Writer Unit Test ===\n");
     test_duplicate_run_and_no_overwrite();
@@ -309,6 +413,11 @@ int main(void) {
     test_budget_exhaustion_and_incident_reserve();
     test_bounded_text_sink();
     test_truncated_last_chunk_recovery();
-    printf("=== All 5 Diag Writer Unit Tests Passed ===\n");
+    test_outcome_does_not_infer_coverage();
+    test_configured_drain_and_stop(1000);
+    test_configured_drain_and_stop(7);
+    test_configured_drain_and_stop(DIAG_RING_CAPACITY * 2);
+    test_configured_drain_and_stop(0);
+    printf("=== All 10 Diag Writer Unit Tests Passed ===\n");
     return 0;
 }

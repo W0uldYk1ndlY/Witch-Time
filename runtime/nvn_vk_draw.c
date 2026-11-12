@@ -13,7 +13,9 @@
 #include <math.h>
 #include "tex_decode.h"
 #include "nvn_vk_requirements.h"
+#include "nvn_vk_timestamp.h"
 #include "diag.h"
+#include "temporal_source_capture.h"
 void rpt_begin(void); void rpt_end(void); int rpt_printf(const char *fmt, ...);     /* hostrt.c: [Recomps#1] the reports in one write each */
 static int have_targets_live(void);
 
@@ -509,6 +511,7 @@ static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.
  * gave to other processes while it ran. */
 static int g_ts_on = -1;
 static VkQueryPool g_ts_pool;
+static uint32_t g_ts_bits;
 static double g_ts_ns;
 static LONG64 g_ts_n;
 /* Session 9: the same per FRAME (the frame a buffer was recorded for), with the time between two presents and whether the frame
@@ -535,13 +538,17 @@ int nvn_vk_cutc_live(void) {
  *   and the last submission of the frame were made, when the present job began, and the game's waits for a fence. */
 #define PT_MAX 96
 #define PT_KINDS 64
+enum { PT_GAP = -1, PT_FSR_BASE = 10, PT_SGSR_FS_BASE = 20, PT_CAMERA_VELOCITY = 22,
+       PT_FULL_STORE = 23, PT_COPY_CONVERT = 24, PT_SGSR_CS_BASE = 30 };
 typedef struct { int w, h, ncol, cf, depth, win, what; } PtKind;      /* what: 0 pass, 1 compute dispatches, 2 present blit */
 static int g_pt_on = -1, g_pt_nkind, g_split = -1;
 static VkQueryPool g_pt_pool;
 static PtKind g_pt_kind[PT_KINDS];
 static double g_pt_ns[PT_KINDS];
 static LONG64 g_pt_cnt[PT_KINDS], g_pt_draws[PT_KINDS], g_pt_frames, g_cmd_draws, g_splits;
-static struct { int n, fight, last_what; uint8_t kind[PT_MAX]; LONG64 d0; } g_pt_slot[NSLOT];
+static LONG64 g_pt_internal_draws; /* Internal draws must not advance WT_VK_SPLIT's game-draw threshold. */
+static LONG64 g_pt_state[5], g_pt_capacity;
+static struct { int n, fight, last_what, overflow; uint8_t kind[PT_MAX]; LONG64 d0; uint64_t components; } g_pt_slot[NSLOT];
 /* Round 16, the owner's "something in our shaders": every frame with fighters in which a pipeline (a program pair in a
  * pass signature) is drawn for the FIRST time is counted with what that cost; WT_VK_FIRSTLOG=1 prints a line per such
  * frame ("nvn_vk_first:"); the sums are printed at exit in any case. linked = made at this draw by a link of ready stage
@@ -551,6 +558,33 @@ static LONG64 g_fu_frames, g_fu_total, g_fu_linked, g_fu_made, g_fu_newsig, g_fu
 #define VK_SPLIT_DEFAULT 0
 static LONG64 g_tl_t0, g_tl_first, g_tl_last, g_tl_sum[8], g_tl_n;      /* sums: 0 first submission, 1 last submission, 2 present job, 3 fence waits (count), 4 fence wait ticks, 5 end of a fence wait after the batch start */
 void nvn_front_done_moved(void);                   /* nvn_gl.c (finding 138): R.done moved, a game thread may wait for it */
+/* One aggregate per stable what and submission, independent of console battle filtering. NULL queries publish pending. */
+static void pt_components(int si, int64_t frame, int64_t serial, const VkTimestampResult *pt,
+                          const VkTimestampResult *ts, int pr, int qr) {
+    for (int what = 0; what < 64; what++) {
+        if (!(g_pt_slot[si].components & (UINT64_C(1) << what))) continue;
+        int state = pt ? 7 : 1, found = 0;
+        double ns = 0;
+        if (pt && g_pt_slot[si].overflow) state = 5;
+        else if (pt) for (int i = 0; i < g_pt_slot[si].n; i++) {
+            if (g_pt_kind[g_pt_slot[si].kind[i]].what != what) continue;
+            VkTimestampResult end = i + 1 < g_pt_slot[si].n ? pt[i + 1] : ts[1];
+            int result = pr;
+            if (i + 1 == g_pt_slot[si].n) {
+                if (qr != 0 && qr != 1) result = qr;
+                else if (pr == 0) result = qr;
+            }
+            uint64_t ticks;
+            int next = nvn_vk_timestamp_delta(pt[i], end, g_ts_bits, result, &ticks);
+            if (!found++) state = next;
+            else if (next == 3 || (next == 2 && state != 3) || (next == 1 && state != 2 && state != 3)) state = next;
+            else if (next == 4 && state == 0) state = 4;
+            if (next == 0 || next == 4) ns += (double)ticks * (double)V.props.limits.timestampPeriod;
+        }
+        if ((state == 0 || state == 4) && (!isfinite(ns) || ns < 0 || ns >= 9223372036854775808.0)) state = 3;
+        diag_stream_gpu_component(frame, (uint32_t)what, serial, state == 0 || state == 4 ? (int64_t)ns : -1, (uint32_t)state);
+    }
+}
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
     for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial < s->serial) slot_wait(&R.slot[i]);   /* [Recomps#1] in submission order (oq_land) */
@@ -560,26 +594,36 @@ static void slot_wait(Slot *s) {
     if (r != VK_SUCCESS) { if (r == VK_ERROR_DEVICE_LOST) fault_dump(); ckpt_dump(); vkd_fail("a submitted command buffer did not finish within 20 s (%s): the GPU is stuck or the device is lost", vk_result_name(r)); }
     VKC(vkResetFences(V.device, 1, &s->fence));
     if (g_ts_on > 0) {                             /* WT_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
-        uint64_t ts[2] = {0, 0};
-        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
-            double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod;
+        VkTimestampResult ts[2] = {{0}};
+        VkResult qr = vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        uint64_t ticks;
+        int state = nvn_vk_timestamp_delta(ts[0], ts[1], g_ts_bits, qr, &ticks);
+        if (state == 0 || state == 4) {
+            double ns = (double)ticks * (double)V.props.limits.timestampPeriod;
             g_ts_ns += ns;
             g_ts_n++;
             if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6);
-            diag_stream_gpu_sample((int64_t)s->ts_frame, (int64_t)ns, (int64_t)(s - R.slot), 0 /* COMPLETED */);
+            diag_stream_gpu_sample((int64_t)s->ts_frame, (int64_t)ns, (int64_t)(s - R.slot), state);
         } else {
-            diag_stream_gpu_sample((int64_t)s->ts_frame, -1, (int64_t)(s - R.slot), 3 /* QUERY_FAILED */);
+            diag_stream_gpu_sample((int64_t)s->ts_frame, -1, (int64_t)(s - R.slot), state);
         }
         int si = (int)(s - R.slot);
-        if (g_pt_on > 0 && g_pt_slot[si].n) {      /* WT_VK_PASSTIME: the segments of this command buffer */
-            static uint64_t pt[PT_MAX];
+        if (g_pt_on > 0 && g_pt_slot[si].components) {      /* WT_VK_PASSTIME: the segments of this command buffer */
+            VkTimestampResult pt[PT_MAX] = {{0}};
             int n = g_pt_slot[si].n;
-            if (ts[1] && vkGetQueryPoolResults(V.device, g_pt_pool, (uint32_t)si * PT_MAX, (uint32_t)n, sizeof pt[0] * (size_t)n, pt, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && g_pt_slot[si].fight)
+            VkResult pr = n ? vkGetQueryPoolResults(V.device, g_pt_pool, (uint32_t)si * PT_MAX, (uint32_t)n, sizeof pt[0] * (size_t)n, pt, sizeof pt[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_SUCCESS;
+            pt_components(si, (int64_t)s->ts_frame, (int64_t)s->serial, pt, ts, pr, qr);
+            if (g_pt_slot[si].fight && !g_pt_slot[si].overflow)
                 for (int i = 0; i < n; i++) {
-                    uint64_t end = i + 1 < n ? pt[i + 1] : ts[1];
-                    if (end >= pt[i]) { g_pt_ns[g_pt_slot[si].kind[i]] += (double)(end - pt[i]) * (double)V.props.limits.timestampPeriod; g_pt_cnt[g_pt_slot[si].kind[i]]++; }
+                    VkTimestampResult end = i + 1 < n ? pt[i + 1] : ts[1];
+                    int result = i + 1 < n || qr == VK_SUCCESS ? pr : qr;
+                    int ps = nvn_vk_timestamp_delta(pt[i], end, g_ts_bits, result, &ticks);
+                    if (g_pt_kind[g_pt_slot[si].kind[i]].what == PT_GAP) continue;
+                    g_pt_state[ps]++;
+                    if (ps == 0 || ps == 4) { g_pt_ns[g_pt_slot[si].kind[i]] += (double)ticks * (double)V.props.limits.timestampPeriod; g_pt_cnt[g_pt_slot[si].kind[i]]++; }
                 }
             g_pt_slot[si].n = 0;
+            g_pt_slot[si].components = 0;
         }
     }
     oq_land((int)(s - R.slot));                    /* [Recomps#1] counter reports of this command buffer */
@@ -629,6 +673,12 @@ static void cmd_begin(void) {
     oq_slot_reset(R.cur);                                 /* [Recomps#1] occlusion queries of this slot */
     if (g_ts_on < 0) {
         g_ts_on = getenv("WT_VK_GPUTIME") && atoi(getenv("WT_VK_GPUTIME")) && V.props.limits.timestampComputeAndGraphics;
+        if (g_ts_on) {
+            VkQueueFamilyProperties q[32]; uint32_t nq = 32;
+            vkGetPhysicalDeviceQueueFamilyProperties(V.gpu, &nq, q);
+            g_ts_bits = V.family < nq && V.family < 32 ? q[V.family].timestampValidBits : 0;
+            g_ts_on = g_ts_bits > 0 && g_ts_bits <= 64 && isfinite(V.props.limits.timestampPeriod) && V.props.limits.timestampPeriod > 0;
+        }
         if (g_ts_on) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NSLOT * 2; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_ts_pool)); }
     }
     s->ts_frame = g_cur_frame;
@@ -637,23 +687,29 @@ static void cmd_begin(void) {
         g_pt_on = g_ts_on > 0 && getenv("WT_VK_PASSTIME") && atoi(getenv("WT_VK_PASSTIME"));
         if (g_pt_on) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NSLOT * PT_MAX; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_pt_pool)); }
     }
-    if (g_pt_on > 0) { vkCmdResetQueryPool(s->cmd, g_pt_pool, (uint32_t)R.cur * PT_MAX, PT_MAX); g_pt_slot[R.cur].n = 0; g_pt_slot[R.cur].last_what = -1; }
+    if (g_pt_on > 0) { vkCmdResetQueryPool(s->cmd, g_pt_pool, (uint32_t)R.cur * PT_MAX, PT_MAX); g_pt_slot[R.cur].n = 0; g_pt_slot[R.cur].components = 0; g_pt_slot[R.cur].overflow = 0; g_pt_slot[R.cur].last_what = -1; }
     g_cmd_draws = 0;
+    g_pt_internal_draws = 0;
     garbage_collect();
 }
 static volatile LONG g_in_fight;
 /* WT_VK_PASSTIME: a mark in the command buffer being recorded (see the comment at PT_MAX). */
 static void pt_mark(int w, int h, int ncol, int cf, int depth, int win, int what) {
     if (g_pt_on <= 0 || !R.recording) return;
+    if (what >= 0 && what < 64) g_pt_slot[R.cur].components |= UINT64_C(1) << what;
+    if (g_pt_slot[R.cur].overflow) return;
     int si = R.cur, k;
-    if (g_pt_slot[si].n) g_pt_draws[g_pt_slot[si].kind[g_pt_slot[si].n - 1]] += g_cmd_draws - g_pt_slot[si].d0;
-    g_pt_slot[si].d0 = g_cmd_draws;
-    if (g_pt_slot[si].n == PT_MAX) return;
+    if (g_pt_slot[si].n) g_pt_draws[g_pt_slot[si].kind[g_pt_slot[si].n - 1]] += g_cmd_draws + g_pt_internal_draws - g_pt_slot[si].d0;
+    g_pt_slot[si].d0 = g_cmd_draws + g_pt_internal_draws;
+    if (g_pt_slot[si].n == PT_MAX) { g_pt_slot[si].overflow = 1; g_pt_capacity++; return; }
     for (k = 0; k < g_pt_nkind; k++) { PtKind *q = &g_pt_kind[k]; if (q->w == w && q->h == h && q->ncol == ncol && q->cf == cf && q->depth == depth && q->win == win && q->what == what) break; }
-    if (k == g_pt_nkind) { if (k == PT_KINDS) k = PT_KINDS - 1; else { PtKind q = {w, h, ncol, cf, depth, win, what}; g_pt_kind[k] = q; g_pt_nkind++; } }
+    if (k == g_pt_nkind) { if (k == PT_KINDS) { g_pt_slot[si].overflow = 1; g_pt_capacity++; return; } else { PtKind q = {w, h, ncol, cf, depth, win, what}; g_pt_kind[k] = q; g_pt_nkind++; } }
     vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pt_pool, (uint32_t)(si * PT_MAX + g_pt_slot[si].n));
     g_pt_slot[si].kind[g_pt_slot[si].n++] = (uint8_t)k; g_pt_slot[si].fight = g_in_fight; g_pt_slot[si].last_what = what;
 }
+/* Included upscalers call begin immediately before work and end immediately after it; neither submits nor waits. */
+static void pt_begin(int what, int w, int h) { pt_mark(w, h, 0, 0, 0, 0, what); }
+static void pt_end(void) { pt_mark(0, 0, 0, 0, 0, 0, PT_GAP); }
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
@@ -667,7 +723,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
         R.host_consumable_writes = 0;
     }
     if (g_ts_on > 0) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
-    if (g_pt_on > 0 && g_pt_slot[R.cur].n) g_pt_draws[g_pt_slot[R.cur].kind[g_pt_slot[R.cur].n - 1]] += g_cmd_draws - g_pt_slot[R.cur].d0;
+    if (g_pt_on > 0 && g_pt_slot[R.cur].n) g_pt_draws[g_pt_slot[R.cur].kind[g_pt_slot[R.cur].n - 1]] += g_cmd_draws + g_pt_internal_draws - g_pt_slot[R.cur].d0;
     if (g_tl_t0) { LONG64 now = tk(); if (!g_tl_first) g_tl_first = now; g_tl_last = now; }
     VKC(vkEndCommandBuffer(s->cmd));
     VkCommandBuffer cbs[2];
@@ -689,6 +745,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
     diag_hook_gpu_submit((int64_t)(s - R.slot), (int64_t)(R.serial + 1), (int64_t)R.flushes, (int64_t)ncb);
     s->pending = 1; s->serial = ++R.serial;
+    if (g_pt_on > 0) pt_components((int)(s - R.slot), (int64_t)s->ts_frame, (int64_t)s->serial, NULL, NULL, 0, 0);
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
 }
@@ -873,7 +930,8 @@ static float rs_scale(void) {
         g_rs_mode = gfx_options()->upscaler;
         if (g_rs_mode >= 6 && g_rs_mode <= 8) {
             int variant = gfx_sgsr_variant();
-            if (variant != 0) printf("nvn_vk_upscale: SGSR mode %d variant %d unavailable (%s); using native rendering\n", g_rs_mode, variant, variant < 0 ? "invalid WT_SGSR_VARIANT" : "compute backend not integrated");
+            if (variant == 1) printf("nvn_vk_upscale: SGSR 2-pass-cs selected; experimental, HDR quality unqualified; native scene scale until reduced-store qualification\n");
+            else if (variant != 0) printf("nvn_vk_upscale: SGSR mode %d variant %d unavailable (%s); using native rendering\n", g_rs_mode, variant, variant < 0 ? "invalid WT_SGSR_VARIANT" : "3-pass compute backend not integrated");
             else printf("nvn_vk_upscale: SGSR 2-pass-fs selected; experimental HDR, native scene scale until reduced-store qualification\n");
         }
         float r = v / fsr_ratio(g_rs_mode);
@@ -1886,7 +1944,16 @@ static UpscaleScene U = UPSCALE_SCENE_INITIALIZER;
 static void upscale_draw(VStage *fs); static void fsr_present(void); static void fsr_shutdown(void);      /* nvn_vk_upscale.c / nvn_vk_fsr.c */
 static void sgsr_shutdown(void);
 static void sgsr_present(void);
+static int sgsr_cs_want(void);
+static void sgsr_cs_shutdown(void);
+static void sgsr_cs_present(void);
+static VkImageView sgsr_cs_up_view(int stage, Tex *t, VTex *vt, const View *view);
 static void fsr_evidence_prepare(void); static void fsr_evidence_sample(int stage, Tex *tex, VkImageView view); static void fsr_evidence_draw(void);
+static void upscale_diag_present(void);
+static void upscale_diag_prepare(void);
+static void upscale_diag_sample(int stage, Tex *tex, VkImageView view);
+static void upscale_diag_draw(void);
+static void upscale_diag_dispatched(int backend);
 static VkImageView fsr_dither_view(int s, unsigned u, Tex *t, VTex *vt, const View *view); static VkImageView fsr_up_view(int s, Tex *t, VTex *vt, const View *view);
 static VkImageView sgsr_up_view(int s, Tex *t, VTex *vt, const View *view);
 static int g_vk_test;                              /* session 13, TEST ONLY: WT_VK_TEST (see the dynamic state) */
@@ -2141,6 +2208,7 @@ static void resolve_sampler(int s, VStage *v, int i) {
         VkImageView dither = fsr_dither_view(s, u, t, vt, &view);      /* [witchtime] issue 118: this frame's phase of the dither while FSR runs (may end the pass) */
         if (!dither) dither = fsr_up_view(s, t, vt, &view);           /* [witchtime] issue 118: FSR's output for a tonemap at the picture's scale (may end the pass) */
         VkImageView sgsr_output = dither ? VK_NULL_HANDLE : sgsr_up_view(s, t, vt, &view);
+        if (!dither && !sgsr_output) sgsr_output = sgsr_cs_up_view(s, t, vt, &view);
         if (g_ptm_on > 0) { LONG64 x = tk(); g_ptr[1] += x - rt0; rt0 = x; }
         if (s == 1) { if (vt->rs || rs_keep_has(t)) g_fs_screen = 1; else if (t->b.width <= 64 && t->b.height <= 64) g_fs_small = 1; }      /* [witchtime] the dither */
         EView e;
@@ -3764,6 +3832,12 @@ static int draw_prepare(unsigned prim) {
 
     PT(0);
     if (!g_dp_potential) upscale_draw(fs);         /* before the first draw that reads the finished scene; not a draw the GPU may cull */
+    if (wt_tsc_requested()) {
+        int scene_eligible = !g_dp_potential && !U.camera_conflict &&
+            upscale_scene_matches(&U, R.ncol ? R.col[0].tex : NULL, R.ncol && R.col[0].tex ? R.col[0].tex->vk : NULL,
+                                  R.depth.tex, R.depth.tex ? R.depth.tex->vk : NULL);
+        wt_tsc_frame((uint64_t)U.frame, scene_eligible);
+    }
     /* 1. textures (may upload, change layouts, end the pass) */
     g_ndtex = 0;
     g_movie_y = 0; g_fs_screen = g_fs_small = 0;
@@ -3773,8 +3847,8 @@ static int draw_prepare(unsigned prim) {
     {   int m = rs_xstretch() != 1.0f && prim == 5 && R.prog[1] && R.have_viewport && R.viewport[3] <= 460.0f && (stage_fnv(&R.prog[0]->st[0]) == 0xad7d2a1fu || R.prog[0]->st[0].code_fnv == 0x044ea2e3u || (R.prog[0]->st[0].code_fnv == 0x9f4eba97u && cb3_flat()));      /* [witchtime] the screen filters (above): strips into the half-size targets (the game's size: R.pass_h grows with the scale) */
         if (m != g_filter_draw) { g_filter_draw = m; R.dyn_dirty = 1; } }
     watch_fs(fs);                                  /* [witchtime] TEST ONLY: WT_VK_WATCHFS */
-    int stores = 0;                                /* [witchtime] storage images, after the samplers in g_dtex */
-    for (int j = 0; j < nsv; j++) { int s = sx[j]; VStage *v = sv[j]; for (int k = 0; k < 8; k++) if (v->images >> k & 1) { if (!resolve_image(s, v, k)) return 0; stores = 1; } }
+    int stores = 0, buffer_writes = 0;              /* [witchtime] storage images, after the samplers in g_dtex */
+    for (int j = 0; j < nsv; j++) { int s = sx[j]; VStage *v = sv[j]; buffer_writes |= v->ssbo_w; for (int k = 0; k < 8; k++) if (v->images >> k & 1) { if (!resolve_image(s, v, k)) return 0; stores = 1; } }
     PT(1);
     /* 2. buffers: every range the draw reads, into the ring (may wrap the ring = submit) */
     static BufRef bufs[160];                       /* [witchtime] up to four stages (tessellation) */
@@ -3849,6 +3923,20 @@ static int draw_prepare(unsigned prim) {
     if (!D.has_vids) { uint32_t n = vlay_number(vbd, vnb, vad, vna); pkey_vlay_set(&k, n); vs->vlay = n; }      /* finding 116 */
     pkey_targets(&k);
     Pipe *p = tess ? tess_pipe_get(&k, vs, tcs, tes, fs, R.patch) : pipe_get(&k, vs, fs);
+    if (wt_tsc_enabled()) {
+        /* Selection evidence only: no guest-command/submission provenance is attached here. */
+        Stage *vsrc = &R.prog[0]->st[0], *fsrc = R.prog[1] ? &R.prog[1]->st[1] : NULL;
+        uint64_t identity[16] = {
+            R.prog[0]->guest, (uint64_t)R.prog[0]->serial,
+            R.prog[1] ? R.prog[1]->guest : 0, R.prog[1] ? (uint64_t)R.prog[1]->serial : 0,
+            wt_tsc_code_hash(0, vsrc->code, vsrc->code_len > 0 ? (size_t)vsrc->code_len : 0),
+            fsrc ? wt_tsc_code_hash(1, fsrc->code, fsrc->code_len > 0 ? (size_t)fsrc->code_len : 0) : 0,
+            vs->hb, fs ? fs->hb : 0, vs->h, fs ? fs->h : 0,
+            (uint64_t)tess, p && p->p ? 1u : 0u, (uint64_t)nvn_front_frame_next(),
+            tcs ? tcs->h : 0, tes ? tes->h : 0, (uint64_t)GetCurrentThreadId()
+        };
+        wt_tsc_backend(identity);
+    }
     if (!p) return 0;                              /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
     if (!p->p) { g_fail_draws++; return 0; }       /* finding 120: the driver refused this pipeline: the draw is left out */
     if (tess) {                                    /* [witchtime] tessellated draws: counted; each pipeline named at its first use */
@@ -4008,7 +4096,7 @@ static int draw_prepare(unsigned prim) {
             if (g_storing_cbs[i]) g_storing_cbs[i]->wserial = R.serial + 1;
         }
     }      /* [witchtime] pass_end makes the writes visible; indirect_src waits again */
-    g_dp_fs_stores = fs && fs->images && !fs->ssbo_w;      /* [witchtime] issue 147 (rs_store_low): a stage that also writes buffers would write them twice */
+    g_dp_fs_stores = fs && fs->images && !buffer_writes;      /* [witchtime] issue 147 (rs_store_low): a stage that also writes buffers would write them twice */
     ckpt(0, vs, fs, tes);                          /* [issue 26] */
     return 1;
 }
@@ -4422,6 +4510,7 @@ static void rs_store_done(int drawn) {             /* the targets of the game's 
     pass_end();
     memcpy(R.col, g_sf_col, sizeof R.col); R.depth = g_sf_dep; R.ncol = g_sf_ncol; R.have_targets = g_sf_have; R.dyn_dirty = 1;
     g_oq_on = g_sf_oq;
+    if (drawn) pt_end();
     g_sf_draws += drawn;
 }
 static void exec(const Cmd *m, int depth) {
@@ -4673,7 +4762,7 @@ static void exec(const Cmd *m, int depth) {
         ckpt(2, NULL, NULL, NULL);
         primlog_add(0, a[2] * (a[4] ? a[4] : 1));
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
-        if (rs_store_low()) { int ok = draw_prepare((unsigned)a[0]); if (ok) vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]); rs_store_done(ok); }      /* [witchtime] issue 147 */
+        if (rs_store_low()) { int ok = draw_prepare((unsigned)a[0]); if (ok) { pt_begin(PT_FULL_STORE, R.pass_w, R.pass_h); vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]); g_pt_internal_draws++; } rs_store_done(ok); }      /* [witchtime] issue 147 */
         break;
     case OP_DRAW_ELEMENTS: {
         unsigned t = (unsigned)a[1] < 3 ? (unsigned)a[1] : 1;
@@ -4692,7 +4781,7 @@ static void exec(const Cmd *m, int depth) {
         if (rs_store_low()) {                      /* [witchtime] issue 147; the indices again: the draw's preparation may have wrapped the ring */
             buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);
             int ok = draw_prepare((unsigned)a[0]);
-            if (ok) { vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]); }
+            if (ok) { vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32); pt_begin(PT_FULL_STORE, R.pass_w, R.pass_h); vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]); g_pt_internal_draws++; }
             rs_store_done(ok);
         }
         break;
@@ -5603,7 +5692,9 @@ static void vk_present2(void *arg, int progress) {
     }
     if (progress) goto swap;
     sgsr_present();
+    sgsr_cs_present();
     fsr_present();                                 /* [witchtime] issue 118 */
+    if (wt_tsc_requested()) wt_tsc_frame((uint64_t)U.frame, 0); /* Advance only; presents never arm capture. */
     if (g_tl_t0 && g_tl_first) { LONG64 now = tk(); g_tl_sum[0] += g_tl_first - g_tl_t0; g_tl_sum[1] += g_tl_last - g_tl_t0; g_tl_sum[2] += now - g_tl_t0; g_tl_n++; g_tl_first = 0; }
     if (g_pt_on > 0 && g_in_fight) g_pt_frames++;
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
@@ -6200,14 +6291,27 @@ static void frstat_report(void) {
         printf("nvn_vk_first: %lld battle frames, %lld of them over 20 ms between presents | frames in which a pipeline was drawn for the first time: %lld (%lld pipelines: %lld linked at the draw from ready stage libraries, %lld compiled or waited for, %lld in a pass signature never seen; %.2f ms in all making them) | of those frames over 20 ms: %lld (%lld of them also made or read a texture at its use)\n",
                (long long)g_fu_fight_frames, (long long)g_fu_fight_slow, (long long)g_fu_frames, (long long)g_fu_total, (long long)g_fu_linked, (long long)g_fu_made, (long long)g_fu_newsig, (double)g_fu_tk * 1000.0 / (double)fq.QuadPart, (long long)g_fu_slow, (long long)g_fu_slow_tex);
     }
+    if (g_pt_on >= 0) printf("nvn_vk_pass_status: enabled=%d completed=%lld pending=%lld unsupported=%lld failed=%lld wrapped=%lld capacity_submissions=%lld; absent kinds are not measured\n", g_pt_on, (long long)g_pt_state[0], (long long)g_pt_state[1], (long long)g_pt_state[2], (long long)g_pt_state[3], (long long)g_pt_state[4], (long long)g_pt_capacity);
     if (g_pt_on > 0 && g_pt_frames) {             /* WT_VK_PASSTIME */
         double tot = 0;
-        for (int k = 0; k < g_pt_nkind; k++) tot += g_pt_ns[k];
-        printf("nvn_vk_pass: %lld frames with fighters, %.2f ms of GPU time per frame in marked segments; per kind (in the order of first use):\n", (long long)g_pt_frames, tot / 1e6 / (double)g_pt_frames);
+        uint64_t samples = 0;
+        for (int k = 0; k < g_pt_nkind; k++) { tot += g_pt_ns[k]; samples += g_pt_cnt[k]; }
+        if (samples) printf("nvn_vk_pass: %lld frames with fighters, %.2f ms of GPU time per frame in marked segments; per kind (in the order of first use):\n", (long long)g_pt_frames, tot / 1e6 / (double)g_pt_frames);
+        else printf("nvn_vk_pass: %lld frames with fighters, marked GPU time unavailable: no_valid_marked_samples\n", (long long)g_pt_frames);
         for (int k = 0; k < g_pt_nkind; k++) {
             PtKind *q = &g_pt_kind[k];
+            if (q->what == PT_GAP || !g_pt_cnt[k]) continue;
             char name[160];
-            if (q->what == 1) snprintf(name, sizeof name, "compute dispatches");
+            if (q->what >= PT_FSR_BASE) {
+                static const char *fsr[] = {"camera velocity", "prepare", "luma", "shading-change pyramid", "shading change", "reactive", "locks", "accumulate"};
+                const char *label = q->what >= PT_SGSR_CS_BASE ? "SGSR CS pass" :
+                    q->what == PT_COPY_CONVERT ? "copy/conversion" : q->what == PT_FULL_STORE ? "full-store replay" :
+                    q->what == PT_CAMERA_VELOCITY ? "camera velocity" : q->what == PT_SGSR_FS_BASE ? "SGSR FS convert/camera velocity" :
+                    q->what == PT_SGSR_FS_BASE + 1 ? "SGSR FS upscale" :
+                    q->what < PT_FSR_BASE + 8 ? fsr[q->what - PT_FSR_BASE] : "unknown";
+                snprintf(name, sizeof name, "%s (marker %d) %dx%d", label, q->what, q->w, q->h);
+            }
+            else if (q->what == 1) snprintf(name, sizeof name, "compute dispatches");
             else if (q->what == 2) snprintf(name, sizeof name, "present blit to the window %dx%d (and what follows it)", q->w, q->h);
             else snprintf(name, sizeof name, "pass %dx%d, %d colour (format 0x%x)%s%s", q->w, q->h, q->ncol, q->cf, q->depth ? " + depth" : "", q->win ? ", WINDOW TEXTURE" : "");
             printf("nvn_vk_pass:   %6.3f ms per frame (%4.1f %%), %5.1f segments and %6.1f draws per frame: %s\n", g_pt_ns[k] / 1e6 / (double)g_pt_frames, tot > 0 ? 100.0 * g_pt_ns[k] / tot : 0.0, (double)g_pt_cnt[k] / (double)g_pt_frames, (double)g_pt_draws[k] / (double)g_pt_frames, name);
@@ -6248,6 +6352,7 @@ static void vkd_shutdown(void) {
     fl_shutdown();
     fsr_shutdown();                                /* [witchtime] issue 118 (its images went with g_vtex_all) */
     sgsr_shutdown();
+    sgsr_cs_shutdown();
     hdr_views(0);                                  /* [Recomps#1] finding 147: the HDR pass */
     if (g_hdr.pipe) vkDestroyPipeline(V.device, g_hdr.pipe, NULL);
     if (g_hdr.pl) { vkDestroyPipelineLayout(V.device, g_hdr.pl, NULL); vkDestroyDescriptorSetLayout(V.device, g_hdr.dl, NULL); vkDestroyDescriptorPool(V.device, g_hdr.dp, NULL); vkDestroySampler(V.device, g_hdr.smp, NULL); }

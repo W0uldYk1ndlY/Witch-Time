@@ -3,8 +3,272 @@ use std::time::{Duration, Instant};
 
 use crate::diag::adb::{AdbDeviceInfo, AdbTransport};
 use crate::diag::bootstrap::compute_request_digest;
-use crate::diag::models::DiagnosticLiveStatus;
+use crate::diag::models::{DiagnosticLiveStatus, DiagnosticTemporalObservation, TemporalSelection, SgsrVariant, TemporalSupport, TemporalOutputGrid, DiagnosticGpuComponent, DiagnosticGpuComponentReport};
 use crate::diag::symbolization::parse_crash_breadcrumb;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TemporalRecord {
+    seq: u64, prod: u32, tid: u32, gen: u32,
+    #[serde(rename = "type")]
+    kind: u32,
+    p0: i64, p1: i64, p2: i64, p3: i64,
+}
+
+fn decode_temporal_records(records: &[TemporalRecord]) -> Option<DiagnosticTemporalObservation> {
+    let mut group: Vec<&TemporalRecord> = Vec::new();
+    let mut latest = None;
+    let mut previous_seq = None;
+    let mut surfaces = std::collections::BTreeMap::new();
+    for r in records {
+        if r.kind == 8 {
+            if !(0..=u32::MAX as i64).contains(&r.p0) || !(0..=u32::MAX as i64).contains(&r.p1)
+                || !(0..=u32::MAX as i64).contains(&r.p2) { return None; }
+            if r.p1 == 0 || r.p2 == 0 { surfaces.remove(&(r.p0 as u32)); }
+            else { surfaces.insert(r.p0 as u32, (r.seq, [r.p1 as u32, r.p2 as u32])); }
+            continue;
+        }
+        if !(32..=35).contains(&r.kind) { continue; }
+        if previous_seq.map_or(false, |seq| r.seq <= seq) { return None; }
+        previous_seq = Some(r.seq);
+        if r.kind == 32 { group.clear(); latest = None; }
+        if r.kind != 32 + group.len() as u32 { return None; }
+        if let Some(first) = group.first() {
+            if (r.p0, r.prod, r.tid, r.gen) != (first.p0, first.prod, first.tid, first.gen) { return None; }
+        }
+        group.push(r);
+        if group.len() != 4 { continue; }
+        let (selection, dims, state, failure) = (group[0], group[1], group[2], group[3]);
+        if selection.p0 < 0 || !(0..=8).contains(&selection.p1) || !(0..=63).contains(&state.p1)
+            || !(0..=u32::MAX as i64).contains(&dims.p3) { return None; }
+        let variant = match selection.p3 {
+            0 => Some(SgsrVariant::Fragment), 1 => Some(SgsrVariant::Compute2),
+            2 => Some(SgsrVariant::Compute3), -1 => None, _ => return None,
+        };
+        let effective = match selection.p2 {
+            0 => TemporalSelection::Native {}, 1 => TemporalSelection::Fsr3 {},
+            2 => TemporalSelection::Fsr3Quality {}, 3 => TemporalSelection::Fsr3Balanced {},
+            4 => TemporalSelection::Fsr3Performance {}, 5 => TemporalSelection::Fsr3UltraPerformance {},
+            6 => TemporalSelection::Sgsr2 { variant: variant? },
+            7 => TemporalSelection::Sgsr2Quality { variant: variant? },
+            8 => TemporalSelection::Sgsr2Performance { variant: variant? }, _ => return None,
+        };
+        let motion = match state.p2 {
+            0 => TemporalSupport::Unavailable, 1 => TemporalSupport::CameraOnly,
+            2 => TemporalSupport::PartialDynamic, 3 => TemporalSupport::FullDynamic, _ => return None,
+        };
+        let flags = state.p1;
+        // A contradictory consumed claim is corrupt, not successful execution.
+        if flags & 8 != 0 && (flags & 7 != 7 || flags & 16 != 0 || failure.p1 != 0 || selection.p2 == 0) { return None; }
+        let extent = |p: i64| [((p as u64) >> 32) as u32, p as u32];
+        latest = Some(DiagnosticTemporalObservation {
+            effective, scene_dimensions: extent(dims.p1), output_dimensions: extent(dims.p2), motion,
+            output_grid: TemporalOutputGrid::Reconstruction,
+            surface_dimensions: surfaces.get(&(dims.p3 as u32)).filter(|(seq, _)| *seq <= selection.seq).map(|(_, size)| *size),
+            reactive_consumed: flags & 32 != 0, supported: flags & 1 != 0,
+            initialized: flags & 2 != 0, dispatched: flags & 4 != 0, consumed: flags & 8 != 0,
+            skipped: flags & 16 != 0,
+            reset_reason: if state.p3 == 0 { None } else { Some(format!("renderer_reset_{}", state.p3)) },
+            fallback_reason: if failure.p1 == 0 { None } else { Some(format!("renderer_fallback_{}", failure.p1)) },
+            scene_frame: selection.p0 as u64, surface_generation: dims.p3 as u32,
+            // No event establishes LOD/mips/etc. Never derive effective settings from the request.
+            unrelated_settings_hash: String::new(),
+        });
+        group.clear();
+    }
+    if group.is_empty() { latest } else { None }
+}
+
+const MAX_EVENT_STREAM_BYTES: usize = 128 * 1024 * 1024;
+const MAX_EVENT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+// Compact required fields, one-digit values, one separating newline; no trailing newline assumed.
+const MIN_EVENT_HEADER_BYTES: usize = b"{\"chunk_id\":1,\"start_seq\":1,\"end_seq\":1,\"count\":1}\n".len();
+const MIN_EVENT_RECORD_BYTES: usize = b"{\"seq\":1,\"ts\":0,\"type\":0,\"prod\":0,\"tid\":0,\"gen\":0,\"p0\":0,\"p1\":0,\"p2\":0,\"p3\":0}".len();
+
+fn collect_event_chunks(transport: &dyn AdbTransport, serial: &str, remote_root: &str,
+                        output: &std::path::Path, status_path: Option<&std::path::Path>, run_id: &str) -> Result<Vec<PathBuf>, String> {
+    let status = status_path.and_then(|p| read_temporal_artifact(p, 1024 * 1024).ok())
+        .and_then(|bytes| serde_json::from_slice::<DiagnosticLiveStatus>(&bytes).ok());
+    let stopped = status.filter(|s| s.run_id == run_id && s.state == "stopped");
+    let required = stopped.as_ref().map(|s| s.recorder.chunks_committed);
+    if let Some(s) = &stopped {
+        let r = &s.recorder;
+        let minimum_bytes = u64::from(r.chunks_committed).checked_mul(MIN_EVENT_HEADER_BYTES as u64)
+            .and_then(|headers| r.total_records_written.checked_mul(MIN_EVENT_RECORD_BYTES as u64)
+                .and_then(|records| headers.checked_add(records)))
+            .ok_or("stopped status byte accounting overflow")?;
+        // Writer bytes include incidents; only event bytes have this collector's 128 MiB ceiling.
+        if u64::from(r.chunks_committed) > r.total_records_written
+            || (r.chunks_committed == 0) != (r.total_records_written == 0)
+            || r.total_records_written > r.total_emitted
+            || minimum_bytes > r.total_bytes_written
+            || minimum_bytes > MAX_EVENT_STREAM_BYTES as u64 {
+            return Err("inconsistent or over-budget stopped status byte/record/chunk counts".into());
+        }
+    }
+    if required.is_none() {
+        eprintln!("event collection completeness unknown: no matching typed stopped status (legacy limit 200)");
+    }
+    let mut chunks = Vec::new();
+    let mut bytes_read = 0usize;
+    let mut sequence = Vec::new();
+    for i in 1..=required.unwrap_or(200) {
+        let name = format!("events-{:06}.jsonl", i);
+        let local = output.join(&name);
+        if let Err(error) = transport.pull(serial, &format!("{}/{}", remote_root, name), &local) {
+            if required.is_some() { return Err(format!("required event chunk {} unavailable: {}", i, error)); }
+            break;
+        }
+        let bytes = read_temporal_artifact(&local, MAX_EVENT_CHUNK_BYTES)?;
+        bytes_read = bytes_read.checked_add(bytes.len()).ok_or("event stream byte accounting overflow")?;
+        if bytes_read > MAX_EVENT_STREAM_BYTES { return Err("event stream exceeds 128 MiB size bound".into()); }
+        if let Some(s) = &stopped {
+            if bytes_read as u64 > s.recorder.total_bytes_written {
+                return Err("event stream exceeds stopped status declared bytes".into());
+            }
+            let mut lines = bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty());
+            let header_line = lines.next().ok_or("missing chunk header")?;
+            if header_line.len() > 4096 { return Err("event header exceeds size bound".into()); }
+            let header: serde_json::Value = serde_json::from_slice(header_line)
+                .map_err(|e| e.to_string())?;
+            let mut count = 0u64;
+            let mut first = None;
+            let mut last = None;
+            for line in lines {
+                if line.len() > 4096 { return Err("event row exceeds size bound".into()); }
+                let value: serde_json::Value = serde_json::from_slice(line).map_err(|e| e.to_string())?;
+                if value["ts"].as_u64().is_none() { return Err("missing or invalid event timestamp".into()); }
+                let record: TemporalRecord = serde_json::from_value(value).map_err(|e| e.to_string())?;
+                if record.seq == 0 || last.map_or(false, |seq| record.seq <= seq) {
+                    return Err("invalid within-chunk sequence".into());
+                }
+                if first.is_none() { first = Some(record.seq); }
+                last = Some(record.seq);
+                count = count.checked_add(1).ok_or("event record accounting overflow")?;
+                sequence.push(record.seq);
+                if sequence.len() as u64 > s.recorder.total_records_written {
+                    return Err("event stream exceeds stopped status declared records".into());
+                }
+            }
+            if count == 0 || header["chunk_id"].as_u64() != Some(u64::from(i))
+                || header["count"].as_u64() != Some(count) || header["start_seq"].as_u64() != first
+                || header["end_seq"].as_u64() != last {
+                return Err("empty or inconsistent event chunk header".into());
+            }
+        }
+        chunks.push(local);
+    }
+    if let Some(s) = &stopped {
+        if sequence.len() as u64 != s.recorder.total_records_written
+            || (s.recorder.incidents_written == 0 && bytes_read as u64 != s.recorder.total_bytes_written) {
+            return Err("event stream disagrees with stopped status totals".into());
+        }
+        sequence.sort_unstable();
+        if sequence.iter().enumerate().any(|(i, seq)| *seq != i as u64 + 1) {
+            return Err("incomplete or duplicate global event sequence".into());
+        }
+    }
+    Ok(chunks)
+}
+
+fn read_temporal_artifact(path: &std::path::Path, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > limit { return Err("temporal artifact exceeds size bound".into()); }
+    Ok(bytes)
+}
+
+/// Derive bounded runtime observations; missing legacy identities/settings stay missing.
+fn enrich_temporal_manifest(manifest_path: &std::path::Path, status_path: Option<&std::path::Path>,
+                            chunks: &[PathBuf], run_id: &str, gpu_components_requested: bool) -> Result<(), String> {
+    let mut manifest: serde_json::Value = serde_json::from_slice(&read_temporal_artifact(manifest_path, 16 * 1024 * 1024)?)
+        .map_err(|e| e.to_string())?;
+    if manifest["run_id"].as_str() != Some(run_id) { return Err("manifest run mismatch".into()); }
+    let object = manifest.as_object_mut().ok_or("manifest is not an object")?;
+    let had_observation = object.remove("temporal_observation").is_some();
+    let had_components = object.remove("gpu_components").is_some();
+    if gpu_components_requested {
+        object.insert("gpu_components".into(), serde_json::to_value(DiagnosticGpuComponentReport {
+            healthy: false, reason: Some("GPU component collector has no validated stopped-writer events".into()), observations: Vec::new(),
+        }).map_err(|e| e.to_string())?);
+    }
+    let status = status_path.and_then(|p| read_temporal_artifact(p, 1024 * 1024).ok())
+        .and_then(|bytes| serde_json::from_slice::<DiagnosticLiveStatus>(&bytes).ok());
+    let healthy = status.as_ref().map_or(false, |s| s.run_id == run_id && s.healthy && s.state == "stopped"
+        && s.recorder.total_dropped == 0 && s.recorder.total_emitted == s.recorder.total_records_written
+        && s.recorder.chunks_committed as usize == chunks.len());
+    if healthy {
+        let mut records = Vec::new();
+        let mut valid = true;
+        let mut bytes_read = 0usize;
+        let mut records_read = 0u64;
+        let mut sequence = Vec::new();
+        for (index, path) in chunks.iter().enumerate() {
+            let bytes = read_temporal_artifact(path, 16 * 1024 * 1024)?;
+            bytes_read += bytes.len();
+            if bytes.len() > 16 * 1024 * 1024 || bytes_read > 128 * 1024 * 1024 { valid = false; break; }
+            let mut header = None;
+            let mut count = 0u64;
+            let mut first_seq = None;
+            let mut last_seq = None;
+            for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                if line.len() > 4096 { valid = false; break; }
+                let value: serde_json::Value = match serde_json::from_slice(line) {
+                    Ok(v) => v, Err(_) => { valid = false; break; }
+                };
+                if header.is_none() {
+                    if value["chunk_id"].as_u64() != Some(index as u64 + 1) { valid = false; break; }
+                    header = Some(value); continue;
+                }
+                let record: TemporalRecord = match serde_json::from_value(value) {
+                    Ok(r) => r, Err(_) => { valid = false; break; }
+                };
+                if last_seq.map_or(false, |s| record.seq <= s) { valid = false; break; }
+                if first_seq.is_none() { first_seq = Some(record.seq); }
+                last_seq = Some(record.seq); count += 1;
+                sequence.push(record.seq);
+                if record.kind == 8 || (32..=36).contains(&record.kind) { records.push(record); }
+            }
+            if header.as_ref().map_or(true, |h| h["count"].as_u64() != Some(count)
+                || h["start_seq"].as_u64() != first_seq || h["end_seq"].as_u64() != last_seq) { valid = false; }
+            records_read += count;
+            if !valid { break; }
+        }
+        if status.as_ref().map_or(true, |s| s.recorder.total_records_written != records_read) { valid = false; }
+        // Chunks drain separate producers: verify the complete sequence set, not chunk order.
+        sequence.sort_unstable();
+        if sequence.iter().enumerate().any(|(i, seq)| *seq != i as u64 + 1) { valid = false; }
+        if valid {
+            records.sort_unstable_by_key(|r| r.seq);
+            if let Some(observation) = decode_temporal_records(&records) {
+                object.insert("temporal_observation".into(), serde_json::to_value(observation).map_err(|e| e.to_string())?);
+            }
+        }
+        let mut components: Vec<_> = records.iter().filter(|r| r.kind == 36).collect();
+        if !components.is_empty() {
+            components.sort_unstable_by_key(|r| r.seq);
+            let report = if !gpu_components_requested {
+                DiagnosticGpuComponentReport { healthy: false, reason: Some("GPU component collector was not requested".into()), observations: Vec::new() }
+            } else if !valid {
+                DiagnosticGpuComponentReport { healthy: false, reason: Some("incomplete or malformed event stream".into()), observations: Vec::new() }
+            } else if components.windows(2).any(|pair| pair[0].seq == pair[1].seq) {
+                DiagnosticGpuComponentReport { healthy: false, reason: Some("duplicate GPU component sequence".into()), observations: Vec::new() }
+            } else {
+                match DiagnosticGpuComponent::reduce_payloads(components.iter().map(|r| [r.p0, r.p1, r.p2, r.p3]), true) {
+                    Ok(observations) => DiagnosticGpuComponentReport { healthy: true, reason: None, observations },
+                    Err(reason) => DiagnosticGpuComponentReport { healthy: false, reason: Some(reason.into()), observations: Vec::new() },
+                }
+            };
+            object.insert("gpu_components".into(), serde_json::to_value(report).map_err(|e| e.to_string())?);
+        }
+    }
+    if !had_observation && !had_components && !object.contains_key("temporal_observation") && !object.contains_key("gpu_components") { return Ok(()); }
+    // Local derived artifact only; the app's receipt and other provenance are unchanged.
+    let tmp = manifest_path.with_extension("temporal.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, manifest_path).map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserverPhase {
@@ -503,25 +767,35 @@ impl<'a> AndroidRunner<'a> {
         // Pull artifacts to host output dir
         let _ = std::fs::create_dir_all(&self.config.host_output_dir);
         let local_manifest = self.config.host_output_dir.join("manifest.json");
-        let _ = self.transport.pull(&serial, &remote_manifest, &local_manifest);
+        let manifest_pulled = self.transport.pull(&serial, &remote_manifest, &local_manifest).is_ok();
 
         let local_outcome = self.config.host_output_dir.join("outcome.json");
         let _ = self.transport.pull(&serial, &remote_outcome, &local_outcome);
 
         let local_status = self.config.host_output_dir.join("status.json");
-        let _ = self.transport.pull(&serial, &remote_status, &local_status);
+        let status_pulled = self.transport.pull(&serial, &remote_status, &local_status).is_ok();
 
         let remote_session_log = format!("{}/session.log", remote_session_root);
         let local_session_log = self.config.host_output_dir.join("session.log");
         let _ = self.transport.pull(&serial, &remote_session_log, &local_session_log);
 
         // Pull event chunks
-        for i in 1..=200 {
-            let chunk_name = format!("events-{:06}.jsonl", i);
-            let remote_chunk = format!("{}/{}", remote_session_root, chunk_name);
-            let local_chunk = self.config.host_output_dir.join(&chunk_name);
-            if self.transport.pull(&serial, &remote_chunk, &local_chunk).is_err() {
-                break;
+        let temporal_chunks = match collect_event_chunks(self.transport, &serial, &remote_session_root,
+            &self.config.host_output_dir, if status_pulled { Some(&local_status) } else { None }, &self.config.run_id) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                eprintln!("event collection failed: {}", error);
+                if final_status == RunnerExitStatus::Completed { final_status = RunnerExitStatus::CollectorFailure(error); }
+                Vec::new()
+            }
+        };
+        if manifest_pulled {
+            let components_requested = serde_json::from_slice::<crate::diag::models::DiagnosticRequest>(&self.config.request_bytes)
+                .map(|request| request.profile.collectors.iter().any(|c| c == "gpu_components")).unwrap_or(false);
+            if let Err(error) = enrich_temporal_manifest(&local_manifest,
+                if status_pulled { Some(local_status.as_path()) } else { None },
+                &temporal_chunks, &self.config.run_id, components_requested) {
+                eprintln!("runtime observation provenance unavailable: {}", error);
             }
         }
 
@@ -569,6 +843,375 @@ mod tests {
     use super::*;
     use crate::diag::adb::FakeAdb;
     use serde_json::json;
+
+    fn temporal_records() -> Vec<TemporalRecord> {
+        let payloads = [[17, 7, 7, 1], [17, (853i64 << 32) | 479, (1280i64 << 32) | 720, 3],
+            [17, 15, 1, 1], [17, 0, -1, -1]];
+        payloads.iter().enumerate().map(|(i, p)| TemporalRecord {
+            seq: i as u64 + 10, kind: 32 + i as u32, prod: 0, tid: 8, gen: 1,
+            p0: p[0], p1: p[1], p2: p[2], p3: p[3],
+        }).collect()
+    }
+
+    fn collection_fixture(tag: &str, count: u32) -> (PathBuf, PathBuf, serde_json::Value, FakeAdb) {
+        let dir = std::env::temp_dir().join(format!("event_collection_{}_{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = dir.join("status.json");
+        let mut health = json!({"schema_version":"1.0", "run_id":"collection", "timestamp_ns":1,
+            "healthy":true, "state":"stopped", "lifecycle":{"state":"resumed","is_foreground":true},
+            "surface_generation":3, "progress":{"render_age_ms":0,"is_active_stall":false,"expected_inactivity":false},
+            "recorder":{"total_emitted":count,"total_dropped":0,"chunks_committed":count,"total_records_written":count,
+                "total_bytes_written":0,"remaining_budget":1024,"reserve_held":false,"incidents_written":0,"active_producers":1}});
+        let adb = FakeAdb::new();
+        adb.add_device("fixture", "device");
+        let mut bytes = 0;
+        for i in 1..=count {
+            let chunk = format!("{}\n{}\n", json!({"chunk_id":i,"start_seq":i,"end_seq":i,"count":1}),
+                json!({"seq":i,"ts":0,"type":0,"prod":0,"tid":0,"gen":0,"p0":0,"p1":0,"p2":0,"p3":0}));
+            bytes += chunk.len();
+            adb.write_remote_file("fixture", &format!("/run/events-{:06}.jsonl", i), chunk.into_bytes());
+        }
+        health["recorder"]["total_bytes_written"] = json!(bytes);
+        std::fs::write(&status, health.to_string()).unwrap();
+        (dir, status, health, adb)
+    }
+
+    fn remove_collection_fixture(dir: PathBuf) {
+        for entry in std::fs::read_dir(&dir).unwrap() { std::fs::remove_file(entry.unwrap().path()).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn stopped_collection_accepts_byte_bounded_4176_and_4102_chunk_streams() {
+        for count in [336, 4176, 4102] {
+            let (dir, status, _, adb) = collection_fixture(&format!("large_{count}"), count);
+            let chunks = collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap();
+            assert_eq!(chunks.len(), count as usize);
+            assert!(chunks.last().unwrap().ends_with(format!("events-{count:06}.jsonl")));
+            remove_collection_fixture(dir);
+        }
+    }
+
+    #[test]
+    fn stopped_collection_requires_middle_and_tail_chunks() {
+        for missing in [2, 4] {
+            let (dir, status, _, adb) = collection_fixture(&format!("missing_{missing}"), 4);
+            adb.remote_fs.lock().unwrap().get_mut("fixture").unwrap().remove(&format!("/run/events-{missing:06}.jsonl"));
+            assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection")
+                .unwrap_err().contains(&format!("chunk {missing} unavailable")));
+            remove_collection_fixture(dir);
+        }
+    }
+
+    #[test]
+    fn stopped_collection_rejects_dishonest_totals_and_overflow_before_pulling() {
+        let (dir, status, health, adb) = collection_fixture("totals", 4);
+        for (field, value) in [("chunks_committed", 5), ("chunks_committed", 0),
+            ("total_records_written", 3), ("total_records_written", u64::MAX),
+            ("total_bytes_written", 1)] {
+            let mut bad = health.clone(); bad["recorder"][field] = json!(value);
+            std::fs::write(&status, bad.to_string()).unwrap();
+            assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").is_err(), "{field}={value}");
+            assert!(!dir.join("events-000001.jsonl").exists());
+        }
+        for delta in [-1i64, 1] {
+            let mut bad = health.clone();
+            bad["recorder"]["total_bytes_written"] = json!((health["recorder"]["total_bytes_written"].as_u64().unwrap() as i64 + delta) as u64);
+            std::fs::write(&status, bad.to_string()).unwrap();
+            assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").is_err());
+        }
+        // Incident bytes are not event bytes; only the upper bound is knowable here.
+        let mut incident = health.clone(); incident["recorder"]["incidents_written"] = json!(1);
+        incident["recorder"]["total_bytes_written"] = json!(health["recorder"]["total_bytes_written"].as_u64().unwrap() + 50);
+        std::fs::write(&status, incident.to_string()).unwrap();
+        assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().len(), 4);
+        // Combined writer accounting can exceed the separate event-stream collection budget.
+        incident["recorder"]["total_bytes_written"] = json!(MAX_EVENT_STREAM_BYTES as u64 + 1024 * 1024);
+        std::fs::write(&status, incident.to_string()).unwrap();
+        assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().len(), 4);
+        let mut oversized_events = health.clone();
+        let records = MAX_EVENT_STREAM_BYTES as u64 / MIN_EVENT_RECORD_BYTES as u64 + 1;
+        oversized_events["recorder"]["total_records_written"] = json!(records);
+        oversized_events["recorder"]["total_emitted"] = json!(records);
+        oversized_events["recorder"]["total_bytes_written"] = json!(u64::MAX);
+        std::fs::write(&status, oversized_events.to_string()).unwrap();
+        assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection")
+            .unwrap_err().contains("over-budget"));
+        remove_collection_fixture(dir);
+    }
+
+    #[test]
+    fn stopped_collection_rejects_bad_headers_empty_chunks_and_sequence_loss() {
+        let (dir, status, health, adb) = collection_fixture("malformed", 4);
+        let original = adb.remote_fs.lock().unwrap()["fixture"]["/run/events-000002.jsonl"].clone();
+        let text = String::from_utf8(original.clone()).unwrap();
+        let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        for case in 0..6 {
+            let mut header = rows[0].clone(); let mut record = rows[1].clone();
+            match case {
+                0 => header["count"] = json!(2),
+                1 => header["chunk_id"] = json!(3),
+                2 => { header["start_seq"] = json!(1); header["end_seq"] = json!(1); record["seq"] = json!(1); },
+                3 => { header["start_seq"] = json!(9); header["end_seq"] = json!(9); record["seq"] = json!(9); },
+                4 => { header["count"] = json!(0); },
+                _ => { record.as_object_mut().unwrap().remove("ts"); },
+            }
+            let chunk = if case == 4 { format!("{header}\n") } else { format!("{header}\n{record}\n") };
+            let mut bad = health.clone();
+            bad["recorder"]["total_bytes_written"] = json!(health["recorder"]["total_bytes_written"].as_u64().unwrap() - original.len() as u64 + chunk.len() as u64);
+            std::fs::write(&status, bad.to_string()).unwrap();
+            adb.write_remote_file("fixture", "/run/events-000002.jsonl", chunk.into_bytes());
+            assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").is_err(), "case {case}");
+        }
+        // Producer drains need not publish chunks in global sequence order.
+        for (chunk_id, seq) in [(2, 3), (3, 2)] {
+            let mut header = rows[0].clone(); let mut record = rows[1].clone();
+            header["chunk_id"] = json!(chunk_id); header["start_seq"] = json!(seq);
+            header["end_seq"] = json!(seq); record["seq"] = json!(seq);
+            adb.write_remote_file("fixture", &format!("/run/events-{chunk_id:06}.jsonl"), format!("{header}\n{record}\n").into_bytes());
+        }
+        std::fs::write(&status, health.to_string()).unwrap();
+        assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().len(), 4);
+        remove_collection_fixture(dir);
+    }
+
+    #[test]
+    fn nonmatching_or_unavailable_status_retains_unknown_legacy_collection() {
+        let (dir, status, health, adb) = collection_fixture("legacy", 336);
+        for (field, value) in [("run_id", "other"), ("state", "running")] {
+            let mut bad = health.clone(); bad[field] = json!(value);
+            std::fs::write(&status, bad.to_string()).unwrap();
+            assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().len(), 200);
+        }
+        assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, None, "collection").unwrap().len(), 200);
+        remove_collection_fixture(dir);
+    }
+
+    #[test]
+    fn collection_enforces_file_and_aggregate_byte_limits_without_trusted_status() {
+        let (dir, _, _, adb) = collection_fixture("byte_limits", 0);
+        adb.write_remote_file("fixture", "/run/events-000001.jsonl", vec![b' '; MAX_EVENT_CHUNK_BYTES + 1]);
+        assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, None, "collection")
+            .unwrap_err().contains("size bound"));
+        for i in 1..=9 {
+            adb.write_remote_file("fixture", &format!("/run/events-{i:06}.jsonl"), vec![b' '; MAX_EVENT_CHUNK_BYTES]);
+        }
+        assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, None, "collection")
+            .unwrap_err().contains("128 MiB"));
+        remove_collection_fixture(dir);
+    }
+
+    #[test]
+    fn collection_minimum_wire_bound_accepts_nonempty_minimal_chunk_and_empty_stream() {
+        let (dir, status, mut health, adb) = collection_fixture("minimum", 1);
+        let mut chunk = b"{\"chunk_id\":1,\"start_seq\":1,\"end_seq\":1,\"count\":1}\n".to_vec();
+        chunk.extend_from_slice(b"{\"seq\":1,\"ts\":0,\"type\":0,\"prod\":0,\"tid\":0,\"gen\":0,\"p0\":0,\"p1\":0,\"p2\":0,\"p3\":0}");
+        assert_eq!(chunk.len(), MIN_EVENT_HEADER_BYTES + MIN_EVENT_RECORD_BYTES);
+        health["recorder"]["total_bytes_written"] = json!(chunk.len());
+        std::fs::write(&status, health.to_string()).unwrap();
+        adb.write_remote_file("fixture", "/run/events-000001.jsonl", chunk);
+        assert_eq!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().len(), 1);
+        for field in ["chunks_committed", "total_emitted", "total_records_written", "total_bytes_written"] {
+            health["recorder"][field] = json!(0);
+        }
+        std::fs::write(&status, health.to_string()).unwrap();
+        assert!(collect_event_chunks(&adb, "fixture", "/run", &dir, Some(&status), "collection").unwrap().is_empty());
+        remove_collection_fixture(dir);
+    }
+
+    #[test]
+    fn temporal_decoder_requires_complete_same_scene_producer_and_valid_consumption() {
+        let r = temporal_records();
+        let o = decode_temporal_records(&r).unwrap();
+        assert_eq!(o.effective, TemporalSelection::Sgsr2Quality { variant: SgsrVariant::Compute2 });
+        assert_eq!(o.scene_dimensions, [853, 479]);
+        assert_eq!(o.output_dimensions, [1280, 720]);
+        assert!(o.consumed && o.dispatched && !o.reactive_consumed);
+        assert!(o.unrelated_settings_hash.is_empty());
+        assert_eq!(o.output_grid, TemporalOutputGrid::Reconstruction);
+        assert_eq!(o.surface_dimensions, None);
+        let mut with_surface = vec![TemporalRecord { seq: 9, prod: 0, tid: 8, gen: 1,
+            kind: 8, p0: 3, p1: 1600, p2: 900, p3: 44 }];
+        with_surface.extend(r.clone());
+        let observed = decode_temporal_records(&with_surface).unwrap();
+        assert_eq!(observed.surface_dimensions, Some([1600, 900]));
+        assert_eq!(observed.output_dimensions, [1280, 720]);
+        with_surface[0].p0 = 4;
+        assert_eq!(decode_temporal_records(&with_surface).unwrap().surface_dimensions, None);
+        with_surface[0].p0 = 3; with_surface[0].seq = 1000;
+        assert_eq!(decode_temporal_records(&with_surface).unwrap().surface_dimensions, None);
+        assert!(decode_temporal_records(&[]).is_none());
+        assert!(decode_temporal_records(&r[..3]).is_none());
+        for bad in 0..5 {
+            let mut records = r.clone();
+            match bad {
+                0 => records[2].p0 += 1,
+                1 => records[2].gen += 1,
+                2 => records[2].tid += 1,
+                3 => records[2].p1 = 8, // consumed without dispatch/setup/support
+                _ => records[3].p1 = 3, // consumed despite fallback
+            }
+            assert!(decode_temporal_records(&records).is_none());
+        }
+        let mut incomplete_tail = r.clone();
+        let mut next = r[0].clone(); next.seq = 100; next.p0 += 1;
+        incomplete_tail.push(next);
+        assert!(decode_temporal_records(&incomplete_tail).is_none());
+        let mut skipped = r.clone(); skipped[0].p2 = 0; skipped[2].p1 = 23; skipped[3].p1 = 5;
+        let o = decode_temporal_records(&skipped).unwrap();
+        assert!(!o.consumed && o.skipped && o.fallback_reason.is_some());
+    }
+
+    #[test]
+    fn temporal_manifest_enrichment_never_invents_legacy_provenance() {
+        let dir = std::env::temp_dir().join(format!("task81_temporal_enrich_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("manifest.json"); let status = dir.join("status.json");
+        let chunk = dir.join("events-000001.jsonl");
+        let receipt = json!({"run_id":"temporal_fixture", "status":"acknowledged", "request_digest":"receipt_only"});
+        let mut health = json!({"schema_version":"1.0", "run_id":"temporal_fixture", "timestamp_ns":1,
+            "healthy":true, "state":"stopped", "lifecycle":{"state":"resumed","is_foreground":true},
+            "surface_generation":3, "progress":{"render_age_ms":0,"is_active_stall":false,"expected_inactivity":false},
+            "recorder":{"total_emitted":4,"total_dropped":0,"chunks_committed":1,"total_records_written":4,
+                "total_bytes_written":1024,"remaining_budget":1024,"reserve_held":false,"incidents_written":0,"active_producers":1}});
+        let mut jsonl = String::from("{\"chunk_id\":1,\"count\":4,\"start_seq\":1,\"end_seq\":4}\n");
+        for (i, mut r) in temporal_records().into_iter().enumerate() {
+            r.seq = i as u64 + 1;
+            jsonl.push_str(&json!({"seq":r.seq,"type":r.kind,"prod":r.prod,"tid":r.tid,"gen":r.gen,
+                "p0":r.p0,"p1":r.p1,"p2":r.p2,"p3":r.p3}).to_string());
+            jsonl.push('\n');
+        }
+        std::fs::write(&chunk, &jsonl).unwrap();
+        assert!(read_temporal_artifact(&chunk, 4).is_err());
+        std::fs::write(&manifest, receipt.to_string()).unwrap();
+        std::fs::write(&status, health.to_string()).unwrap();
+        enrich_temporal_manifest(&manifest, Some(&status), &[chunk.clone()], "temporal_fixture", false).unwrap();
+        let enriched: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(enriched["status"], "acknowledged");
+        assert_eq!(enriched["temporal_observation"]["effective"]["mode"], "sgsr2_quality");
+        assert_eq!(enriched["temporal_observation"]["unrelated_settings_hash"], "");
+        assert!(enriched.get("effective_treatments").is_none() && enriched.get("build_identity").is_none());
+        for condition in 0..7 {
+            std::fs::write(&manifest, receipt.to_string()).unwrap();
+            health["recorder"]["total_dropped"] = json!(if condition == 0 { 1 } else { 0 });
+            health["recorder"]["chunks_committed"] = json!(if condition == 1 { 2 } else { 1 });
+            health["recorder"]["total_emitted"] = json!(if condition == 3 { 5 } else { 4 });
+            health["state"] = json!(if condition == 4 { "active" } else { "stopped" });
+            std::fs::write(&status, health.to_string()).unwrap();
+            let content = match condition {
+                2 => format!("{}{{\"seq\":", jsonl),
+                5 => format!("{}{{\"p0\":18}}\n", jsonl),
+                6 => jsonl.replacen("\"count\":4", "\"count\":3", 1),
+                _ => jsonl.clone(),
+            };
+            std::fs::write(&chunk, content).unwrap();
+            enrich_temporal_manifest(&manifest, Some(&status), &[chunk.clone()], "temporal_fixture", false).unwrap();
+            let missing: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            assert!(missing.get("temporal_observation").is_none());
+        }
+        for file in [&manifest, &status, &chunk] { std::fs::remove_file(file).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn enrichment_checks_global_sequence_coverage_across_producers() {
+        let dir = std::env::temp_dir().join(format!("temporal_global_sequence_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("manifest.json");
+        let status = dir.join("status.json");
+        let chunks = [dir.join("events-000001.jsonl"), dir.join("events-000002.jsonl")];
+        let health = json!({"schema_version":"1.0", "run_id":"sequence_fixture", "timestamp_ns":1,
+            "healthy":true, "state":"stopped", "lifecycle":{"state":"resumed","is_foreground":true},
+            "surface_generation":3, "progress":{"render_age_ms":0,"is_active_stall":false,"expected_inactivity":false},
+            "recorder":{"total_emitted":8,"total_dropped":0,"chunks_committed":2,"total_records_written":8,
+                "total_bytes_written":2048,"remaining_budget":1024,"reserve_held":false,"incidents_written":0,"active_producers":2}});
+        std::fs::write(&status, health.to_string()).unwrap();
+        let mut first = String::from("{\"chunk_id\":1,\"count\":7,\"start_seq\":1,\"end_seq\":8}\n");
+        let row = |seq, kind, prod, p0, p1, p2, p3| json!({"seq":seq,"type":kind,"prod":prod,"tid":2,"gen":1,
+            "p0":p0,"p1":p1,"p2":p2,"p3":p3}).to_string() + "\n";
+        first.push_str(&row(1u64, 0, 1, 0i64, 0i64, 0i64, 0i64));
+        for (i, r) in temporal_records().into_iter().enumerate() {
+            first.push_str(&json!({"seq":i as u64 + 3,"type":r.kind,"prod":r.prod,"tid":r.tid,"gen":r.gen,
+                "p0":r.p0,"p1":r.p1,"p2":r.p2,"p3":r.p3}).to_string());
+            first.push('\n');
+        }
+        first.push_str(&row(7, 36, 1, 17, (10i64 << 32) | 1, 9, -1));
+        first.push_str(&row(8, 36, 1, 17, 10i64 << 32, 9, 0));
+        std::fs::write(&chunks[0], first).unwrap();
+        for duplicate in [false, true] {
+            let seq = if duplicate { 1 } else { 2 };
+            let second = json!({"chunk_id":2,"count":1,"start_seq":seq,"end_seq":seq}).to_string()
+                + "\n" + &row(seq, 0, 2, 0, 0, 0, 0);
+            std::fs::write(&chunks[1], second).unwrap();
+            std::fs::write(&manifest, json!({"run_id":"sequence_fixture","status":"acknowledged"}).to_string()).unwrap();
+            enrich_temporal_manifest(&manifest, Some(&status), &chunks, "sequence_fixture", true).unwrap();
+            let enriched: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            assert_eq!(enriched.get("temporal_observation").is_some(), !duplicate);
+            assert_eq!(enriched["gpu_components"]["healthy"], !duplicate);
+            if duplicate {
+                assert_eq!(enriched["gpu_components"]["observations"], json!([]));
+            } else {
+                assert_eq!(enriched["gpu_components"]["observations"][0]["duration_ns"], 0);
+            }
+        }
+        for file in [&manifest, &status, &chunks[0], &chunks[1]] { std::fs::remove_file(file).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn collected_event36_stream_publishes_reduced_components_without_frame_totals() {
+        let dir = std::env::temp_dir().join(format!("task82_components_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("manifest.json"); let status = dir.join("status.json");
+        let chunk = dir.join("events-000001.jsonl");
+        let payload = |pass, serial, state, ns| [10, ((pass as i64) << 32) | state, serial, ns];
+        let events = vec![payload(20, 40, 1, -1), payload(21, 40, 1, -1), payload(20, 40, 0, 0),
+            payload(20, 41, 1, -1), payload(20, 41, 4, 250), payload(22, 42, 1, -1)];
+        for case in 0..7 {
+            let mut records = events.clone();
+            if case == 1 { records.push(payload(20, 40, 0, 0)); }
+            if case == 2 { records.push(payload(23, 43, 99, -1)); }
+            if case >= 5 { records.clear(); }
+            let requested = case != 3 && case != 6;
+            let count = records.len();
+            let mut jsonl = json!({"chunk_id":1,"start_seq":1,"end_seq":count,"count":count}).to_string();
+            jsonl.push('\n');
+            for (index, p) in records.iter().enumerate() {
+                jsonl.push_str(&json!({"seq":index + 1,"type":36,"prod":0,"tid":8,"gen":1,
+                    "p0":p[0],"p1":p[1],"p2":p[2],"p3":p[3]}).to_string());
+                jsonl.push('\n');
+            }
+            std::fs::write(&chunk, jsonl).unwrap();
+            std::fs::write(&manifest, json!({"run_id":"components_fixture","status":"acknowledged"}).to_string()).unwrap();
+            let health = json!({"schema_version":"1.0","run_id":"components_fixture","timestamp_ns":1,
+                "healthy":true,"state":if case == 4 { "active" } else { "stopped" },
+                "lifecycle":{"state":"resumed","is_foreground":true},"surface_generation":3,
+                "progress":{"render_age_ms":0,"is_active_stall":false,"expected_inactivity":false},
+                "recorder":{"total_emitted":count,"total_dropped":0,"chunks_committed":if count == 0 {0} else {1},
+                    "total_records_written":count,"total_bytes_written":1024,"remaining_budget":1024,
+                    "reserve_held":false,"incidents_written":0,"active_producers":1}});
+            std::fs::write(&status, health.to_string()).unwrap();
+            let chunks = if count == 0 { Vec::new() } else { vec![chunk.clone()] };
+            enrich_temporal_manifest(&manifest, Some(&status), &chunks, "components_fixture", requested).unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            assert!(result.get("frame_gpu_time_ns").is_none() && result.get("gpu_utilization").is_none());
+            assert!(result.get("build_identity").is_none() && result.get("effective_treatments").is_none());
+            if case == 6 { assert!(result.get("gpu_components").is_none()); continue; }
+            let report: DiagnosticGpuComponentReport = serde_json::from_value(result["gpu_components"].clone()).unwrap();
+            if case == 0 {
+                assert!(report.healthy && report.reason.is_none());
+                assert_eq!(report.observations.len(), 4);
+                assert_eq!(report.observations[0].duration_ns, Some(0));
+                assert_eq!(report.observations[1].duration_ns, Some(250));
+                for observation in &report.observations[2..] {
+                    assert_eq!(observation.state, crate::diag::models::GpuComponentState::LostTail);
+                    assert_eq!(observation.duration_ns, None);
+                }
+            } else { assert!(!report.healthy && report.reason.is_some() && report.observations.is_empty()); }
+        }
+        for file in [&manifest, &status, &chunk] { std::fs::remove_file(file).unwrap(); }
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     fn test_config(run_id: &str) -> AndroidRunnerConfig {
         let req_json = json!({

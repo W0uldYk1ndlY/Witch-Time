@@ -255,7 +255,7 @@ static void test_no_fallback_on_failure(void) {
     uint32_t attr = 1;
 
     /* When polled, failed session MUST zero out all fields (neutral release) and return false */
-    bool polled = diag_replay_poll(&sess, 0, 0, &buttons, &lx, &ly, &rx, &ry, &attr);
+    bool polled = diag_replay_poll(&sess, 0, 0, 0, &buttons, &lx, &ly, &rx, &ry, &attr);
     assert(!polled);
     assert(buttons == 0);
     assert(lx == 0 && ly == 0);
@@ -325,27 +325,110 @@ static void test_valid_roundtrip_and_polling(void) {
     uint64_t b = 0;
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
     uint32_t attr = 0;
-    assert(diag_replay_poll(&sess, 0, 2, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(diag_replay_poll(&sess, 2, 0, 2, &b, &lx, &ly, &rx, &ry, &attr));
     assert(b == 0 && lx == 0);
 
     /* Poll at anchor 0, poll 6: should deliver record 0 */
-    assert(diag_replay_poll(&sess, 0, 6, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(diag_replay_poll(&sess, 6, 0, 6, &b, &lx, &ly, &rx, &ry, &attr));
     assert(b == DIAG_REPLAY_BTN_A);
     assert(lx == 16000 && ly == 0);
 
     /* Poll at anchor 0, poll 12: should deliver record 1 */
-    assert(diag_replay_poll(&sess, 0, 12, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(diag_replay_poll(&sess, 12, 0, 12, &b, &lx, &ly, &rx, &ry, &attr));
     assert(b == (DIAG_REPLAY_BTN_B | DIAG_REPLAY_BTN_ZL));
     assert(lx == 0 && ly == -16000);
 
     /* Poll at anchor 1, poll 3: should deliver record 2 */
-    assert(diag_replay_poll(&sess, 1, 3, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(diag_replay_poll(&sess, 20, 1, 3, &b, &lx, &ly, &rx, &ry, &attr));
     assert(b == DIAG_REPLAY_BTN_PLUS);
     assert(attr == (DIAG_REPLAY_ATTR_CONNECTED | DIAG_REPLAY_ATTR_WIRED));
+    assert(!sess.is_eof);
+    assert(diag_replay_poll(&sess, 99, 1, 82, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(b == DIAG_REPLAY_BTN_PLUS && !sess.is_eof);
+    assert(diag_replay_poll(&sess, 100, 1, 83, &b, &lx, &ly, &rx, &ry, &attr));
+    assert(b == 0 && lx == 0 && ly == 0 && sess.is_eof);
 
     diag_replay_free(&sess);
     remove_file(path);
     printf("      Valid replay loaded and polled cleanly (passed)\n");
+}
+
+static void test_global_poll_duration(void) {
+    const char *path = "tests/test_global_poll.bin";
+    diag_replay_header_t h = {0};
+    h.total_polls = 400;
+    const uint64_t polls[] = {0, 60, 75, 180, 195, 300};
+    diag_replay_record_t r[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        r[i].poll = polls[i];
+        r[i].anchor = -1;
+        r[i].buttons = (i & 1) ? DIAG_REPLAY_BTN_A : 0;
+        r[i].attributes = DIAG_REPLAY_ATTR_CONNECTED;
+    }
+    diag_replay_session_t s;
+    assert(diag_replay_write(path, &h, r, 6) == DIAG_REPLAY_OK);
+    assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_OK);
+    assert(s.next_global_poll == 0);
+    for (uint64_t p = 0; p <= 400; p++) {
+        uint64_t b = ~0ULL;
+        uint32_t attr = 0;
+        /* Anchor transitions reset anchor-relative time, never the global clock. */
+        assert(diag_replay_poll(&s, p, (int)(p / 100), (uint32_t)(p % 100),
+                                &b, NULL, NULL, NULL, NULL, &attr));
+        assert(s.is_eof == (p == 400));
+        uint64_t expected = ((p >= 60 && p < 75) || (p >= 180 && p < 195) ||
+                             (p >= 300 && p < 400)) ? DIAG_REPLAY_BTN_A : 0;
+        assert(b == expected);
+        assert(attr == DIAG_REPLAY_ATTR_CONNECTED);
+    }
+    diag_replay_free(&s);
+
+    /* A 64-bit deadline and exclusive endpoint must not wrap at 32 bits or UINT64_MAX. */
+    h.total_polls = UINT64_MAX;
+    r[0].poll = UINT64_MAX - 1;
+    r[0].buttons = DIAG_REPLAY_BTN_A;
+    assert(diag_replay_write(path, &h, r, 1) == DIAG_REPLAY_OK);
+    assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_OK);
+    uint64_t b;
+    assert(diag_replay_poll(&s, UINT64_MAX - 2, -1, 0, &b, NULL, NULL, NULL, NULL, NULL));
+    assert(b == 0 && !s.is_eof);
+    assert(diag_replay_poll(&s, UINT64_MAX - 1, -1, 0, &b, NULL, NULL, NULL, NULL, NULL));
+    assert(b == DIAG_REPLAY_BTN_A && !s.is_eof);
+    assert(diag_replay_poll(&s, UINT64_MAX, -1, 0, &b, NULL, NULL, NULL, NULL, NULL));
+    assert(b == 0 && s.is_eof);
+    diag_replay_free(&s);
+
+    /* Unanchored records at/after the exclusive endpoint cannot ever be delivered. */
+    h.total_polls = r[0].poll;
+    assert(diag_replay_write(path, &h, r, 1) == DIAG_REPLAY_OK);
+    assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_ERR_CORRUPT_RECORD);
+    assert(s.has_failed && !s.is_loaded);
+    h.total_polls = 0;
+    r[0].poll = 0;
+    assert(diag_replay_write(path, &h, r, 1) == DIAG_REPLAY_OK);
+    assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_ERR_CORRUPT_RECORD);
+    /* Zero-duration anchored streams complete without delivering any state. */
+    r[0].anchor = 0;
+    assert(diag_replay_write(path, &h, r, 1) == DIAG_REPLAY_OK);
+    assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_OK);
+    assert(diag_replay_poll(&s, 0, 0, 0, &b, NULL, NULL, NULL, NULL, NULL));
+    assert(s.is_eof && b == 0);
+    diag_replay_free(&s);
+
+    /* Empty files retain the false/neutral sample contract, but duration still completes. */
+    for (uint64_t duration = 0; duration <= 1; duration++) {
+        h.total_polls = duration;
+        assert(diag_replay_write(path, &h, NULL, 0) == DIAG_REPLAY_OK);
+        assert(diag_replay_load(path, 0, 0, 0, &s) == DIAG_REPLAY_OK);
+        b = ~0ULL;
+        assert(!diag_replay_poll(&s, 0, -1, 0, &b, NULL, NULL, NULL, NULL, NULL));
+        assert(b == 0 && s.is_eof == (duration == 0));
+        assert(!diag_replay_poll(&s, duration, -1, 0, &b, NULL, NULL, NULL, NULL, NULL));
+        assert(s.is_eof);
+        diag_replay_free(&s);
+    }
+    remove_file(path);
+    puts("Global poll boundaries, held input, duration, overflow and empty replay passed");
 }
 
 int main(void) {
@@ -358,6 +441,7 @@ int main(void) {
     test_missing_eof_and_size_ceilings();
     test_no_fallback_on_failure();
     test_valid_roundtrip_and_polling();
-    printf("=== All 8 Validated Replay Tests Passed ===\n");
+    test_global_poll_duration();
+    printf("=== All 9 Validated Replay Tests Passed ===\n");
     return 0;
 }

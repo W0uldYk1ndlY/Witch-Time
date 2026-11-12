@@ -5,6 +5,14 @@
 #include "../runtime/pcmenu.c"
 #include <assert.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+static int setenv(const char *name, const char *value, int overwrite) {
+    return !overwrite && getenv(name) ? 0 : _putenv_s(name, value);
+}
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
 
 volatile LONG g_guest_frozen, g_display_close;
 volatile int game_cutscene_fps, game_model_lod;
@@ -213,7 +221,8 @@ int main(int argc, char **argv) {
     assert(gfx_ini_refresh(old) == 0 && !strcmp(slurp(old), s));      /* once */
     spit(old, "; my note\r\n"); { FILE *f = fopen(old, "ab"); fputs(s, f); fclose(f); }
     assert(gfx_ini_refresh(old) == 0 && strstr(slurp(old), "my note"));      /* the player's comment stays while the defaults stand */
-    s = slurp("config/graphics.ini");                      /* the shipped file: LF, and nothing to do at a new install's first start */
+    s = slurp("config/graphics.ini");                      /* exercise LF even when Git checks the shipped file out as CRLF */
+    { char *dst = s; for (const char *src = s; *src; src++) if (*src != '\r') *dst++ = *src; *dst = 0; }
     assert(!strstr(s, "\r\n"));
     spit(old, s);
     assert(gfx_ini_refresh(old) == 0);

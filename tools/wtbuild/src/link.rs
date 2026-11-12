@@ -76,6 +76,7 @@ const HOST_SOURCES: &[&str] = &[
     "diag.c",
     "diag_writer.c",
     "diag_replay.c",
+    "temporal_source_capture.c",
 ];
 const POSIX_SOURCES: &[&str] = &["plat_posix.c", "plat_audio_sdl.c"];
 /// the player's tables, compiled on their PC into game.so: the dump's sdk data, the lifted sdk code, and the values

@@ -626,13 +626,14 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
             uint32_t attr = 0;
             int16_t rx16 = 0, ry16 = 0, lx16 = 0, ly16 = 0;
             long long since = g_rec_poll >= g_anchor_poll ? g_rec_poll - g_anchor_poll : 0;
-            diag_replay_poll(sess, g_anchor, (uint32_t)since, &buttons, &lx16, &ly16, &rx16, &ry16, &attr);
+            diag_replay_poll(sess, sess->next_global_poll, g_anchor, (uint32_t)since, &buttons, &lx16, &ly16, &rx16, &ry16, &attr);
             lx = lx16; ly = ly16; rx = rx16; ry = ry16;
             wired = (attr & DIAG_REPLAY_ATTR_WIRED) != 0;
             if (sess->is_eof) {
-                diag_writer_write_outcome("completed", "REPLAY_FINISHED", "cp_combat_end");
+                diag_writer_write_outcome("completed", "REPLAY_FINISHED", NULL);
                 report_and_exit(0);
             }
+            if (sess->next_global_poll < UINT64_MAX) sess->next_global_poll++;
         }
         prompts_used = 0; /* Controller origin, never keyboard prompts */
     } else {

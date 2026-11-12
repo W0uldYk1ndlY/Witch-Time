@@ -185,6 +185,9 @@ pub fn validate_metric_semantics(m: &DiagnosticMeasurement) -> Result<(), String
 /// Enforces that heavy capture collectors (e.g. perfetto_trace, deep_memory_dump, raw_frame_capture)
 /// stay strictly out of lightweight performance samples.
 pub fn validate_profile_collectors(profile: &DiagnosticProfileRequest) -> Result<(), String> {
+    if profile.collectors.iter().any(|c| c == "temporal_source_capture") && profile.profile_name != "validation" {
+        return Err("temporal_source_capture requires the validation profile".into());
+    }
     if profile.profile_name == "lightweight" {
         for collector in &profile.collectors {
             if collector == "perfetto_trace"
@@ -574,6 +577,8 @@ pub struct IncidentRecovery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticTreatments {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<DiagnosticTemporalTreatment>,
     /// Experimental software write-watch backend (WT_WW_SOFT). Default: false (off).
     #[serde(default)]
     pub ww_soft: bool,
@@ -594,6 +599,7 @@ pub struct DiagnosticTreatments {
 impl DiagnosticTreatments {
     pub fn all_off() -> Self {
         Self {
+            temporal: None,
             ww_soft: false,
             vk_writerwait: false,
             vk_loadclear: false,
@@ -604,6 +610,135 @@ impl DiagnosticTreatments {
     pub fn are_candidates_off(&self) -> bool {
         !self.ww_soft && !self.vk_writerwait && !self.vk_loadclear
     }
+}
+
+/// Explicit comparison axis; cohorts must never be pooled together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalCohort { EqualOutput, EqualRender }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SgsrVariant {
+    #[serde(rename = "2_pass_fs")] Fragment,
+    #[serde(rename = "2_pass_cs")] Compute2,
+    #[serde(rename = "3_pass_cs")] Compute3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TemporalSelection {
+    Native {}, Fsr3 {}, Fsr3Quality {}, Fsr3Balanced {}, Fsr3Performance {}, Fsr3UltraPerformance {},
+    Sgsr2 { variant: SgsrVariant },
+    Sgsr2Quality { variant: SgsrVariant },
+    Sgsr2Performance { variant: SgsrVariant },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticTemporalTreatment {
+    pub selection: TemporalSelection,
+    pub cohort: TemporalCohort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalSupport { Unavailable, CameraOnly, PartialDynamic, FullDynamic }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalOutputGrid { #[default] Unknown, Reconstruction }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuComponentState { Completed, Pending, Unsupported, Failed, Wrapped, CapacityOverflow, LostTail, NoResults }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticGpuComponent {
+    pub frame: i64,
+    pub pass_id: u32,
+    pub submission_serial: i64,
+    pub state: GpuComponentState,
+    pub duration_ns: Option<i64>,
+}
+
+impl DiagnosticGpuComponent {
+    /// Decode event 36 without pooling passes, submissions, or unavailable samples.
+    pub fn from_payload(p: [i64; 4]) -> Result<Self, &'static str> {
+        use GpuComponentState::*;
+        if p[0] < 0 || p[2] < 0 { return Err("invalid GPU component frame/submission identity"); }
+        let state = match p[1] as u32 {
+            0 => Completed, 1 => Pending, 2 => Unsupported, 3 => Failed,
+            4 => Wrapped, 5 => CapacityOverflow, 6 => LostTail, 7 => NoResults,
+            _ => return Err("unknown GPU component state"),
+        };
+        let measured = matches!(state, Completed | Wrapped);
+        if (measured && p[3] < 0) || (!measured && p[3] != -1) {
+            return Err("GPU component duration/state mismatch");
+        }
+        Ok(Self { frame: p[0], pass_id: ((p[1] as u64) >> 32) as u32,
+            submission_serial: p[2], state, duration_ns: if measured { Some(p[3]) } else { None } })
+    }
+
+    /// Ordered event-36 payloads. One terminal replaces pending; never sum repeats.
+    pub fn reduce_payloads(payloads: impl IntoIterator<Item = [i64; 4]>, healthy_stopped: bool)
+        -> Result<Vec<Self>, &'static str> {
+        let mut observations: BTreeMap<(i64, u32, i64), Self> = BTreeMap::new();
+        for payload in payloads {
+            let observation = Self::from_payload(payload)?;
+            let key = (observation.frame, observation.pass_id, observation.submission_serial);
+            if let Some(previous) = observations.get(&key) {
+                if previous.state != GpuComponentState::Pending {
+                    return Err("duplicate or out-of-order GPU component observation");
+                }
+            } else if observations.len() >= 1_048_576 {
+                return Err("GPU component observation budget exceeded");
+            }
+            observations.insert(key, observation);
+        }
+        if healthy_stopped {
+            for observation in observations.values_mut() {
+                if observation.state == GpuComponentState::Pending {
+                    observation.state = GpuComponentState::LostTail;
+                    observation.duration_ns = None;
+                }
+            }
+        }
+        Ok(observations.into_values().collect())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticGpuComponentReport {
+    /// Transport/reduction integrity, not a claim that every duration is available.
+    pub healthy: bool,
+    pub reason: Option<String>,
+    pub observations: Vec<DiagnosticGpuComponent>,
+}
+
+/// Actual renderer evidence, not inferred from a request or menu selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticTemporalObservation {
+    pub effective: TemporalSelection,
+    pub scene_dimensions: [u32; 2],
+    pub output_dimensions: [u32; 2],
+    #[serde(default)]
+    pub output_grid: TemporalOutputGrid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_dimensions: Option<[u32; 2]>,
+    pub motion: TemporalSupport,
+    pub reactive_consumed: bool,
+    pub supported: bool,
+    pub initialized: bool,
+    pub dispatched: bool,
+    pub consumed: bool,
+    pub skipped: bool,
+    pub reset_reason: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub scene_frame: u64,
+    pub surface_generation: u32,
+    /// Hash of all non-temporal graphics settings, including LOD/mips and dynamic resolution.
+    pub unrelated_settings_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -666,7 +801,42 @@ pub struct DiagnosticProfileRequest {
     pub storage_budget_bytes: u64,
     pub incident_disk_reserve_bytes: u64,
     pub max_incidents: u32,
+    #[serde(deserialize_with = "deserialize_diagnostic_collectors")]
     pub collectors: Vec<String>,
+}
+
+fn deserialize_diagnostic_collectors<'de, D: serde::Deserializer<'de>>(deserializer: D)
+    -> Result<Vec<String>, D::Error> {
+    let collectors = Vec::<String>::deserialize(deserializer)?;
+    let allowed = ["events", "metrics", "frame_timing", "gpu_timing", "live_status",
+        "atrace", "perfetto", "simpleperf", "perfetto_trace", "deep_memory_dump",
+        "raw_frame_capture", "gpu_components", "temporal_source_capture"];
+    for (index, collector) in collectors.iter().enumerate() {
+        if !allowed.contains(&collector.as_str()) || collectors[..index].contains(collector) {
+            return Err(serde::de::Error::custom(format!("unsupported or duplicate diagnostic collector: {}", collector)));
+        }
+    }
+    Ok(collectors)
+}
+
+#[cfg(test)]
+mod temporal_source_collector_tests {
+    use super::*;
+    #[test]
+    fn temporal_source_is_explicit_and_validation_only() {
+        let value = serde_json::json!({"profile_name":"validation", "memory_budget_bytes":1048576,
+            "storage_budget_bytes":1048576, "incident_disk_reserve_bytes":0, "max_incidents":0,
+            "collectors":["temporal_source_capture"]});
+        let mut profile: DiagnosticProfileRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(validate_profile_collectors(&profile).is_ok());
+        for name in ["lightweight", "standard", "component_timing"] {
+            profile.profile_name = name.into();
+            assert!(validate_profile_collectors(&profile).is_err());
+        }
+        let mut duplicate = value;
+        duplicate["collectors"] = serde_json::json!(["temporal_source_capture", "temporal_source_capture"]);
+        assert!(serde_json::from_value::<DiagnosticProfileRequest>(duplicate).is_err());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -698,6 +868,10 @@ pub struct DiagnosticPolicyRef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_components: Option<DiagnosticGpuComponentReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_observation: Option<DiagnosticTemporalObservation>,
     pub schema_version: SchemaVersion,
     pub run_id: String,
     pub diagnostic_version: String,

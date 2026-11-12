@@ -44,6 +44,7 @@
 #include <windows.h>
 #include "nvn_gl_api.h"
 #include "runtime.h"
+#include "temporal_source_capture.h"
 #include "hostrt.h"
 #include "mx_translate.h"
 #include "gfx_options.h"
@@ -2281,6 +2282,7 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
     cb->len += need;
     m->op = op; m->size = (uint32_t)need;
     for (int i = 0; i < 7; i++) m->a[i] = c->x[i + 1];
+    if (wt_tsc_enabled()) wt_tsc_command(A0);
     return m;
 }
 
@@ -4676,7 +4678,7 @@ static void cmd_is_recording(Ctx *c) { RET(cb_get(A0)->recording); }
  * recording, submission, fence, sync wait, window acquire and present, with the guest thread name and the guest return address. */
 int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(DWORD tid);
 #define L1T(...) do { if (display_l1_trace()) { char l1b_[240]; snprintf(l1b_, sizeof l1b_, __VA_ARGS__); printf("l1-trace: %+8.2f %-26s lr %09llx %s%c", display_l1_ms(), guest_thread_name_of(GetCurrentThreadId()) ? guest_thread_name_of(GetCurrentThreadId()) : "?", (unsigned long long)c->x[30], l1b_, 10); } } while (0)
-static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; }
+static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; if (wt_tsc_enabled()) wt_tsc_begin(A0); }
 static void cmd_end(Ctx *c) {
     CmdBuf *cb = cb_get(A0);
     cb->ctrl_used += 32; cb->rec_ctrl += 32;
@@ -4688,7 +4690,11 @@ static void cmd_end(Ctx *c) {
 static void cmd_call(Ctx *c) { uint64_t src = A2; int n = (int)A1; Cmd *m = rec(c, OP_CALL, (size_t)n * 8); memcpy(BLOB(m), P(src), (size_t)n * 8); }
 static void cmd_texpool(Ctx *c) { rec(c, OP_TEXPOOL, 0)->a[0] = (uint64_t)(uintptr_t)hobj(A1, K_TPOOL); }
 static void cmd_smppool(Ctx *c) { rec(c, OP_SMPPOOL, 0)->a[0] = (uint64_t)(uintptr_t)hobj(A1, K_SPOOL); }
-static void cmd_program(Ctx *c) { rec(c, OP_PROGRAM, 0)->a[0] = (uint64_t)(uintptr_t)hobj(A1, K_PROG); }
+static void cmd_program(Ctx *c) {
+    Cmd *m = rec(c, OP_PROGRAM, 0); Prog *p = hobj(A1, K_PROG);
+    m->a[0] = (uint64_t)(uintptr_t)p;
+    if (wt_tsc_enabled()) wt_tsc_program(A0, A1, p ? (uint64_t)p->serial : 0, A2);
+}
 static void rec_ranges(Ctx *c, uint32_t op, int single) {      /* (cmdbuf, stage, index, address, size) or (cmdbuf, stage, first, count, ranges) */
     int n = single ? 1 : (int)A3;
     uint64_t src = A4, addr = A3, size = A4;
@@ -4696,6 +4702,7 @@ static void rec_ranges(Ctx *c, uint32_t op, int single) {      /* (cmdbuf, stage
     if (single) { m->a[2] = 1; memcpy(BLOB(m), &addr, 8); memcpy(BLOB(m) + 8, &size, 8); }
     else if (src) memcpy(BLOB(m), P(src), (size_t)n * 16);
     else memset(BLOB(m), 0, (size_t)n * 16);
+    if (op == OP_UBO && wt_tsc_enabled()) wt_tsc_ranges(A0, (uint32_t)A1, (uint32_t)A2, (uint32_t)n, (const uint64_t *)BLOB(m));
 }
 static void cmd_ubo(Ctx *c) { rec_ranges(c, OP_UBO, 1); }
 static void cmd_ubos(Ctx *c) { rec_ranges(c, OP_UBO, 0); }

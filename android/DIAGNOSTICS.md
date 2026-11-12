@@ -1,5 +1,140 @@
 # Android Diagnostic Artifact Contract
 
+## Temporal extension (typed launch, renderer events and host-derived observation)
+
+`treatments.temporal` is optional; omission retains all older request/default
+semantics. Example:
+```json
+{"selection":{"mode":"sgsr2_quality","variant":"2_pass_cs"},"cohort":"equal_output"}
+```
+Modes are `native`, `fsr3`, `fsr3_quality`, `fsr3_balanced`,
+`fsr3_performance`, `fsr3_ultra_performance`, `sgsr2`, `sgsr2_quality`,
+`sgsr2_performance`. Only SGSR modes require/accept `variant`:
+`2_pass_fs`, `2_pass_cs`, `3_pass_cs`. Unknown fields/values and numeric modes
+are rejected. Cohorts are only `equal_output` and `equal_render`.
+
+Full manifests may carry `temporal_observation`, containing actual effective
+selection, `scene_dimensions`, `output_dimensions`, `output_grid`, optional
+`surface_dimensions`, motion support
+(`unavailable`, `camera_only`, `partial_dynamic`, `full_dynamic`),
+`reactive_consumed`, separate supported/initialized/dispatched/consumed/skipped
+booleans, nullable reset/fallback reasons, scene frame, surface generation, and
+`unrelated_settings_hash`. Derive the exact per-axis ratio from output/scene
+dimensions; never substitute the menu's requested ratio. `output_grid` must be
+`reconstruction` for comparison: these are backend reconstruction/tonemap extents,
+including odd game dynamic-resolution levels, **not** the Android surface or
+requested display resolution. Omitted grid provenance defaults to `unknown` and
+is ineligible. `surface_dimensions` comes only from an existing surface-generation
+event matching the scene generation; missing surface evidence stays absent.
+The settings hash must
+cover non-temporal settings including LOD/mips, FXAA/grain and game dynamic
+resolution. It must not hash the intentionally varied temporal selection.
+Build provenance reuses the existing APK/runtime/shim/main/SDK identity fields;
+all must be present for temporal comparisons, but candidate hashes may differ.
+
+Both sides must declare the same cohort and acknowledge their exact treatments.
+Actual reconstruction output extents and unrelated settings must match in either cohort;
+equal-render additionally requires identical actual scene extents. Missing
+observations, zero dimensions, unsupported execution, unconsumed temporal
+output, skipped scenes and fallback are ineligible, not successful treatment.
+One observation cannot certify an entire varying-resolution route: route-level
+coverage must still be established from scene events and correctness gates.
+Configured display resolutions remain matched and acknowledged separately by
+the existing settings contract. They are not required or inferred to equal
+reconstruction dimensions. Reported surface extent/availability must also match
+across the pair; reconstruction equality cannot certify physical display output.
+
+Recorder hook `diag_hook_temporal(const diag_temporal_observation_t *)` writes
+four existing fixed-size scalar records on the graphics producer:
+
+* 32: scene frame, selected mode, effective mode, variant.
+* 33: scene frame, packed scene extent, packed output extent, surface generation.
+  Extents pack unsigned width in the upper 32 bits, height in the lower 32 bits.
+* 34: scene frame, flags, motion support, reset reason.
+* 35: scene frame, fallback reason, failing pass, compiler/Vulkan error code.
+
+Mode IDs preserve native=0/FSR=1..5/SGSR=6..8; variants are -1 unavailable,
+0 fragment, 1 compute-two-pass, 2 compute-three-pass. Motion IDs are 0 unavailable,
+1 camera-only, 2 partial dynamic, 3 full dynamic. Flags are bits 0 supported,
+1 initialized, 2 dispatched, 3 consumed, 4 skipped, 5 reactive **consumed**.
+Backend reset/fallback/pass IDs require a documented renderer mapping; 0 means
+none and -1 unknown. Sequence gaps or missing members make that observation
+incomplete; do not reconstruct a successful scene from records of other frames.
+
+Native bootstrap validates the typed selectors after verifying the request
+digest, including duplicate/unknown selector keys and invalid modes/variants.
+Only its fixed mode/variant allowlist maps to existing `WT_UPSCALER` and
+`WT_SGSR_VARIANT` selectors before `dlopen`; no arbitrary environment names or
+values are accepted. `native` maps to the existing `off` selector. Omission
+does not override older launch defaults. Invalid selections reject with
+`INVALID_TEMPORAL_TREATMENT` before acknowledgement/loading.
+
+The shared renderer now calls the hook at the frame-ending decision before its
+scene evidence is cleared. FSR uses its existing matching output-bound and
+recorded-tonemap-draw evidence. SGSR requires the exact routed temporal output
+view plus a recorded tonemap consumer draw; its passes and scene-copy alone do
+not establish consumption. Consequently a same-size SGSR copy-only route remains
+explicitly unconsumed. Motion stays camera-only and reactive consumption false.
+These observations establish recorded commands, **not GPU completion**.
+Native scene dimensions come from the observed scene image; native output
+dimensions require a matching scene sample and recorded tonemap draw into the
+actual target. They are not inferred to equal scene dimensions, including under
+game dynamic resolution. No such consumer leaves output dimensions unavailable.
+Reset reason 1 means the backend's actual reset decision; individual cut/resize
+causes are not inferred. Fallback reasons 1..9 are respectively no eligible
+scene, unsupported capability/variant, setup failure, no dispatch, no recorded
+matching temporal-output consumer, baseline fallback, camera conflict, input mismatch, unsupported output.
+The skipped flag means the selected treatment lacks a complete proven output
+chain; it does not negate a separately reported dispatch (for example SGSR's
+copy-only route with unavailable direct-output consumption evidence).
+Unavailable pass/error IDs remain -1; backend logs retain their precise errors.
+
+After collecting committed chunks, the existing Android runner may add the
+latest complete `temporal_observation` to its **local** manifest. It requires
+all four events in order with matching scene/producer/thread/generation,
+valid modes/flags, healthy matching-run **stopped** writer status, zero recorder
+drops, emitted/written record equality and all reported chunks. Chunk
+headers/counts/endpoints and complete rows are checked against final record totals.
+Missing/malformed events, partial tail, collector gaps or lost samples leave
+the observation absent. The app's receipt-only acknowledgement never supplies
+effective temporal state. Existing manifest fields are preserved; no request
+values are promoted into effective treatments, identities or unrelated settings.
+
+**Remaining acceptance limitation:** this transport does not establish the
+unrelated-settings hash or absent build/fixture identities. The derived
+observation deliberately leaves `unrelated_settings_hash` empty, so such a run
+remains comparison-ineligible until those independent facts are established.
+It is a latest-scene snapshot, not a complete route-coverage certificate.
+
+### Component GPU timing transport
+
+Event 36 preserves legacy IDs and carries `frame` in p0, pass ID in p1's upper
+32 bits, state in p1's lower 32 bits, submission serial in p2 and duration ns in
+p3. `diag_stream_gpu_component(frame, pass_id, serial, gpu_ns, state)` emits only
+valid completed/wrapped durations; unavailable time is -1, never zero. The host
+`DiagnosticGpuComponent::from_payload` maps unavailable duration to JSON null,
+retaining pass/frame/submission identity without summing it into utilization.
+
+States: completed=0, pending=1, unsupported=2, failed=3, wrapped=4,
+capacity-overflow=5, lost-tail=6, no-results=7. Invalid completed duration becomes
+failed/unavailable. Production markers publish one pending record per unique
+non-gap component at submission, keyed by `(frame, pass_id, submission_serial)`.
+Collection publishes one aggregate terminal: every interval must be valid before
+their durations can be summed; measured zero remains valid. Capacity overflow
+invalidates the component instead of publishing a partial sum.
+
+The runner validates complete global sequence coverage across all producer chunks
+and a healthy stopped writer before enrichment. Finals replace pending once;
+duplicate terminals or malformed states make the report unhealthy. Pending-only
+records at that validated EOF become `lost_tail` with null duration offline. No
+shutdown-thread GPU inspection, extra wait, or post-shutdown event is required.
+
+The fixed opt-in `gpu_components` collector enables both `WT_VK_GPUTIME` and
+`WT_VK_PASSTIME`; legacy `gpu_timing` retains whole-span timing with pass timing
+disabled. Component profiling adds distinct overhead and requires its own A/A
+calibration: lightweight recorder calibration does not qualify it. Summed marked
+cost excludes gaps and is neither whole-frame duration nor GPU utilization.
+
 This document specifies the versioned JSON artifact contract and validation rules for automated, reproducible Android diagnostic sessions, offline analysis, and performance/correctness comparisons in Witch Time.
 
 The tooling implementation lives in `tools/wtbuild/src/diag/` and is verified by synthetic tests and deterministic round-trip fixtures in `tools/wtbuild/testdata/diagnostics/`.
@@ -229,8 +364,8 @@ The offline evaluation engine (`tools/wtbuild/src/diag/evaluation.rs`) computes 
 
 ### 8.1 Binary Replay Specification
 Validated input replay uses a strict binary format designed for deterministic reproduction:
-- **Header (64 bytes):** Magic `WTRP` (`0x50525457`), version `1.0`, declared `source_policy`, `mapping_policy`, `confirm_policy`, `record_count`, `total_polls`, and reserved padding.
-- **Records (32 bytes per change):**
+- **Header (68 bytes):** Magic `WTRP` (`0x50525457`), version `1.0`, declared `source_policy`, `mapping_policy`, `confirm_policy`, `record_count`, `total_polls`, and reserved padding.
+- **Records (36 bytes per change):**
   - `poll`: Strictly monotonic poll index (`poll > prev_poll`).
   - `anchor`: Screen/draw class anchor ID (`-1` if unanchored).
   - `anchor_poll`: Polls elapsed since reaching the anchor.
@@ -238,6 +373,7 @@ Validated input replay uses a strict binary format designed for deterministic re
   - `lx, ly, rx, ry`: Left and right analog stick axes in standard signed range `[-32768..32767]`.
   - `attributes`: Bitmask of connection flags (`NPAD_ATTR_CONNECTED`, `NPAD_ATTR_WIRED`).
 - **Footer (16 bytes):** EOF marker `_END` (`0x444E455F`), `record_count_check`, and checksum.
+- **Playback timing:** `total_polls` is an exclusive duration: samples are delivered at zero-based 64-bit global polls `[0, total_polls)`. Loading a replay resets its clock to zero; rebinding an existing session or changing semantic anchors does not reset it. Unanchored changes become due when `record.poll <= global_poll`; unanchored records at or beyond `total_polls` are rejected. Anchored changes retain anchor-ID/anchor-relative timing. Between changes, including the tail after the final change, the last state is held. EOF releases input on the first query at `global_poll >= total_polls`, not when the last change is consumed, so the final in-duration HID sample is delivered before completion. Empty replays return false/neutral samples and complete at their declared duration; zero duration completes immediately.
 - **Safety Ceilings:** Max file size capped at 16 MiB; max record count capped at 500,000.
 
 ### 8.2 Fixed First-Profile Restrictions

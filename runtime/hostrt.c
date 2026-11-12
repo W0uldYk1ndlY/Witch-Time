@@ -7,6 +7,7 @@
 #include "hostrt.h"
 #include "diag.h"
 #include "diag_writer.h"
+#include "temporal_source_capture.h"
 
 #define FILE_OFF 0x1000ULL
 #include "sdklift.h"               /* [Recomps#1] SDK_BASE / SDK_IMAGE_SIZE for the dispatch range below */
@@ -481,12 +482,21 @@ void os_thread_report(FILE *out);            /* os_threads.c: every thread the g
 
 void report_and_exit(int code) {
     if (diag_is_enabled()) {
+        bool quiescent = diag_seal_producers();
+        int capture_failed = 0;
+        if (wt_tsc_requested()) {
+            wt_tsc_core_loss(diag_get_total_dropped());
+            if (!quiescent) wt_tsc_core_loss(1);
+            capture_failed = wt_tsc_finish() != 0;
+        }
+        const char *reason = !quiescent ? "DIAG_PRODUCERS_NOT_QUIESCENT" : code != 0 ? "EXIT_NON_ZERO" : capture_failed ? "TEMPORAL_SOURCE_CAPTURE_INCOMPLETE" : "CLEAN_COMPLETION";
+        if (capture_failed && code == 0) code = 1;
         diag_writer_write_outcome(code == 0 ? "completed" : "failed",
-                                  code == 0 ? "CLEAN_COMPLETION" : "EXIT_NON_ZERO",
-                                  "cp_combat_end");
+                                  reason,
+                                  NULL);
         diag_writer_stop();
         diag_writer_shutdown();
-        diag_shutdown();
+        if (quiescent) diag_shutdown();
     }
     audit_exit_counts();
     print_import_summary(stdout);

@@ -99,6 +99,7 @@ static size_t g_text_sink_dropped = 0;
 /* Internal writer state */
 static diag_writer_config_t g_cfg;
 static diag_writer_state_t g_state = DIAG_WRITER_IDLE;
+static bool g_seal_failed = false;
 static uint64_t g_total_records_written = 0;
 static uint64_t g_total_bytes_written = 0;
 static uint32_t g_chunks_committed = 0;
@@ -198,6 +199,7 @@ int diag_writer_init(const diag_writer_config_t *cfg) {
     }
 
     g_state = DIAG_WRITER_ACTIVE;
+    g_seal_failed = false;
     g_total_records_written = 0;
     g_total_bytes_written = 0;
     g_chunks_committed = 0;
@@ -249,8 +251,8 @@ int diag_writer_flush_chunks(void) {
     }
 
     /* Drain available records from all active producers */
-    diag_record_t records[256];
-    size_t batch_limit = 256;
+    diag_record_t records[DIAG_RING_CAPACITY];
+    size_t batch_limit = DIAG_RING_CAPACITY;
     if (batch_limit > g_cfg.chunk_record_limit) {
         batch_limit = g_cfg.chunk_record_limit;
     }
@@ -525,6 +527,8 @@ int diag_writer_write_status(void) {
 
 int diag_writer_write_outcome(const char *outcome, const char *reason, const char *last_checkpoint) {
     if (g_state == DIAG_WRITER_IDLE) return -1;
+    bool incomplete = g_seal_failed || (reason && !strcmp(reason, "DIAG_PRODUCERS_NOT_QUIESCENT"));
+    if (incomplete) g_seal_failed = true;
     char tmp_path[320];
     char final_path[320];
     snprintf(tmp_path, sizeof(tmp_path), "%s/outcome.json.tmp", g_cfg.output_dir);
@@ -546,11 +550,11 @@ int diag_writer_write_outcome(const char *outcome, const char *reason, const cha
                "    \"termination_origin\": \"process\"\n"
                "  },\n"
                "  \"last_confirmed_checkpoint\": %s%s%s,\n"
-               "  \"covered_segments\": [\"boot\", \"continue_menu\", \"shibuya_intro\", \"shibuya_fight\"],\n"
+               "  \"covered_segments\": [],\n"
                "  \"checkpoints\": [],\n"
                "  \"correctness_assertions\": [],\n"
                "  \"storage_exhausted\": false,\n"
-               "  \"incomplete_recovery\": false\n"
+               "  \"incomplete_recovery\": %s\n"
                "}\n",
             g_cfg.run_id,
             outcome ? outcome : "completed",
@@ -560,7 +564,8 @@ int diag_writer_write_outcome(const char *outcome, const char *reason, const cha
             (outcome && !strcmp(outcome, "completed")) ? 0 : 1,
             last_checkpoint ? "\"" : "",
             last_checkpoint ? last_checkpoint : "null",
-            last_checkpoint ? "\"" : "");
+            last_checkpoint ? "\"" : "",
+            incomplete ? "true" : "false");
 
     fflush(f);
     fclose(f);
@@ -863,22 +868,35 @@ int diag_writer_record_recovery(uint32_t incident_id,
 }
 
 void diag_writer_stop(void) {
+    if (g_state == DIAG_WRITER_IDLE) return;
+    if (!diag_seal_producers()) g_seal_failed = true;
     if (g_thread_active) {
         g_thread_running = 0;
         wt_thread_close(g_flusher_thread);
         g_thread_active = false;
     }
 
-    /* Drain all pending records */
-    diag_writer_flush_chunks();
-    g_state = DIAG_WRITER_STOPPED;
+    /* Bound final work even when a timed-out admitted producer is still active. */
+    size_t batch_limit = g_cfg.chunk_record_limit;
+    if (batch_limit > DIAG_RING_CAPACITY) batch_limit = DIAG_RING_CAPACITY;
+    if (batch_limit > 0) {
+        size_t passes = (DIAG_RING_CAPACITY - 2 + batch_limit) / batch_limit;
+        for (size_t i = 0; i < passes; i++) {
+            uint64_t before = g_total_records_written;
+            if (diag_writer_flush_chunks() != 0 ||
+                g_total_records_written == before ||
+                g_state == DIAG_WRITER_EXHAUSTED) break;
+        }
+    }
+    if (g_seal_failed || g_state == DIAG_WRITER_ERROR) g_state = DIAG_WRITER_ERROR;
+    else g_state = DIAG_WRITER_STOPPED;
     diag_writer_write_status();
 }
 
 void diag_writer_shutdown(void) {
     diag_writer_stop();
     diag_close_crash_channel();
-    g_state = DIAG_WRITER_IDLE;
+    if (g_state != DIAG_WRITER_ERROR) g_state = DIAG_WRITER_IDLE;
 }
 
 void diag_writer_get_stats(diag_writer_stats_t *out_stats) {

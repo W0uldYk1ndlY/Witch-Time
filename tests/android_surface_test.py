@@ -41,6 +41,10 @@ static struct {
 } V;
 static int g_sc_src, calls, sleeps, create_ok, closed;
 static int permanent_failure, native_available = 1, generation;
+static int64_t g_diag_surface_gen;
+static void diag_hook_surface_gen(int64_t value, int64_t width, int64_t height, int64_t format) {
+    assert(value == g_diag_surface_gen && width == 1280 && height == 720); (void)format;
+}
 typedef uint64_t Uint64;
 static Uint64 ticks;
 #define SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER "native-window"
@@ -114,7 +118,7 @@ int main(void) {
     create_result = VK_ERROR_OUT_OF_DATE_KHR;
     assert(!swapchain_create()); assert(!V.swapchain);
     create_result = VK_SUCCESS;
-    assert(swapchain_create()); assert(V.swapchain); assert(V.image_count == 2);
+    assert(swapchain_create()); assert(V.swapchain); assert(V.image_count == 2); assert(g_diag_surface_gen == 1);
     return 0;
 }
 ''')

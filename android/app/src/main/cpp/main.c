@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "diag_bootstrap.h"
+#include "temporal_source_capture.h"
 
 static int fail(const char *message) {
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "%s", message);
@@ -16,6 +17,14 @@ static int fail(const char *message) {
 }
 
 int SDL_main(int argc, char **argv) {
+    /* Serialize a concurrent ordinary launch against the separate export-only Activity. */
+    void *export_library = dlopen("libsave_export.so", RTLD_NOW | RTLD_NOLOAD);
+    if (export_library) {
+        int (*exporting)(void) = (int (*)(void))dlsym(export_library, "wt_save_export_in_progress");
+        int blocked = !exporting || exporting();
+        dlclose(export_library);
+        if (blocked) return fail("Committed save export is active; game startup refused.");
+    }
     SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
     const char *root = SDL_GetAndroidExternalStoragePath();
     if (!root || chdir(root)) return fail("Cannot open the app's private external files directory.");
@@ -23,6 +32,7 @@ int SDL_main(int argc, char **argv) {
     char run_id[DIAG_BOOTSTRAP_MAX_RUN_ID_LEN + 4] = {0};
     char digest[DIAG_BOOTSTRAP_SHA256_HEX_LEN + 4] = {0};
     int diag_mode = 0;
+    char run_dir[256] = {0};
 
     int parse_res = diag_bootstrap_parse_args(argc, argv, run_id, sizeof(run_id), digest, sizeof(digest));
     if (parse_res > 0) {
@@ -39,7 +49,6 @@ int SDL_main(int argc, char **argv) {
 #if !defined(_WIN32)
         umask(0000);
 #endif
-        char run_dir[256];
         snprintf(run_dir, sizeof(run_dir), "diagnostics/%s", run_id);
 
         char err_reason[128] = {0};
@@ -50,6 +59,8 @@ int SDL_main(int argc, char **argv) {
         }
 
         /* Startup ordering: write startup acknowledgement before runtime dlopen */
+        if (diag_bootstrap_save_export_requested())
+            return fail("Save export requires SaveExportActivity; game startup refused.");
         if (diag_bootstrap_write_acknowledgement(run_dir, run_id, digest) != DIAG_BOOTSTRAP_OK) {
             diag_bootstrap_write_outcome_rejection(run_dir, run_id, "ACKNOWLEDGEMENT_WRITE_FAILED", "Failed to write manifest.json");
             return fail("Cannot write startup acknowledgement.");
@@ -93,6 +104,24 @@ int SDL_main(int argc, char **argv) {
     if (!runtime) return fail(dlerror());
     int (*run)(int, char **) = (int (*)(int, char **))dlsym(runtime, "display_android_run");
     if (!run) return fail("libwitchtime.so does not export display_android_run.");
+    int (*capture_finish)(void) = NULL;
+    if (diag_mode && diag_bootstrap_temporal_source_requested()) {
+        int (*capture_start)(const char *, int, WtTscBind) =
+            (int (*)(const char *, int, WtTscBind))dlsym(runtime, "wt_tsc_start");
+        capture_finish = (int (*)(void))dlsym(runtime, "wt_tsc_finish");
+        WtTscBind bind = (WtTscBind)dlsym(runtime, "game_temporal_source_bind");
+        if (!capture_start || !capture_finish || capture_start(run_dir, 1, bind) != 0) {
+            if (capture_finish) capture_finish();
+            diag_bootstrap_write_outcome_rejection(run_dir, run_id, "TEMPORAL_SOURCE_CAPTURE_UNAVAILABLE", "Missing export or capture initialization failed");
+            return fail("Temporal source capture unavailable; stopping before runtime execution.");
+        }
+    }
     char *game_argv[] = { "witch-time", "targets/exefs/main.elf", NULL };
-    return run(2, game_argv);
+    int result = run(2, game_argv);
+    /* Covers early runtime returns before core diagnostics initialized; normal teardown is already finalized. */
+    if (capture_finish && capture_finish() != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Temporal source capture incomplete.");
+        if (result == 0) result = 1;
+    }
+    return result;
 }

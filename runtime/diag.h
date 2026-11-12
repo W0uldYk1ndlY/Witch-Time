@@ -44,6 +44,11 @@ typedef enum diag_event_type {
     DIAG_EV_MEM_STREAM = 29,
     DIAG_EV_MEM_ALLOC = 30,
     DIAG_EV_AUDIO_COUNTERS = 31,
+    DIAG_EV_TEMPORAL_SELECTION = 32,
+    DIAG_EV_TEMPORAL_DIMENSIONS = 33,
+    DIAG_EV_TEMPORAL_STATE = 34,
+    DIAG_EV_TEMPORAL_FAILURE = 35,
+    DIAG_EV_GPU_COMPONENT = 36,
     DIAG_EV_CUSTOM = 99,
 } diag_event_type_t;
 
@@ -124,13 +129,20 @@ typedef struct diag_producer_stats {
 bool diag_is_enabled(void);
 int  diag_init(const char *run_id);
 void diag_shutdown(void);
+/* Close admissions; wait at most 50 ms for accepted emitters/registrations.
+ * True proves final drain is stable. False means capture is unavailable;
+ * rings remain valid for late completion. Failure is sticky until init.
+ * No re-init with live producers. */
+bool diag_seal_producers(void);
 uint64_t diag_time_ns(void);
 
-/* Producer registration */
+/* Explicit producer slots are caller-owned SPSC; coordinate retirement/reuse
+ * with the sole producer and consumer before unregistering/re-registering. */
 int  diag_register_producer(const char *name);
 void diag_unregister_producer(int producer_id);
 
-/* Producer emit API (non-blocking, lock-free, zero allocation, no-op if disabled) */
+/* Producer emit API (non-blocking, lock-free, zero allocation, no-op if disabled).
+ * An invalid id while enabled counts one total drop (e.g. registration failure). */
 void diag_emit(int producer_id, uint32_t type, int64_t p0, int64_t p1, int64_t p2, int64_t p3);
 
 /* Consumer drain API (used by background chunk writer) */
@@ -139,6 +151,10 @@ bool   diag_get_producer_stats(int producer_id, diag_producer_stats_t *out_stats
 uint64_t diag_get_total_emitted(void);
 uint64_t diag_get_total_dropped(void);
 
+/* Hooks use one lazy TLS slot per actual calling thread, shared across event
+ * domains. At most 16 lifetime hook/explicit producer slots per session; hook
+ * slots are never recycled. Exhaustion counts drops, with no shared fallback.
+ * Init invalidates TLS ids/failures; requires no live producers from old session. */
 /* Graphics pipeline instrumentation hooks (no-op when disabled) */
 void diag_hook_render_end(int64_t frame, int64_t draws, int64_t skipped, int64_t clears);
 void diag_hook_gpu_submit(int64_t slot, int64_t serial, int64_t flushes, int64_t cmd_count);
@@ -147,6 +163,54 @@ void diag_hook_present_queued(int64_t frame, int64_t image_index, int64_t target
 void diag_hook_present_called(int64_t frame, int64_t image_index, int64_t result_code, int64_t is_progress);
 void diag_hook_present_discard(int64_t frame, int64_t image_index, int64_t reason, int64_t surface_gen);
 void diag_hook_surface_gen(int64_t generation, int64_t width, int64_t height, int64_t format);
+
+/* Scene-aligned evidence only. Modes: native=0, legacy FSR=1..5, SGSR=6..8;
+ * variant: unavailable=-1, 2-pass-fs=0, 2-pass-cs=1, 3-pass-cs=2.
+ * Reason/pass ids belong to the backend contract; 0 means none, -1 unknown. */
+#define DIAG_TEMPORAL_SUPPORTED   (1u << 0)
+#define DIAG_TEMPORAL_INITIALIZED (1u << 1)
+#define DIAG_TEMPORAL_DISPATCHED  (1u << 2)
+#define DIAG_TEMPORAL_CONSUMED    (1u << 3)
+#define DIAG_TEMPORAL_SKIPPED     (1u << 4) /* no fully proven output treatment; dispatch may still be recorded */
+#define DIAG_TEMPORAL_REACTIVE    (1u << 5) /* consumed, not merely generated */
+typedef struct diag_temporal_observation {
+    uint64_t scene_frame;
+    int32_t selected_mode, effective_mode, variant;
+    uint32_t scene_width, scene_height, output_width, output_height;
+    uint32_t surface_generation, flags;
+    int32_t motion_support; /* unavailable=0, camera-only=1, partial=2, full=3 */
+    int32_t reset_reason, fallback_reason, failing_pass, error_code;
+} diag_temporal_observation_t;
+void diag_hook_temporal(const diag_temporal_observation_t *observation);
+
+enum { DIAG_TEMPORAL_NO_SCENE = 1, DIAG_TEMPORAL_UNSUPPORTED = 2,
+       DIAG_TEMPORAL_SETUP_FAILED = 3, DIAG_TEMPORAL_NO_DISPATCH = 4,
+       DIAG_TEMPORAL_NO_CONSUMER = 5, DIAG_TEMPORAL_FALLBACK = 6,
+       DIAG_TEMPORAL_CAMERA_CONFLICT = 7, DIAG_TEMPORAL_INPUT_MISMATCH = 8,
+       DIAG_TEMPORAL_OUTPUT_UNSUPPORTED = 9 };
+/* Shared production decision, also tested without Vulkan. Consumed means a
+ * matching output binding AND recorded consumer draw, not GPU completion. */
+static inline void diag_temporal_decide(diag_temporal_observation_t *o, int latched_mode,
+                                        int eligible, int bound, int consumer_recorded) {
+    o->effective_mode = 0;
+    o->flags &= ~(DIAG_TEMPORAL_CONSUMED | DIAG_TEMPORAL_SKIPPED);
+    if (!latched_mode) return;
+    if (!o->fallback_reason) {
+        if (!eligible) o->fallback_reason = DIAG_TEMPORAL_NO_SCENE;
+        else if (!(o->flags & DIAG_TEMPORAL_SUPPORTED)) o->fallback_reason = DIAG_TEMPORAL_UNSUPPORTED;
+        else if (!(o->flags & DIAG_TEMPORAL_INITIALIZED)) o->fallback_reason = DIAG_TEMPORAL_SETUP_FAILED;
+        else if (!(o->flags & DIAG_TEMPORAL_DISPATCHED)) o->fallback_reason = DIAG_TEMPORAL_NO_DISPATCH;
+        else if (!bound || !consumer_recorded) o->fallback_reason = DIAG_TEMPORAL_NO_CONSUMER;
+    }
+    if (o->fallback_reason) o->flags |= DIAG_TEMPORAL_SKIPPED;
+    else { o->flags |= DIAG_TEMPORAL_CONSUMED; o->effective_mode = latched_mode; }
+}
+
+/* State: completed=0, pending=1, unsupported=2, failed=3, wrapped=4,
+ * capacity-overflow=5, lost-tail=6, no-results=7. Only 0/4 carry measured ns.
+ * pass id upper 32 bits and state lower 32 bits share p1; p2 is submission serial. */
+void diag_stream_gpu_component(int64_t frame, uint32_t pass_id, int64_t serial,
+                               int64_t gpu_ns, uint32_t state);
 
 /* Optimization instrumentation hooks */
 void diag_hook_opt_ww(int64_t backend, int64_t faults, int64_t rearms, int64_t queries);

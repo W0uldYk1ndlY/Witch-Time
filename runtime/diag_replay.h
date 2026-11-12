@@ -59,7 +59,7 @@ typedef enum diag_replay_confirm_policy {
 
 #pragma pack(push, 1)
 
-/* 64-byte file header */
+/* 68-byte file header */
 typedef struct diag_replay_header {
     uint32_t magic;               /* DIAG_REPLAY_MAGIC */
     uint16_t version_major;       /* 1 */
@@ -68,13 +68,13 @@ typedef struct diag_replay_header {
     uint32_t mapping_policy;      /* diag_replay_mapping_policy_t */
     uint32_t confirm_policy;      /* diag_replay_confirm_policy_t */
     uint32_t record_count;        /* Number of records */
-    uint64_t total_polls;         /* Total polls represented */
+    uint64_t total_polls;         /* Exclusive zero-based playback duration */
     uint32_t flags;               /* Reserved flags */
     uint32_t crc32;               /* Optional CRC32 */
-    uint8_t  reserved[28];        /* Zeroed padding to 64 bytes */
+    uint8_t  reserved[28];        /* Zeroed padding */
 } diag_replay_header_t;
 
-/* 32-byte fixed-size record */
+/* 36-byte fixed-size record */
 typedef struct diag_replay_record {
     uint64_t poll;                /* Strictly monotonic poll sequence */
     int32_t  anchor;              /* Anchor class (-1 if none) */
@@ -121,6 +121,7 @@ typedef struct diag_replay_session {
     diag_replay_record_t *records;
     size_t record_count;
     size_t current_pos;
+    uint64_t next_global_poll;    /* HID playback clock; zeroed on load */
     bool is_loaded;
     bool has_failed;
     bool is_cancelled;
@@ -139,8 +140,10 @@ diag_replay_error_t diag_replay_load(const char *path,
 /* Free allocated session resources */
 void diag_replay_free(diag_replay_session_t *session);
 
-/* Query input for current poll and anchor. Returns true if valid replay sample provided */
+/* Zero-based global_poll is independent of anchor_poll; total_polls is exclusive.
+ * Returns true if valid replay sample provided. */
 bool diag_replay_poll(diag_replay_session_t *session,
+                      uint64_t global_poll,
                       int anchor,
                       uint32_t anchor_poll,
                       uint64_t *out_buttons,

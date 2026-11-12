@@ -1,6 +1,7 @@
 /* SGSR fragment backend. Included after nvn_vk_fsr.c in the Vulkan translation unit. */
 #include "sgsr2_params.h"
 #include "sgsr2_vertex.h"
+#include "upscale_motion.h"
 
 static const char k_sgsr_convert[] = {
 #embed "third_party/sgsr2/glsl_2_pass_fs/sgsr2_convert.fs"
@@ -32,6 +33,7 @@ static char *sgsr_fragment_source(const char *upstream) {
     const char *prefix = "#version 450\n#define REQUEST_NDC_Y_UP 1\n"
         "#define texelFetch(s,p,l) texelFetch(s,clamp(p,ivec2(0),textureSize(s,l)-ivec2(1)),l)\n";
     fsr_put(&text, prefix, strlen(prefix));
+    fsr_put(&text, WT_UPSCALE_MOTION_GLSL, strlen(WT_UPSCALE_MOTION_GLSL));
     p++;
     const char *position = strstr(p, "vec3 Position = vec3(ScreenPos,");
     /* HDR variance squares exceed mediump range well before FP16 color storage does. */
@@ -39,7 +41,7 @@ static char *sgsr_fragment_source(const char *upstream) {
         const char *next = strstr(p, "mediump");
         if (position && (!next || position < next)) {
             fsr_put(&text, p, (size_t)(position - p));
-            const char *unjitter = "ScreenPos -= vec2(2.0 * params.jitterOffset.x * params.renderSizeRcp.x, -2.0 * params.jitterOffset.y * params.renderSizeRcp.y);\n";
+            const char *unjitter = "ScreenPos = wtMotionUnjitterNdc(ScreenPos, params.jitterOffset, params.renderSizeRcp);\n";
             fsr_put(&text, unjitter, strlen(unjitter)); p = position; position = NULL; continue;
         }
         if (!next) { fsr_put(&text, p, strlen(p)); break; }
@@ -273,12 +275,15 @@ static void sgsr_pass(int pass, FImg *target, const VkDescriptorBufferInfo *ubo,
     rendering.layerCount = rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &color;
     VkViewport viewport = {0, 0, (float)vt->w, (float)vt->h, 0, 1};
     VkRect2D scissor = {{0, 0}, {(uint32_t)vt->w, (uint32_t)vt->h}};
+    pt_begin(PT_SGSR_FS_BASE + pass, target->vt->w, target->vt->h);
     vkCmdBeginRendering(R.cmd, &rendering);
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, SG.pipe[pass]);
     vkCmdSetViewport(R.cmd, 0, 1, &viewport); vkCmdSetScissor(R.cmd, 0, 1, &scissor);
     vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, SG.pl[pass], 0, (uint32_t)count, writes);
     vkCmdDraw(R.cmd, 3, 1, 0, 0);
+    g_pt_internal_draws++;
     vkCmdEndRendering(R.cmd);
+    pt_end();
     R.pipe_bound = NULL; R.dyn_dirty = R.dyn3_dirty = 1; dsh_forget();
     vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
@@ -389,7 +394,9 @@ static void sgsr_run(Tex *color, Tex *depth, int effect) {
     blit.srcSubresource.layerCount = blit.dstSubresource.layerCount = 1;
     blit.srcOffsets[1].x = ow; blit.srcOffsets[1].y = oh; blit.srcOffsets[1].z = 1;
     blit.dstOffsets[1].x = w; blit.dstOffsets[1].y = h; blit.dstOffsets[1].z = 1;
+    pt_begin(PT_COPY_CONVERT, w, h);
     vkCmdBlitImage(R.cmd, result->img, result->layout, vc->img, vc->layout, 1, &blit, ow == w && oh == h ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    pt_end();
     vt_layout(result, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); vt_layout(vc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     SG.history = output; SG.have_history = 1;
     memcpy(SG.previous_vp, vp, sizeof vp); memcpy(SG.previous_position, position, sizeof position); memcpy(SG.previous_forward, forward, sizeof forward);
@@ -397,6 +404,7 @@ static void sgsr_run(Tex *color, Tex *depth, int effect) {
     memcpy(SG.previous_projection, camera + 16, sizeof SG.previous_projection);
     U.col = color; U.output_larger = ow != w || oh != h; U.ran = U.frame;
     U.surface_generation = g_diag_surface_gen; U.have_surface = 1;
+    upscale_diag_dispatched(0);
     game_fsr_w = w; game_fsr_h = h; game_fsr_phases = (int)(8.0 * ow / w * ow / w + 0.5);
 }
 
@@ -404,6 +412,7 @@ static void sgsr_present(void) {
     int selected = g_rs_mode >= 6 && g_rs_mode <= 8;
     if (!selected && SG.last_mode < 6) return;
     int variant = gfx_sgsr_variant();
+    if (variant != 0) return; /* The compute backend owns its observations. */
     int state = !selected ? 0 : variant != 0 ? 1 : SG.ok < 0 ? 2 : U.ran != U.frame ? 3 : 4;
     int reset = state == 4 && SG.frame_reset;
     if (SG.observations < 32 && (!SG.observations || state != SG.last_state || g_rs_mode != SG.last_mode ||

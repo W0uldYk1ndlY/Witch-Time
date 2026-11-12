@@ -234,6 +234,16 @@ diag_replay_error_t diag_replay_load(const char *path,
     }
 
     /* Fully validated */
+    for (uint32_t i = 0; i < header.record_count; i++) {
+        if (records[i].anchor < 0 && records[i].poll >= header.total_polls) {
+            free(records);
+            out_session->has_failed = true;
+            out_session->error_code = DIAG_REPLAY_ERR_CORRUPT_RECORD;
+            snprintf(out_session->error_msg, sizeof(out_session->error_msg),
+                     "Unanchored record %u is outside playback duration", i);
+            return DIAG_REPLAY_ERR_CORRUPT_RECORD;
+        }
+    }
     out_session->header = header;
     out_session->records = records;
     out_session->record_count = header.record_count;
@@ -260,6 +270,7 @@ void diag_replay_free(diag_replay_session_t *session) {
 }
 
 bool diag_replay_poll(diag_replay_session_t *session,
+                      uint64_t global_poll,
                       int anchor,
                       uint32_t anchor_poll,
                       uint64_t *out_buttons,
@@ -268,6 +279,9 @@ bool diag_replay_poll(diag_replay_session_t *session,
                       int16_t *out_rx,
                       int16_t *out_ry,
                       uint32_t *out_attributes) {
+    if (session && session->is_loaded && !session->has_failed &&
+        global_poll >= session->header.total_polls) session->is_eof = true;
+
     /* If session failed, is not loaded, or corrupt: default to safe neutral release, never live keys */
     if (!session || !session->is_loaded || session->has_failed || session->record_count == 0) {
         if (out_buttons) *out_buttons = 0;
@@ -296,8 +310,7 @@ bool diag_replay_poll(diag_replay_session_t *session,
         bool is_due = false;
 
         if (r->anchor < 0) {
-            /* Legacy/unanchored poll alignment */
-            is_due = true;
+            is_due = r->poll <= global_poll;
         } else if (anchor > r->anchor) {
             is_due = true;
         } else if (anchor == r->anchor && anchor_poll >= r->anchor_poll) {
@@ -308,10 +321,6 @@ bool diag_replay_poll(diag_replay_session_t *session,
             break;
         }
         session->current_pos++;
-    }
-
-    if (session->current_pos >= session->record_count && session->record_count > 0) {
-        session->is_eof = true;
     }
 
     if (session->current_pos > 0) {
@@ -543,4 +552,3 @@ diag_input_policy_result_t diag_verify_input_policy(const diag_input_policy_chec
 
     return res;
 }
-

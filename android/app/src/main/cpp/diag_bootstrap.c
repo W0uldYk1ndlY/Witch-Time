@@ -269,7 +269,219 @@ static int str_contains(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
 }
 
+/* Only these typed selectors may affect renderer startup, never an environment map. */
+static const char *diag_temporal_mode;
+static const char *diag_temporal_variant;
+static int diag_collectors_present, diag_gpu_timing, diag_gpu_components;
+static int diag_temporal_source;
+static int diag_save_export;
+int diag_bootstrap_save_export_requested(void) {
+    return diag_bootstrap_is_diagnostic_variant() && diag_save_export;
+}
+int diag_bootstrap_temporal_source_requested(void) {
+    return diag_bootstrap_is_diagnostic_variant() && diag_temporal_source;
+}
+
+static const char *diag_json_space(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+/* Decode ASCII keys/selectors; other Unicode remains nonmatching, not an alias. */
+static const char *diag_json_string(const char *p, char *out, size_t cap) {
+    size_t n = 0;
+    if (*p++ != '"') return NULL;
+    while (*p && *p != '"') {
+        unsigned c = (unsigned char)*p++;
+        if (c < 32) return NULL;
+        if (c == '\\') {
+            c = (unsigned char)*p++;
+            if (!c) return NULL;
+            if (c == 'u') {
+                unsigned v = 0;
+                for (int i = 0; i < 4; i++) {
+                    unsigned h = (unsigned char)*p++;
+                    if (h >= '0' && h <= '9') h -= '0';
+                    else if (h >= 'a' && h <= 'f') h = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') h = h - 'A' + 10;
+                    else return NULL;
+                    v = (v << 4) | h;
+                }
+                c = v && v < 128 ? v : 128;
+            } else if (!strchr("\"\\/bfnrt", (int)c)) return NULL;
+            else if (c == 'b' || c == 'f' || c == 'n' || c == 'r' || c == 't') c = 128;
+        }
+        if (out && n + 1 < cap) out[n] = (char)c;
+        n++;
+    }
+    if (*p != '"' || (out && n >= cap)) return NULL;
+    if (out) out[n] = 0;
+    return p + 1;
+}
+
+static const char *diag_json_skip(const char *p, unsigned depth) {
+    p = diag_json_space(p);
+    if (depth > 32 || !*p) return NULL;
+    if (*p == '"') return diag_json_string(p, NULL, 0);
+    if (*p == '{' || *p == '[') {
+        int object = *p == '{';
+        char close = object ? '}' : ']';
+        p = diag_json_space(p + 1);
+        if (*p == close) return p + 1;
+        for (;;) {
+            if (object) {
+                p = diag_json_string(p, NULL, 0);
+                if (!p || *(p = diag_json_space(p)) != ':') return NULL;
+                p++;
+            }
+            p = diag_json_skip(p, depth + 1);
+            if (!p) return NULL;
+            p = diag_json_space(p);
+            if (*p == close) return p + 1;
+            if (*p != ',') return NULL;
+            p = diag_json_space(p + 1);
+        }
+    }
+    static const char *literals[] = {"true", "false", "null"};
+    for (unsigned i = 0; i < 3; i++) {
+        size_t n = strlen(literals[i]);
+        if (!strncmp(p, literals[i], n) && (!p[n] || strchr(",]} \t\r\n", p[n]))) return p + n;
+    }
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else {
+        if (*p < '1' || *p > '9') return NULL;
+        do { p++; } while (*p >= '0' && *p <= '9');
+    }
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return NULL;
+        do { p++; } while (*p >= '0' && *p <= '9');
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (*p < '0' || *p > '9') return NULL;
+        do { p++; } while (*p >= '0' && *p <= '9');
+    }
+    return !*p || strchr(",]} \t\r\n", *p) ? p : NULL;
+}
+
+/* Find a unique member, optionally rejecting every other key. */
+static int diag_json_member(const char *p, const char *key, const char *allowed,
+                            const char **value) {
+    *value = NULL;
+    p = diag_json_space(p);
+    if (*p++ != '{') return -1;
+    p = diag_json_space(p);
+    if (*p == '}') return 0;
+    for (;;) {
+        char name[128];
+        p = diag_json_string(p, name, sizeof(name));
+        if (!p || *(p = diag_json_space(p)) != ':') return -1;
+        if (allowed) {
+            const char *candidate = allowed;
+            while (*candidate) {
+                if (*candidate == '|') { candidate++; continue; }
+                size_t length = strcspn(candidate, "|");
+                if (strlen(name) == length && !memcmp(candidate, name, length)) break;
+                candidate += length;
+            }
+            if (!*candidate) return -1;
+        }
+        p = diag_json_space(p + 1);
+        if (!strcmp(name, key)) {
+            if (*value) return -1;
+            *value = p;
+        }
+        p = diag_json_skip(p, 0);
+        if (!p) return -1;
+        p = diag_json_space(p);
+        if (*p == '}') return *value ? 1 : 0;
+        if (*p++ != ',') return -1;
+        p = diag_json_space(p);
+    }
+}
+
+static int diag_parse_temporal(const char *json) {
+    const char *t, *s, *v, *c;
+    char mode[40], variant[24], cohort[24];
+    diag_temporal_mode = diag_temporal_variant = NULL;
+    int r = diag_json_member(json, "treatments", NULL, &t);
+    if (r <= 0) return r;
+    if (!strncmp(t, "null", 4) && strchr(",]} \t\r\n", t[4])) return 0;
+    r = diag_json_member(t, "temporal", NULL, &t);
+    if (r <= 0) return r;
+    if (!strncmp(t, "null", 4) && strchr(",]} \t\r\n", t[4])) return 0;
+    if (diag_json_member(t, "selection", "|selection|cohort|", &s) != 1 ||
+        diag_json_member(t, "cohort", "|selection|cohort|", &c) != 1 ||
+        !diag_json_string(c, cohort, sizeof(cohort)) ||
+        (strcmp(cohort, "equal_output") && strcmp(cohort, "equal_render"))) return -1;
+    if (diag_json_member(s, "mode", "|mode|variant|", &c) != 1 ||
+        !diag_json_string(c, mode, sizeof(mode))) return -1;
+    r = diag_json_member(s, "variant", "|mode|variant|", &v);
+    if (r < 0) return -1;
+    static const char *modes[] = {"native", "fsr3", "fsr3_quality", "fsr3_balanced",
+        "fsr3_performance", "fsr3_ultra_performance", "sgsr2", "sgsr2_quality", "sgsr2_performance"};
+    int i;
+    for (i = 0; i < 9 && strcmp(mode, modes[i]); i++) {}
+    if (i == 9 || (i < 6 && r != 0) || (i >= 6 && r != 1)) return -1;
+    if (i >= 6) {
+        if (!diag_json_string(v, variant, sizeof(variant))) return -1;
+        if (!strcmp(variant, "2_pass_fs")) diag_temporal_variant = "2-pass-fs";
+        else if (!strcmp(variant, "2_pass_cs")) diag_temporal_variant = "2-pass-cs";
+        else if (!strcmp(variant, "3_pass_cs")) diag_temporal_variant = "3-pass-cs";
+        else return -1;
+    }
+    diag_temporal_mode = i ? modes[i] : "off";
+    return 0;
+}
+
+static int diag_parse_collectors(const char *json) {
+    const char *profile, *p;
+    diag_collectors_present = diag_gpu_timing = diag_gpu_components = 0;
+    diag_temporal_source = 0;
+    int r = diag_json_member(json, "profile", NULL, &profile);
+    if (r <= 0) return r;
+    r = diag_json_member(profile, "collectors", NULL, &p);
+    if (r <= 0) return r;
+    if (*p++ != '[') return -1;
+    unsigned seen = 0;
+    p = diag_json_space(p);
+    while (*p != ']') {
+        char collector[64];
+        p = diag_json_string(p, collector, sizeof(collector));
+        if (!p) return -1;
+        static const char *allowed[] = {"events", "metrics", "frame_timing", "gpu_timing", "live_status",
+            "atrace", "perfetto", "simpleperf", "perfetto_trace", "deep_memory_dump", "raw_frame_capture", "gpu_components", "temporal_source_capture"};
+        unsigned i;
+        for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]) && strcmp(collector, allowed[i]); i++) {}
+        if (i == sizeof(allowed) / sizeof(allowed[0]) || (seen & (1u << i))) return -1;
+        seen |= 1u << i;
+        if (!strcmp(collector, "gpu_timing")) diag_gpu_timing = 1;
+        if (!strcmp(collector, "gpu_components")) diag_gpu_components = 1;
+        if (!strcmp(collector, "temporal_source_capture")) diag_temporal_source = 1;
+        p = diag_json_space(p);
+        if (*p == ']') break;
+        if (*p++ != ',') return -1;
+        p = diag_json_space(p);
+        if (*p == ']') return -1;
+    }
+    if (diag_temporal_source) {
+        const char *name;
+        char value[32];
+        if (diag_json_member(profile, "profile_name", NULL, &name) != 1 ||
+            !diag_json_string(name, value, sizeof value) || strcmp(value, "validation")) return -1;
+    }
+    diag_collectors_present = 1;
+    return 0;
+}
+
 int diag_bootstrap_validate_request(const char *run_dir, const char *run_id, const char *expected_digest, char *out_error_reason, size_t error_cap) {
+    diag_save_export = 0;
+    diag_temporal_source = 0;
+    diag_temporal_mode = diag_temporal_variant = NULL;
+    diag_collectors_present = diag_gpu_timing = diag_gpu_components = 0;
     if (!run_dir || !run_id || !expected_digest) {
         if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "NULL_ARGUMENT");
         return DIAG_BOOTSTRAP_ERR_INVALID_ARGS;
@@ -310,6 +522,25 @@ int diag_bootstrap_validate_request(const char *run_dir, const char *run_id, con
     size_t read_bytes = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[read_bytes] = '\0';
+
+    int result = diag_bootstrap_validate_request_data((const uint8_t *)buf, read_bytes,
+        run_id, expected_digest, out_error_reason, error_cap);
+    free(buf);
+    return result;
+}
+
+int diag_bootstrap_validate_request_data(const uint8_t *data, size_t read_bytes, const char *run_id,
+                                         const char *expected_digest, char *out_error_reason, size_t error_cap) {
+    diag_save_export = diag_temporal_source = 0;
+    diag_temporal_mode = diag_temporal_variant = NULL;
+    diag_collectors_present = diag_gpu_timing = diag_gpu_components = 0;
+    if (!data || !run_id || !expected_digest || !diag_bootstrap_validate_run_id(run_id) ||
+        !read_bytes || read_bytes > DIAG_BOOTSTRAP_MAX_REQUEST_BYTES || memchr(data, 0, read_bytes))
+        return DIAG_BOOTSTRAP_ERR_INVALID_ARGS;
+    char *buf = malloc(read_bytes + 1);
+    if (!buf) return DIAG_BOOTSTRAP_ERR_IO;
+    memcpy(buf, data, read_bytes);
+    buf[read_bytes] = 0;
 
     /* Verify request digest */
     char computed_digest[DIAG_BOOTSTRAP_SHA256_HEX_LEN + 1];
@@ -362,22 +593,64 @@ int diag_bootstrap_validate_request(const char *run_dir, const char *run_id, con
     }
 
     /* Build allowlist check: variant diagnostic, target android-arm64, native_optimization release */
-    if (!str_contains(buf, "\"variant\": \"diagnostic\"") && !str_contains(buf, "\"variant\":\"diagnostic\"")) {
-        free(buf);
-        if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "INVALID_BUILD_VARIANT");
-        return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
-    }
-    if (!str_contains(buf, "\"target\": \"android-arm64\"") && !str_contains(buf, "\"target\":\"android-arm64\"")) {
-        free(buf);
-        if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "INVALID_TARGET");
-        return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
-    }
-    if (!str_contains(buf, "\"native_optimization\": \"release\"") && !str_contains(buf, "\"native_optimization\":\"release\"")) {
-        free(buf);
-        if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "INVALID_NATIVE_OPTIMIZATION");
-        return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+    const char *build, *member;
+    int build_found = diag_json_member(buf, "build", NULL, &build);
+    static const char *build_keys[] = {"variant", "target", "native_optimization"};
+    static const char *build_values[] = {"diagnostic", "android-arm64", "release"};
+    static const char *build_errors[] = {"INVALID_BUILD_VARIANT", "INVALID_TARGET", "INVALID_NATIVE_OPTIMIZATION"};
+    for (size_t i = 0; i < 3; i++) {
+        char value[32];
+        if (build_found != 1 || diag_json_member(build, build_keys[i], NULL, &member) != 1 ||
+            !diag_json_string(member, value, sizeof(value)) || strcmp(value, build_values[i])) {
+            free(buf);
+            if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "%s", build_errors[i]);
+            return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+        }
     }
 
+    if (diag_parse_temporal(buf) != 0) {
+        diag_temporal_mode = diag_temporal_variant = NULL;
+        free(buf);
+        if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "INVALID_TEMPORAL_TREATMENT");
+        return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+    }
+    if (diag_parse_collectors(buf) != 0) {
+        diag_temporal_source = 0;
+        diag_temporal_mode = diag_temporal_variant = NULL;
+        diag_collectors_present = diag_gpu_timing = diag_gpu_components = 0;
+        free(buf);
+        if (out_error_reason && error_cap > 0) snprintf(out_error_reason, error_cap, "INVALID_DIAGNOSTIC_COLLECTOR");
+        return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+    }
+    const char *profile, *name;
+    char profile_name[64];
+    if (diag_json_member(buf, "profile", NULL, &profile) == 1 &&
+        diag_json_member(profile, "profile_name", NULL, &name) == 1 &&
+        diag_json_string(name, profile_name, sizeof profile_name) &&
+        !strcmp(profile_name, "committed_save_export")) {
+        const char *collectors, *treatment, *id, *schema;
+        char value[80];
+        const char *end = diag_json_skip(buf, 0);
+        if (!end || *diag_json_space(end) ||
+            diag_json_member(buf, "run_id", "|schema_version|run_id|build|profile|created_utc|", &id) != 1 ||
+            !diag_json_string(id, value, sizeof value) || strcmp(value, run_id) ||
+            diag_json_member(buf, "schema_version", NULL, &schema) != 1 ||
+            !diag_json_string(schema, value, sizeof value) || strcmp(value, "1.0") ||
+            diag_json_member(profile, "collectors", "|profile_name|collectors|", &collectors) != 1 ||
+            *collectors != '[' || *diag_json_space(collectors + 1) != ']' ||
+            diag_json_member(buf, "treatments", NULL, &treatment) != 0) {
+            free(buf);
+            return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+        }
+        diag_save_export = 1;
+        const char *created;
+        int created_found = diag_json_member(buf, "created_utc", NULL, &created);
+        if (created_found < 0 || (created_found && !diag_json_string(created, NULL, 0))) {
+            diag_save_export = 0;
+            free(buf);
+            return DIAG_BOOTSTRAP_ERR_INVALID_JSON;
+        }
+    }
     free(buf);
     return DIAG_BOOTSTRAP_OK;
 }
@@ -433,13 +706,26 @@ int diag_bootstrap_write_outcome_rejection(const char *run_dir, const char *run_
 }
 
 int diag_bootstrap_apply_session_environment(const char *run_dir, const char *run_id) {
-    if (!run_dir || !run_id) return -1;
+    if (!run_dir || !run_id || diag_save_export) return -1;
+    char subpath[512];
+    int trace_len = snprintf(subpath, sizeof(subpath), "%s/boot_trace.txt", run_dir);
+    if (trace_len < 0 || (size_t)trace_len >= sizeof(subpath)) return DIAG_BOOTSTRAP_ERR_INVALID_ARGS;
+    /* The runtime's relative trace default writes in the app root, outside this run. */
+    set_env_var("WT_TRACE", subpath);
+    if (diag_collectors_present) {
+        set_env_var("WT_VK_GPUTIME", diag_gpu_timing || diag_gpu_components ? "1" : "0");
+        set_env_var("WT_VK_PASSTIME", diag_gpu_components ? "1" : "0");
+    }
+    if (diag_temporal_mode) {
+        set_env_var("WT_UPSCALER", diag_temporal_mode);
+        /* Explicitly clear a stale selector even for native/FSR treatments. */
+        set_env_var("WT_SGSR_VARIANT", diag_temporal_variant ? diag_temporal_variant : "2-pass-fs");
+    }
 
 #if !defined(_WIN32)
     umask(0000);
 #endif
 
-    char subpath[512];
     make_dir(run_dir);
 
     snprintf(subpath, sizeof(subpath), "%s/userdata", run_dir);

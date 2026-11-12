@@ -4,6 +4,7 @@
  * (nncxxrt.c), so an exe works with either kind of DLL. */
 #include "game_shim.c"
 #include "scene_step.h"
+#include "temporal_source_guest.h"
 
 /* [witchtime] Bayonetta 3's lifted functions the overrides below call: weak, so the game library of another program of the
  * application (the picture book's, issue 115), which defines none of them and never calls an override, still links
