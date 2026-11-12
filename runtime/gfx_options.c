@@ -85,11 +85,6 @@ static const char *const k_default_ini =
 ";   for about two minutes once, while the shaders are translated for it.\r\n"
 "resolution_scale = 1.0\r\n"
 "\r\n"
-"; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
-";   game: each texture sampler keeps the value the game gave it. A number: at least that much on every sampler that\r\n"
-";   filters between mip levels (sharper textures at flat angles; changes the picture, costs little on any GPU).\r\n"
-"anisotropic_filtering = game\r\n"
-"\r\n"
 "; shader_wait = hold | skip      (Vulkan)\r\n"
 ";   What happens when a draw needs a shader or pipeline that is not ready yet (mostly the first time something is shown\r\n"
 ";   on this PC). hold: the frame waits for it (a late frame, a correct picture). skip: in and around a fight the draw is\r\n"
@@ -104,8 +99,8 @@ static const char *const k_default_ini =
 "\r\n"
 "; profile = custom | low\r\n"
 ";   custom: every key of this file as written. low: the set measured for a weak or integrated GPU (2026-10-12, Intel\r\n"
-";   integrated: 4.2 ms of GPU time per fight frame instead of 9.0): resolution_scale = 0.5, anisotropic_filtering = game,\r\n"
-";   vsync = clock; those three keys of the file are then not used. The log says which profile is active.\r\n"
+";   integrated: 4.2 ms of GPU time per fight frame instead of 9.0): resolution_scale = 0.5, the game's own texture\r\n"
+";   filtering, vsync = clock; those keys of the file are then not used. The log says which profile is active.\r\n"
 "profile = custom\r\n"
 "\r\n"
 "; aspect = keep | stretch      (Vulkan)\r\n"
@@ -147,11 +142,6 @@ static const char *const k_default_ini =
 ";   60: those run in its 60 fps mode, as gameplay does (timing stays real time). Movies keep their own rate.\r\n"
 "cutscene_fps = 30\r\n"
 "\r\n"
-"; texture_lod_bias = 0      (-3 .. 3; Vulkan)\r\n"
-";   0: textures as the game samples them. Below 0: finer mip levels, sharper textures in the distance (-0.5 .. -1;\r\n"
-";   lower can shimmer); added to every sampler that uses mip maps. Above 0: blurrier, a little less GPU time.\r\n"
-"texture_lod_bias = 0\r\n"
-"\r\n"
 "; model_lod = game | highest\r\n"
 ";   game: models lose detail with distance and far ones disappear, as on the console. highest: every model with detail\r\n"
 ";   levels stays at its finest and stays drawn far away; weaker GPUs may lose frame rate. Applies while the game runs.\r\n"
@@ -181,9 +171,10 @@ static const char *const k_default_ini =
 "bc7_textures = on\r\n"
 "\r\n"
 /* [Recomps#1] finding 147 */
-"; hdr = auto | off | on      (Vulkan, Windows)\r\n"
-";   auto: while Windows HDR is on for the monitor the game is on, the picture goes out as HDR (the game's colours at\r\n"
-";   the brightness below, as Windows shows other programs); otherwise as before. on: always. off: never.\r\n"
+"; hdr = auto | off | on      (Vulkan)\r\n"
+";   auto: while HDR is on for the monitor the game is on (Windows' HDR switch; on Linux a Wayland desktop with HDR on),\r\n"
+";   the picture goes out as HDR: the game's colours at the brightness below, and the bright parts of the scene (lights,\r\n"
+";   fire, the sky) up to hdr_peak. Menus, the HUD and movies stay at hdr_paper_white. on: always. off: never.\r\n"
 "hdr = auto\r\n"
 "\r\n"
 "; hdr_format = hdr10 | scrgb\r\n"
@@ -191,9 +182,16 @@ static const char *const k_default_ini =
 "hdr_format = hdr10\r\n"
 "\r\n"
 "; hdr_paper_white = auto | 80 .. 1000\r\n"
-";   How bright the game's white is with HDR on, in nits. auto: Windows' 'SDR content brightness' of that monitor\r\n"
-";   (Settings > System > Display > HDR), followed while the game runs.\r\n"
+";   How bright the game's white is with HDR on, in nits. auto: the desktop's brightness of SDR programs on that monitor\r\n"
+";   (Windows: Settings > System > Display > HDR, 'SDR content brightness'), followed while the game runs.\r\n"
 "hdr_paper_white = auto\r\n"
+"\r\n"
+"; hdr_peak = auto | 80 .. 10000\r\n"
+";   How bright the brightest parts of the scene get with HDR on, in nits: your monitor's peak brightness. The game's own\r\n"
+";   tone curve is kept up to where it starts to flatten, and from there it rises to this value instead of to white.\r\n"
+";   At or below hdr_paper_white: nothing is brighter than white, as before 2026-11. auto: what the desktop says the monitor\r\n"
+";   does (Linux), 1000 on Windows.\r\n"
+"hdr_peak = auto\r\n"
 "\r\n"
 "; hdr_gamma = 2.2 | srgb\r\n"
 ";   How the game's colours are read with HDR on. 2.2: as an SDR monitor shows them (deep blacks). srgb: as Windows\r\n"
@@ -252,6 +250,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
     o->bc7_textures = 1;                       /* #54: a graphics.ini from before the key */
+    o->aniso = 16; o->texture_lod_bias = -1.0f;      /* [witchtime] fixed at the sharpest since 2026-11-10: no keys, no menu rows (profile = low and WT_TEXTURE_LOD_BIAS still change them) */
     o->width = 1280; o->height = 720; o->scale = 1.0f; o->present = 5;      /* vsync = auto when the key is missing (track V session 14) */
 #ifdef __ANDROID__
     o->present = 0;                            /* clock pacing for mobile */
@@ -281,7 +280,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "gpu")) { if (_stricmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
         else if (!_stricmp(key, "console_mode")) o->handheld = !_stricmp(val, "handheld");
         else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
-        else if (!_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
+        else if (!_stricmp(key, "anisotropic_filtering") || !_stricmp(key, "texture_lod_bias")) { }      /* [witchtime] keys of older files: not used any more */
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
@@ -296,8 +295,8 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "hdr_format")) o->hdr_scrgb = !_stricmp(val, "scrgb");
         else if (!_stricmp(key, "hdr_paper_white")) { float v = (float)atof(val); o->hdr_paper_white = v >= 80.0f && v <= 1000.0f ? v : 0.0f; }      /* auto, or a value out of range */
         else if (!_stricmp(key, "hdr_gamma")) o->hdr_srgb = !_stricmp(val, "srgb");
+        else if (!_stricmp(key, "hdr_peak")) { float v = (float)atof(val); o->hdr_peak = v >= 80.0f && v <= 10000.0f ? v : 0.0f; }      /* [witchtime] auto, or a value out of range */
         else if (!_stricmp(key, "cutscene_fps")) o->cutscene_fps = atoi(val) == 60 ? 60 : 30;      /* [witchtime] */
-        else if (!_stricmp(key, "texture_lod_bias")) o->texture_lod_bias = (float)atof(val);      /* [witchtime] */
         else if (!_stricmp(key, "bc7_textures")) o->bc7_textures = !_stricmp(val, "on");      /* #54 */
         else if (!_stricmp(key, "pause_hint")) {}      /* [witchtime] read by pcmenu.c (pcmenu_hint) */
         else if (!_stricmp(key, "discord_presence")) {}      /* [witchtime] read by presence.c */
@@ -308,7 +307,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     if (f) fclose(f);
     if (!o->frame_rate) o->frame_rate = 60;
     if (getenv("WT_UPSCALER")) o->upscaler = upscaler_of(getenv("WT_UPSCALER"));      /* [witchtime] issue 118 */
-    {   /* [witchtime] texture_lod_bias: WT_TEXTURE_LOD_BIAS wins; -3 .. 3 */
+    {   /* [witchtime] the mip bias: -1, or WT_TEXTURE_LOD_BIAS (-3 .. 3) */
         const char *e = getenv("WT_TEXTURE_LOD_BIAS");
         if (e) o->texture_lod_bias = (float)atof(e);
         if (o->texture_lod_bias < -3.0f) o->texture_lod_bias = -3.0f;
@@ -349,9 +348,9 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
                paced ? "the game released and its pictures presented on a steady tick of" : "NOT capped (WT_PACE_120=0; B3 has no lifted limiter), not paced at", o->frame_rate);
     }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
-        o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
+        o->scale = GFX_LOW_SCALE; o->aniso = 0; o->texture_lod_bias = 0.0f; o->present = 0;
     }
-    printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
+    printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", the game's own texture filtering, vsync=clock; these keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[3] = {"windowed", "borderless", "fullscreen"}, *const k_vs[6] = {"clock", "on", "off", "mailbox", "display", "auto"};
     printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s aspect=%s%s\n", o->path,
@@ -359,7 +358,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->aspect_stretch ? "stretch" : "keep", unknown ? " (lines with an unknown key were ignored)" : "");
     {   char pw[16]; static const char *const k_hdr[3] = {"auto", "off", "on"};      /* [Recomps#1] finding 147 */
         if (o->hdr_paper_white > 0) snprintf(pw, sizeof pw, "%.0f", o->hdr_paper_white); else snprintf(pw, sizeof pw, "auto");
-        printf("graphics options: hdr=%s hdr_format=%s hdr_paper_white=%s hdr_gamma=%s\n", k_hdr[o->hdr], o->hdr_scrgb ? "scrgb" : "hdr10", pw, o->hdr_srgb ? "srgb" : "2.2"); }
+        printf("graphics options: hdr=%s hdr_format=%s hdr_paper_white=%s hdr_gamma=%s hdr_peak=%.0f (0 = auto)\n", k_hdr[o->hdr], o->hdr_scrgb ? "scrgb" : "hdr10", pw, o->hdr_srgb ? "srgb" : "2.2", o->hdr_peak); }
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 3.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 3.0: the nearest of the two is used\n", o->scale);      /* PR #8 (stephenjayakar): above 1.0 allowed (nvn_vk_draw.c RS_MAX = 2.0) */
     fflush(stdout);
@@ -536,6 +535,7 @@ int gfx_option_set(const char *key, const char *val) {
     g_opt.present = t.present; g_opt.aniso = t.aniso; g_opt.aspect_stretch = t.aspect_stretch; g_opt.cutscene_fps = t.cutscene_fps;
     g_opt.texture_lod_bias = t.texture_lod_bias; g_opt.scale = t.scale; g_opt.hud_centre = t.hud_centre;
     g_opt.model_lod_high = t.model_lod_high; g_opt.no_film_grain = t.no_film_grain; g_opt.upscaler = t.upscaler;
+    g_opt.hdr = t.hdr; g_opt.hdr_paper_white = t.hdr_paper_white; g_opt.hdr_peak = t.hdr_peak;      /* [witchtime] nvn_vk_draw.c reads them at every present */
     printf("graphics options: %s = %s written to %s\n", key, val, path);
     fflush(stdout);
     return 1;

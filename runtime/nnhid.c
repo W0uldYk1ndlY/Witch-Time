@@ -604,6 +604,7 @@ static int mouse_stick(int *ox, int *oy) {
     *ox = lx; *oy = ly;
     return 1;
 }
+static int g_used = -1;                                     /* the device player 1 used last: 0 pad, 1 keyboard / mouse, -1 none yet */
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     memset((void *)(uintptr_t)out, 0, 0x28);
     wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
@@ -648,6 +649,8 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
             if ((lx || ly) && key_for(id, 0, 24)) { lx = lx * 2 / 5; ly = ly * 2 / 5; }      /* [witchtime] WALK held: 0.4 of the travel, below the 0.5 of the stick-as-button bits */
             int mx, my;
             if (sdl_on() && (int)id == g_keyboard_player && mouse_stick(&mx, &my)) {      /* [Recomps#1] the mouse moves the camera */
+                /* #178: ignore low-speed mouse drift while the pad is in use. */
+                if (g_used == 0 && abs(mx) <= STICK_MAX / 4 && abs(my) <= STICK_MAX / 4) mx = my = 0;
                 rx += mx; ry += my;
                 if (rx > STICK_MAX) rx = STICK_MAX; if (rx < -STICK_MAX) rx = -STICK_MAX;
                 if (ry > STICK_MAX) ry = STICK_MAX; if (ry < -STICK_MAX) ry = -STICK_MAX;
@@ -687,9 +690,9 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     if (id == 0) {                                            /* [witchtime] button prompts follow the device: at once when it changes, else a few times a second */
         void prompts_tick(void);
         void menu_swap_tick(void);                            /* options_row.c */
-        static int used = -1, polls;
-        int changed = prompts_used >= 0 && prompts_used != used;
-        if (changed) { used = prompts_used; nnpad_prompts_used(used); }
+        static int polls;
+        int changed = prompts_used >= 0 && prompts_used != g_used;
+        if (changed) { g_used = prompts_used; nnpad_prompts_used(g_used); }
         if (changed || !(++polls & 15)) { prompts_tick(); menu_swap_tick(); }
     }
     if (id == 0 && !diag_input_is_synthetic_player1_enabled()) record_or_replay(&buttons, &lx, &ly);

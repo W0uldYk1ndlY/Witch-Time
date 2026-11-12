@@ -26,7 +26,7 @@ typedef struct {
     int hdr_srgb;           /* [Recomps#1] hdr_gamma = 2.2 (0: the game's values read as an SDR monitor shows them) | srgb (1: as Windows shows SDR apps) */
     int cutscene_fps;       /* [witchtime] cutscene_fps = 30 (the game's 30 fps mode on the title, in menus and cutscenes, as on the console) | 60;
                              * env WT_CUTSCENE_FPS wins; read by game_shim_eh.c h_fps_mode_set through that variable */
-    float texture_lod_bias; /* [witchtime] texture_lod_bias = 0 (the game's own) .. -3 (sharper: finer mip levels) .. +3; added to every sampler that uses
+    float texture_lod_bias; /* [witchtime] the mip bias, -1 (0 = the game's own; no key since 2026-11-10); added to every sampler that uses
                              * mip maps (nvn_vk_draw.c sampler_get); env WT_TEXTURE_LOD_BIAS wins */
     int model_lod_high;     /* [witchtime] model_lod = game (0) | highest (1); game_shim_eh.c h_model_lod through WT_MODEL_LOD */
     int no_film_grain;      /* [witchtime] film_grain = on (the game's own) | off; nvn_vk_m4.c stage_fx */
@@ -36,6 +36,7 @@ typedef struct {
                              * handed on as RECOMPS_HUD_CENTRE=1 (game_shim_eh.c h_ui_element) */
     int upscaler;           /* [witchtime] issue 118: upscaler = off (0) | fsr3 (1: FSR 3.1 as anti-aliasing, nvn_vk_fsr.c) | fsr3_quality (2) | fsr3_balanced (3)
                                | fsr3_performance (4) | fsr3_ultra_performance (5) | sgsr2 (6) | sgsr2_quality (7) | sgsr2_performance (8); WT_UPSCALER wins */
+    float hdr_peak;         /* [witchtime] hdr_peak: the scene's brightest parts in nits with HDR on (80 .. 10000); 0 = auto (nvn_vk_draw.c hdr_var) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
 int gfx_sgsr_variant(void);               /* WT_SGSR_VARIANT: 0 FS, 1 two-pass CS, 2 three-pass CS, -1 invalid */

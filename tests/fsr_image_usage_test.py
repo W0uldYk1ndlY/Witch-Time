@@ -23,7 +23,7 @@ typedef struct { int sType; void *pNext; } VkFormatProperties2;
 typedef struct { struct { int shaderStorageImageWriteWithoutFormat; } features; } VkPhysicalDeviceFeatures2;
 enum { VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 = 1, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2 = 2,
        VK_IMAGE_USAGE_SAMPLED_BIT = 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT = 2, VK_IMAGE_USAGE_TRANSFER_DST_BIT = 4,
-       VK_IMAGE_USAGE_STORAGE_BIT = 8, VK_IMAGE_TYPE_2D = 1, VK_IMAGE_TILING_OPTIMAL = 1,
+       VK_IMAGE_USAGE_STORAGE_BIT = 8, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = 16, VK_IMAGE_TYPE_2D = 1, VK_IMAGE_TILING_OPTIMAL = 1,
        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT = 1, VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT = 2,
        VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT = 4, VK_SUCCESS = 0, VK_ERROR_FORMAT_NOT_SUPPORTED = -1,
        VK_SAMPLE_COUNT_1_BIT = 1, VK_FORMAT_R16_SFLOAT = 1, VK_FORMAT_R16G16B16A16_SFLOAT = 2, VK_TRUE = 1 };
@@ -56,6 +56,8 @@ int main(void) {
     assert(observed_usage == common);
     assert(fsr_image_usage(VK_FORMAT_R16_SFLOAT, 1, 2048, 1024, 12));
     assert(observed_usage == (common | VK_IMAGE_USAGE_STORAGE_BIT));
+    assert(fsr_image_usage(VK_FORMAT_R16_SFLOAT, 3, 2048, 1024, 12));
+    assert(observed_usage == (common | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
     assert(!fsr_image_usage(VK_FORMAT_R16_SFLOAT, 1, 2049, 1024, 12));
     assert(!fsr_image_usage(VK_FORMAT_R16_SFLOAT, 1, 2048, 1025, 12));
     assert(!fsr_image_usage(VK_FORMAT_R16_SFLOAT, 1, 2048, 1024, 13));

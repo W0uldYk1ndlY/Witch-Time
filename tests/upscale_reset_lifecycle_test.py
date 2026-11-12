@@ -95,9 +95,11 @@ for file, name in [("nvn_vk_draw.c", "garbage_collect"), ("nvn_vk_draw.c", "vt_g
 code += r'''
 static VTex allocated[4*FI_N];
 static int allocations,uploads;
+static int fsr_mv_on(void) { return 1; }
 static int fsr_output_format(VkFormat f) { return f==VK_FORMAT_R16G16B16A16_SFLOAT; }
 static void fsr_img(FImg *out,VkFormat f,int w,int h,int levels,int storage) {
-    assert(allocations<4*FI_N && storage>=0 && storage<=1);
+    assert(allocations<4*FI_N && (storage==0 || storage==1 || storage==3));
+    assert((storage==3)==(out==&F.img[FI_MV]));
     VTex *v=&allocated[allocations++]; v->w=w; v->h=h; v->levels=levels; v->fmt=f;
     v->user=R.serial+1; out->vt=v;
 }

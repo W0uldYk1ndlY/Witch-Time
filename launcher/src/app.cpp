@@ -74,18 +74,22 @@ const std::vector<SettingDef>& setting_defs()
 			{{"1280x720", "1280 × 720"}, {"1600x900", "1600 × 900"}, {"1920x1080", "1920 × 1080"}, {"2560x1440", "2560 × 1440"}, {"3840x2160", "3840 × 2160"}}, 0},
 		{"vsync", "Vertical sync", "Auto locks to a 60 / 120 / 240 Hz display",
 			{{"auto", "Auto"}, {"display", "Display"}, {"clock", "Clock"}, {"off", "Off"}, {"on", "On"}, {"mailbox", "Mailbox"}}, 0},
+		// the launcher's own (config/launcher.ini; the game never reads it): App::sound
+		{"sounds", "Launcher sounds", "Soft ticks as you move through these screens", {{"on", "On"}, {"off", "Off"}}, 0, nullptr, "/launcher.ini"},
 		{"cutscene_fps", "Cutscene frame rate", "Title, menus and cutscenes; movies keep theirs", {{"30", "30 fps"}, {"60", "60 fps"}}, 0},
 		{"frame_rate", "Frame rate (experimental)", "Above 60 some effects may run fast; next start", {{"60", "60 fps"}, {"90", "90 fps"}, {"120", "120 fps"}}, 0},
 		{"resolution_scale", "Internal resolution", "What the game renders at; 900p is its own",
 			{{"0.4", "360p"}, {"0.5", "450p"}, {"0.6", "540p"}, {"0.75", "675p"}, {"0.8", "720p"}, {"1.0", "900p"}, {"1.2", "1080p"}, {"1.6", "1440p"}, {"2.0", "1800p"}, {"2.4", "2160p"}, {"3.0", "2700p"}},
 			1, "1.0"},
-		{"anisotropic_filtering", "Anisotropic filtering", "Sharper textures at flat angles", {{"game", "Game"}, {"2", "2×"}, {"4", "4×"}, {"8", "8×"}, {"16", "16×"}}, 1},
-		{"texture_lod_bias", "Texture detail", "Below 0 sharper far away, above 0 blurrier",
-			{{"-1", "–1"}, {"-0.5", "–0.5"}, {"0", "0 — game"}, {"0.5", "+0.5"}, {"1", "+1"}}, 1, "0"},
 		{"model_lod", "Model detail", "Highest keeps the finest detail at any distance", {{"game", "Game"}, {"highest", "Highest"}}, 1},
 		{"film_grain", "Film grain", "The game's moving noise; the vignette stays", {{"on", "On"}, {"off", "Off"}}, 1},
 		{"upscaler", "FSR 3.1", "Smooths edges; Quality and below upscale (experimental)",
 			{{"off", "Off"}, {"fsr3", "Native AA"}, {"fsr3_quality", "Quality"}, {"fsr3_balanced", "Balanced"}, {"fsr3_performance", "Performance"}, {"fsr3_ultra_performance", "Ultra Performance"}}, 1},
+		{"hdr", "HDR", "Auto follows the desktop's HDR; lights go above white", {{"auto", "Auto"}, {"off", "Off"}, {"on", "On"}}, 1},
+		{"hdr_paper_white", "HDR white", "The game's white with HDR on; Auto is the desktop's",
+			{{"auto", "Auto"}, {"100", "100 nits"}, {"150", "150 nits"}, {"200", "200 nits"}, {"250", "250 nits"}, {"300", "300 nits"}, {"400", "400 nits"}}, 1},
+		{"hdr_peak", "HDR peak", "Your monitor's peak brightness, for the scene's lights",
+			{{"auto", "Auto"}, {"400", "400 nits"}, {"600", "600 nits"}, {"800", "800 nits"}, {"1000", "1000 nits"}, {"1500", "1500 nits"}, {"2000", "2000 nits"}, {"4000", "4000 nits"}}, 1},
 		{"aspect", "Picture fit", "Keep the picture's shape, or fill the window", {{"keep", "Keep shape"}, {"stretch", "Stretch"}}, 1},
 		{"aspect_ratio", "Aspect ratio", "Unlocked takes the window's shape; next start", {{"16:9", "Fixed"}, {"auto", "Unlocked"}}, 1},
 		{"hud_area", "HUD layout", "Wider than 16:9: HUD at the edges, or centred", {{"screen", "Full Screen"}, {"16:9", "Centered"}}, 1},
@@ -377,10 +381,13 @@ void App::bind_model()
 	c.Bind("tab", &tab);
 	c.Bind("row_step", &row_step);
 	c.Bind("row_pitch", &row_pitch);
+	c.Bind("row_count", &row_count);
 	c.Bind("leaving", &leaving);
 	c.Bind("tex_note", &tex_note);
 	c.Bind("tex_action", &tex_action);
+	c.Bind("tex_switch", &tex_switch);
 	c.Bind("tex_remove", &tex_remove);
+	c.Bind("shortcut_note", &shortcut_note);
 	// footer hints: by the label on the button, as confirm and back in handle() go
 	c.BindFunc("glyph_ok", [this](Rml::Variant& v) { v = Rml::String(prompts == 4 ? "gen:glyph?n=enter&c=26222f" : prompts == 2 ? "gen:glyph?n=cross&c=26222f" : "gen:glyph?n=a&c=26222f"); });
 	c.BindFunc("glyph_back", [this](Rml::Variant& v) { v = Rml::String(prompts == 4 ? "gen:glyph?n=esc&c=26222f" : prompts == 2 ? "gen:glyph?n=circle&c=26222f" : "gen:glyph?n=b&c=26222f"); });
@@ -420,7 +427,16 @@ void App::bind_model()
 	c.BindEventCallback("quit", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { running = false; });
 	c.BindEventCallback("tab", [this, arg_int](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& a) { set_tab(arg_int(a, 0)); });
 	c.BindEventCallback("convert_textures", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { convert_textures(); });
+	c.BindEventCallback("switch_textures", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { switch_textures(); });
 	c.BindEventCallback("remove_textures", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { remove_textures(); });
+	c.BindEventCallback("create_shortcut", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+		// the release's own witch-time(.exe) at the top, which an update keeps in place; a checkout without one: this program
+		std::string top = paths.repo + "/witch-time" WT_EXE, said;
+		const char* desktop = SDL_GetUserFolder(SDL_FOLDER_DESKTOP);
+		create_shortcut(desktop ? desktop : "", is_program(top) ? top : paths.self, paths.ui + "/img/icon.png", &said);
+		shortcut_note = said;
+		model.DirtyVariable("shortcut_note");
+	});
 	c.BindEventCallback("browse", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { browse(); });
 	c.BindEventCallback("check_dump", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { check_dump(); });
 	c.BindEventCallback("toggle_move", [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
@@ -486,14 +502,29 @@ int App::run()
 	return 0;
 }
 
+// the control an element is in or is (a row around its arrows, a button), or none
+static Rml::Element* control_of(Rml::Element* e)
+{
+	while (e && e->GetComputedValues().tab_index() != Rml::Style::TabIndex::Auto)
+		e = e->GetParentNode();
+	return e;
+}
+
 void App::draw()
 {
 	ctx->Update();
+	const bool placed = want_focus;              // a screen or a tab opened: its own sound, not a move's
 	if (want_focus)
 	{
 		want_focus = false;
 		focus_first();
 		ctx->Update();
+	}
+	if (Rml::Element* f = control_of(ctx->GetFocusElement()); f != last_focus)
+	{                                            // keys, d-pad and hover all move the focus: one tick for each (issue 141)
+		if (f && !placed)
+			sound(0);
+		last_focus = f;                          // compared only, never used: the element may be gone by then
 	}
 	SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(gpu);
 	if (!cmd)
@@ -656,13 +687,8 @@ void App::handle(SDL_Event& ev)
 // the one the keys left, and the keys go on from where the mouse is. Not once the dump folder's box is in use (typed).
 void App::hover_focus()
 {
-	auto control = [](Rml::Element* e) {
-		while (e && e->GetComputedValues().tab_index() != Rml::Style::TabIndex::Auto)
-			e = e->GetParentNode();
-		return e;
-	};
-	Rml::Element* h = control(ctx->GetHoverElement());
-	Rml::Element* f = control(ctx->GetFocusElement());
+	Rml::Element* h = control_of(ctx->GetHoverElement());
+	Rml::Element* f = control_of(ctx->GetFocusElement());
 	if (h && h != f && h->IsVisible(true) && h->GetTagName() != "input" && !(typed && f && f->GetTagName() == "input"))
 		h->Focus(false);
 }
@@ -746,6 +772,8 @@ void App::go(const Rml::String& to)
 	if (to != screen && !screen.empty() && !std::getenv("WITCHTIME_SCREEN"))
 	{                                      // the screen on show leaves first (its animations); tick() opens the next one
 		next_screen = to;
+		if (!leaving)
+			sound(to == "title" ? 2 : 1);
 		if (!leaving) { leaving = true; leave_at = system->GetElapsedTime(); model.DirtyVariable("leaving"); }
 		return;
 	}
@@ -1014,10 +1042,17 @@ void App::toggle_mod(int index)
 	if (m.code)
 		mods_rebuild = true;
 	refresh_mods();
+	sound(0);
 }
 
-void App::refresh_settings()
+// bumped: the row just changed, the only one whose value nudges. RmlUi starts an element's animations again whenever a
+// data view that names them is run (its "same value?" test never passes for 'animation'), so only what changed is
+// marked dirty here: the rows' way in names tab and row_count, and those are left alone when a value changes.
+void App::refresh_settings(int bumped)
 {
+	for (int n = 0; n < 64; n++)
+		if (n != bumped)
+			bump_count[n] = 0;
 	settings.clear();
 	const auto& defs = setting_defs();
 	for (size_t n = 0; n < defs.size(); n++)
@@ -1034,11 +1069,15 @@ void App::refresh_settings()
 	// the staircase (rows 500 dp wide from 620 dp) ends 20 dp inside the 1280 dp stage, however many rows a section has.
 	// Rows that step less than the diagonal (22.6 dp a 56 dp row) close in on its rule, 40 dp from the first row's corner:
 	// they come closer together too, so the last stays 12 dp clear (Graphics' nine, the converted textures' row too)
-	const float rows = float(settings.size() + (tab == 1 ? 1 : 0)), tan22 = 0.4040f;
+	const float rows = float(settings.size() + (tab <= 1 ? 1 : 0)), tan22 = 0.4040f;   // Display: the desktop shortcut's row
 	row_step = rows > 1 ? std::min(26.f, 140.f / (rows - 1)) : 26.f;
 	row_pitch = rows > 1 ? std::clamp((row_step + 28.f / (rows - 1)) / tan22, 50.f, 56.f) : 56.f;
 	model.DirtyVariable("settings");
-	model.DirtyVariable("tab");
+	if (row_count != int(settings.size()))
+	{
+		row_count = int(settings.size());
+		model.DirtyVariable("row_count");
+	}
 	model.DirtyVariable("row_step");
 	model.DirtyVariable("row_pitch");
 
@@ -1049,9 +1088,13 @@ void App::refresh_settings()
 	const double used = folder_bytes(dir), need = TEX_NEED;
 	const double room = double(fs::space(paths.build, ec).available);
 	const bool complete = file_exists(dir + "/complete");
+	// #136: off keeps the folder (on a hard disk its reads starve the game's own loading); the game reads the key at its start
+	const bool on = ini_get(paths.config + "/graphics.ini", "", "bc7_textures", "on") == "on";
 	char note[320];
-	if (complete)
-		std::snprintf(note, sizeof note, "In use: %.1f GB in build/cache/bc7. Remove them to get the space back; the game then decodes textures as it comes to them.", used / 1e9);
+	if (complete && !on)
+		std::snprintf(note, sizeof note, "Turned off: %.1f GB kept in build/cache/bc7, and the game decodes textures as it comes to them. Turn them on for a sharper picture and less CPU work.", used / 1e9);
+	else if (complete)
+		std::snprintf(note, sizeof note, "In use: %.1f GB in build/cache/bc7. On a hard disk they can freeze cutscenes: turn them off there. Remove them to get the space back.", used / 1e9);
 	else if (room + used < need)
 		std::snprintf(note, sizeof note, "Needs about %.0f GB free on this drive, and it has %.1f GB.", need / 1e9, room / 1e9);
 	else if (used > 0)
@@ -1061,15 +1104,18 @@ void App::refresh_settings()
 	tex_note = note;
 	tex_action = !built || complete || room + used < need ? "" : used > 0 ? "CONTINUE" : "CONVERT";
 	tex_remove = used > 0;
-	for (const char* v : {"tex_note", "tex_action", "tex_remove"})
+	tex_switch = !complete ? "" : on ? "Turn off" : "Turn on";
+	for (const char* v : {"tex_note", "tex_action", "tex_remove", "tex_switch"})
 		model.DirtyVariable(v);
 }
 
 void App::set_tab(int t)
 {
 	tab = (t + 3) % 3;
+	model.DirtyVariable("tab");
 	refresh_settings();
 	want_focus = true;
+	sound(0);
 }
 
 void App::step_setting(int index, int dir)
@@ -1081,8 +1127,54 @@ void App::step_setting(int index, int dir)
 	write_setting(paths.config, d, d.options[size_t(next_option(d, read_setting(paths.config, d), dir))].first);
 	if (index < 64)                        // the value nudges the way it went (the row's animation name changes with each count)
 		bump_count[index] = (std::abs(bump_count[index]) + 1) * (dir < 0 ? -1 : 1);
-	refresh_settings();
+	refresh_settings(index);
 	prompts_read();
+	sound(0);                              // (after the write: switching the sounds on ticks, off does not)
+}
+
+// ---------------------------------------------------------------------------------------------------- sounds
+// Navigation sounds (issue 141), made here: nothing of the game's, no file. One or two sine notes that die away,
+// f2 (0: none) 60 ms after f1; 48 kHz mono.
+static std::vector<float> blip(float f1, float f2)
+{
+	const int rate = 48000, n = rate * (f2 > 0 ? 220 : 90) / 1000;
+	std::vector<float> s(static_cast<size_t>(n));
+	auto note = [](float f, float t) {           // 2 ms in (no click), then the decay
+		return t <= 0 ? 0 : 0.14f * std::sin(6.2831853f * f * t) * std::exp(-t * 45) * std::min(1.f, t * 500);
+	};
+	for (int i = 0; i < n; i++)
+		s[static_cast<size_t>(i)] = note(f1, float(i) / rate) + (f2 > 0 ? note(f2, float(i) / rate - 0.06f) : 0);
+	return s;
+}
+// which: 0 a move or a change, 1 a screen opens, 2 back to the title
+void App::sound(int which)
+{
+	if (ini_get(paths.config + "/launcher.ini", "", "sounds", "on") != "on" || sound_failed)
+		return;
+	if (!sound_stream)
+	{                                            // opened at the first sound: a launcher that only starts the game opens none
+		const SDL_AudioSpec spec = {SDL_AUDIO_F32, 1, 48000};
+		if (!SDL_InitSubSystem(SDL_INIT_AUDIO) || !(sound_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr)))
+		{
+			sound_failed = true;                 // no audio device: silent, and not tried at every move
+			return;
+		}
+		SDL_ResumeAudioStreamDevice(sound_stream);
+	}
+	static const std::vector<float> sounds[3] = {blip(1320, 0), blip(880, 1320), blip(1320, 880)};
+	const std::vector<float>& s = sounds[which];
+	SDL_ClearAudioStream(sound_stream);          // the newest replaces the last: a sweep over the menu does not pile up
+	SDL_PutAudioStreamData(sound_stream, s.data(), int(s.size() * sizeof(float)));
+	SDL_FlushAudioStream(sound_stream);
+}
+// before the game: its audio starts from the state it always did (Linux: this process; Windows: no device held behind it)
+void App::close_sound()
+{
+	if (!sound_stream)
+		return;
+	SDL_DestroyAudioStream(sound_stream);
+	sound_stream = nullptr;
+	SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
 
 void App::convert_textures()
@@ -1096,6 +1188,13 @@ void App::convert_textures()
 	else
 		build_error = start_error(paths.repo);
 	go("build");
+}
+
+void App::switch_textures()
+{
+	const std::string ini = paths.config + "/graphics.ini";
+	ini_set(ini, "", "bc7_textures", ini_get(ini, "", "bc7_textures", "on") == "on" ? "off" : "on");
+	refresh_settings();
 }
 
 void App::remove_textures()
@@ -1275,6 +1374,10 @@ void App::tick()
 		}
 		else if (built_game)
 			std::ofstream(paths.build + "/" BUILT_VERSION, std::ios::binary) << WT_VERSION;
+		else                                         // #158: made, but without the files that do not decode: wtbuild's warning
+			for (const std::string& l : runner.lines)
+				if (const size_t at = l.find("warning: "); at != std::string::npos)
+					build_error = l.substr(at + 9);
 		refresh_title();
 		if (screen == "build")
 			want_focus = true;                   // Stop is gone: the focus to Play, or Build
@@ -1358,6 +1461,7 @@ void App::play()
 			model.DirtyVariable(v);
 		return;
 	}
+	close_sound();
 	if (g.in_process)
 	{
 		release_window();

@@ -21,6 +21,7 @@ static int g_vsync_applied, g_win_applied;
 void nnhid_menu_read(uint64_t *b, int *lx, int *ly, int swap_ab) { (void)swap_ab; *b = 0; *lx = *ly = 0; }
 int nnhid_menu_key(int vk) { (void)vk; return 0; }
 int nvn_front_post_pcmenu(void) { return 1; }
+int nvn_vk_hdr_on(void) { return 0; }
 void display_vsync_apply(void) { g_vsync_applied++; }
 int display_window_apply(void) { g_win_applied++; return 1; }
 void display_mouse_want(int on) { (void)on; }
@@ -120,17 +121,16 @@ int main(int argc, char **argv) {
     g_type[1] = 2;                                         /* Viola on the game's Type C */
     menu_open("test", 0, 0);                              /* (its thread runs on with the stubs' idle input) */
     assert(g_cur[5] == 7 && !strcmp(val_name(5), "1440p"));
-    assert(g_shown[7] && g_cur[7] == 2);                   /* texture_lod_bias: not in the file, its default 0 */
-    change(7, -1, 0); assert(gfx_options()->texture_lod_bias == -0.5f && (g_work & 1) && !row_restart(7));
-    assert(!gfx_options()->model_lod_high && g_cur[8] == 0);
-    change(8, 1, 0); assert(gfx_options()->model_lod_high && game_model_lod == 2 && !row_restart(8));
+    assert(gfx_options()->aniso == 16 && gfx_options()->texture_lod_bias == -1.0f);      /* fixed: the file's anisotropic_filtering = 8 is not used */
+    assert(!gfx_options()->model_lod_high && g_cur[6] == 0);
+    change(6, 1, 0); assert(gfx_options()->model_lod_high && game_model_lod == 2 && !row_restart(6));
     assert(gfx_ini_get("model_lod", buf, sizeof buf) && !strcmp(buf, "highest"));
-    change(8, -1, 0); assert(!gfx_options()->model_lod_high && game_model_lod == 1);
-    assert(!gfx_options()->no_film_grain && g_cur[9] == 0);      /* not in the file: the game's own */
-    change(9, 1, 0); assert(gfx_options()->no_film_grain && !row_restart(9));
+    change(6, -1, 0); assert(!gfx_options()->model_lod_high && game_model_lod == 1);
+    assert(!gfx_options()->no_film_grain && g_cur[7] == 0);      /* not in the file: the game's own */
+    change(7, 1, 0); assert(gfx_options()->no_film_grain && !row_restart(7));
     assert(gfx_ini_get("film_grain", buf, sizeof buf) && !strcmp(buf, "off"));
-    change(9, -1, 0); assert(!gfx_options()->no_film_grain);
-    assert(!gfx_options()->upscaler && g_cur[10] == 0);      /* issue 118: not in the file: off */
+    change(7, -1, 0); assert(!gfx_options()->no_film_grain);
+    assert(!gfx_options()->upscaler && g_cur[8] == 0);      /* issue 118: not in the file: off */
     setenv("WT_UPSCALER", "fsr3_quality", 1);
     assert(gfx_option_set("upscaler", "sgsr2_performance") && gfx_options()->upscaler == 2);
     assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_performance"));
@@ -139,19 +139,18 @@ int main(int argc, char **argv) {
     setenv("WT_SGSR_VARIANT", "bad", 1); assert(gfx_sgsr_variant() == -1);
     setenv("WT_SGSR_VARIANT", "2-pass-cs", 1); assert(gfx_sgsr_variant() == 1);
     unsetenv("WT_SGSR_VARIANT"); assert(gfx_sgsr_variant() == 0);
-    pcmenu_take_work(); change(10, 1, 0); assert(gfx_options()->upscaler == 1 && row_restart(10) && !(g_work & 4));      /* applies when the panel closes */
+    pcmenu_take_work(); change(8, 1, 0); assert(gfx_options()->upscaler == 1 && row_restart(8) && !(g_work & 4));      /* applies when the panel closes */
     assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "fsr3"));
-    change(10, 1, 0); change(10, 1, 0); change(10, 1, 0); change(10, 1, 0); assert(gfx_options()->upscaler == 5 && !strcmp(val_name(10), "Ultra Performance"));
+    change(8, 1, 0); change(8, 1, 0); change(8, 1, 0); change(8, 1, 0); assert(gfx_options()->upscaler == 5 && !strcmp(val_name(8), "Ultra Performance"));
     assert(gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "fsr3_ultra_performance"));
-    change(10, 1, 0); assert(gfx_options()->upscaler == 6 && !strcmp(val_name(10), "SGSR Native AA"));
-    change(10, 1, 0); assert(gfx_options()->upscaler == 7 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_quality"));
-    change(10, 1, 0); assert(gfx_options()->upscaler == 8 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_performance"));
-    for (int k = 0; k < 8; k++) change(10, -1, 0);
+    change(8, 1, 0); assert(gfx_options()->upscaler == 6 && !strcmp(val_name(8), "SGSR Native AA"));
+    change(8, 1, 0); assert(gfx_options()->upscaler == 7 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_quality"));
+    change(8, 1, 0); assert(gfx_options()->upscaler == 8 && gfx_ini_get("upscaler", buf, sizeof buf) && !strcmp(buf, "sgsr2_performance"));
+    for (int k = 0; k < 8; k++) change(8, -1, 0);
     assert(!gfx_options()->upscaler);
     change(2, 1, 0); assert(gfx_options()->present == 4 && g_vsync_applied == 1 && (g_work & 2));      /* auto -> display */
     change(3, 1, 0); assert(game_cutscene_fps == 60);
     pcmenu_take_work(); change(5, 1, 0); assert(row_restart(5) && !(g_work & 4));      /* 1.6 -> 2.0: applies when the panel closes */
-    change(6, -1, 0); assert(gfx_options()->aniso == 4 && (g_work & 1));
     change(5, 1, 0); change(5, 1, 0); change(5, 1, 0); assert(g_cur[5] == 10);      /* 3.0, the last: right stops there */
     change(5, 1, 1); assert(g_cur[5] == 0); change(5, 1, 0); change(5, 1, 0); change(5, 1, 0); change(5, 1, 0); change(5, 1, 0);      /* A goes round */
     g_sel = 5; g_ver++;
@@ -197,11 +196,10 @@ int main(int argc, char **argv) {
     /* the game's Options rows (options_row.c): by key, through the same change path */
     int pending;
     pcmenu_key_set("aspect", "keep"); assert(gfx_options()->aspect_stretch == 0 && !strcmp(pcmenu_key_get("aspect", NULL), "keep"));
-    pcmenu_key_set("anisotropic_filtering", "16"); assert(gfx_options()->aniso == 16 && !strcmp(pcmenu_key_get("anisotropic_filtering", NULL), "16"));
     pcmenu_key_set("resolution_scale", "1.6"); assert(!strcmp(pcmenu_key_get("resolution_scale", &pending), "1.6") && !pending && (g_work & 4));      /* at once */
     pcmenu_key_set("resolution_scale", "2.4"); assert(!strcmp(pcmenu_key_get("resolution_scale", &pending), "2.4") && !pending && gfx_options()->scale == 2.4f);
     pcmenu_key_set("resolution_scale", "7"); assert(!strcmp(pcmenu_key_get("resolution_scale", NULL), "2.4"));      /* none of the row's */
-    s = slurp(ini); assert(strstr(s, "resolution_scale = 2.4\n") && strstr(s, "anisotropic_filtering = 16\n")); free(s);
+    s = slurp(ini); assert(strstr(s, "resolution_scale = 2.4\n") && strstr(s, "anisotropic_filtering = 8\n")); free(s);      /* an old key's line stays as it was */
     assert(!strcmp(pcmenu_key_get("no_such_key", NULL), ""));
     pcmenu_key_set("swap_confirm", "on"); assert(!strcmp(g_menu_swap, "on") && !strcmp(pcmenu_key_get("swap_confirm", NULL), "on"));      /* a key of controllers.ini */
     pcmenu_key_set("swap_confirm", "off"); assert(!strcmp(g_menu_swap, "off"));
