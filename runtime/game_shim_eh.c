@@ -778,6 +778,40 @@ void h_cam_upload(Ctx *c) {
     memcpy((void *)(uintptr_t)(rec + 0x40), m, sizeof m);
     if (ext) memcpy((void *)(uintptr_t)(rec + 0x1b0), m, sizeof m);
 }
+/* [witchtime] motion vectors: which slot held an object's bone palette last frame. f_7100d17d44(object x0, buffer table x1,
+ * mesh part x2 = {u16 *bones, int count}) writes the part's palette (3 x 4 floats a bone, x [object + 0x40] instances) into
+ * constant buffer 14's slot: buffer = *(x1 + [object + 0x88] * 0x18), slot = buffer[+0x30] + buffer[+0x38] * index, the index
+ * at +0x68 (+0x6c when [+0x18] is not 0) going 0, 1, 2 with each write; returns 1 when it wrote. The table's entry is one of
+ * two buffers in turn, each with its own index, so a part's palette goes through six slots and nothing in the buffers says
+ * which one was last frame's. While FSR runs (game_fsr_w) each write is noted here by object and part, and the pair (this
+ * slot, the slot of the write before) goes to the runtime (nvn_vk_fsr.c fsr_mv_last). An older write needs no check here: the
+ * runtime has only the bytes of the slots drawn in the last frame, and a part's slots are its own. Three job threads call it
+ * at once: one lock.
+ * shortcut: both tables are direct mapped, so two parts of one hash lose a pair (the camera's motion is used); 65,536
+ * entries for the few hundred parts of a frame. */
+typedef struct { volatile uint64_t dst, prev; } GameMvPair;
+__declspec(dllexport) GameMvPair game_mv_pairs[1 << 16];      /* by the slot's address (mv_hash) */
+B3_FN void f_7100d17d44(Ctx *c);
+static uint32_t mv_hash(uint64_t a, uint64_t b) { uint64_t h = (a ^ (b << 1) ^ (b >> 7)) * 0x9e3779b97f4a7c15ull; return (uint32_t)(h >> 48); }
+void h_palette_upload(Ctx *c) {
+    uint64_t obj = c->x[0], tab = c->x[1], part = c->x[2], buf = 0, base = 0, stride = 0;
+    int32_t ent = 0; uint32_t alt = 0, idx = 0;
+    if (game_fsr_w > 0) { memcpy(&ent, (void *)(uintptr_t)(obj + 0x88), 4); memcpy(&buf, (void *)(uintptr_t)(tab + (uint64_t)((int64_t)ent * 0x18)), 8); }
+    if (buf) { memcpy(&alt, (void *)(uintptr_t)(buf + 0x18), 4); memcpy(&idx, (void *)(uintptr_t)(buf + (alt ? 0x6c : 0x68)), 4); memcpy(&base, (void *)(uintptr_t)(buf + 0x30), 8); memcpy(&stride, (void *)(uintptr_t)(buf + 0x38), 8); }
+    f_7100d17d44(c);
+    if (!buf || (uint32_t)c->x[0] != 1 || !base) return;
+    static struct { uint64_t obj, part, dst; } last[1 << 16];
+    static char lock;
+    uint64_t dst = base + stride * (uint64_t)(int64_t)(int32_t)idx, prev = 0;
+    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) {}
+    {   __typeof__(last[0]) *l = &last[mv_hash(obj, part)];
+        if (l->obj == obj && l->part == part) prev = l->dst;
+        l->obj = obj; l->part = part; l->dst = dst;
+        GameMvPair *p = &game_mv_pairs[mv_hash(dst, 0)];
+        p->dst = 0; p->prev = prev; p->dst = dst;      /* (the runtime reads dst, prev, dst) */
+    }
+    __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+}
 /* f_7100c0ef04(layout x0, state out x1, element w2, time s0): one element of a UI layout (a .uid of ui/*.dat: elements of 0x1b4
  * bytes from layout + [layout + 0xc]) at this frame: its base position (+0, +4), turn, scale and colours into out + 0x10 ..,
  * then its animation tracks; one caller, 0x7100c12340, every frame. The layouts are in a 1280x720 space around the
@@ -916,4 +950,130 @@ void h_ui_element(Ctx *c) {
     float extra = (720.0f * a - 1280.0f) * 0.5f;
     x += x0 > 0.0f ? extra : -extra;
     memcpy((void *)(uintptr_t)(out + 0x10), &x, 4);
+}
+
+/* [witchtime] The Options screen's fifth tab, "PC Settings" (docs/RE_NOTES.md section 8, "The fifth tab"). The game has four
+ * categories in about 30 places, so it keeps four: the fifth tab is category 3 (Screen Display) with another row list.
+ * - the strip's layout (option0011.uid) gets an eighth element, a fifth anchor like the other four, and the five 160 apart
+ * - each strip gets a fifth tab object in the page of runtime/options_row.c, which also has the strip's methods call it
+ * - the tab select, which every change of category calls just after storing it, counts five positions and stores 3 for 3 and 4
+ * - the list build takes the row list of the position */
+#define OPTX        0x7105a00000ull                       /* runtime/options_row.c OPTX_BASE */
+#define OPT_SLOT(i) (OPTX + 0x900 + 0xc0ull * (i))        /* four of them: +0 the strip, +0x10 its fifth tab (0xb0 bytes) */
+#define OPT_LIST(k) (OPTX + 0xc00 + 0x80ull * (k))        /* u32 count and row numbers: 0 Screen Display with the PC rows (four tabs), 1 the game's Screen Display, 2 PC Settings */
+#define OPT_PC_LABEL 0x1a9a646fu                          /* crc32("menu_option_list_pc_settings") & 0x7fffffff */
+__declspec(dllexport) volatile int game_opt_five;         /* 0 four tabs; 1 five wanted (options_row.c: its rows have their text); 2 and the layout has the fifth anchor */
+static struct { int at; uint32_t cursor[2]; } opt_state[4];      /* by slot: the position 0 .. 4, and the cursors of Screen Display and PC Settings */
+B3_FN void f_7100c0f6d0(Ctx *c);      /* (w0 a layout group, w1 a number) -> the .uid file; one caller, the layout's set-up 0x7100c10c14 */
+B3_FN void f_7100aa4c64(Ctx *c);      /* the tab strip's constructor */
+B3_FN void f_7100aa4de4(Ctx *c);      /* and destructor */
+B3_FN void f_7100aa5718(Ctx *c);      /* (x0 strip, w1 tab, w2 at once) select */
+B3_FN void f_7100aa6148(Ctx *c);      /* (x0 tab, w1 message) the tab's label */
+B3_FN void f_7100a32390(Ctx *c);      /* (x0 screen) the list build */
+B3_FN void f_7100b27ea4(Ctx *c);      /* a widget's constructor */
+B3_FN void f_7100b2866c(Ctx *c);      /* and destructor */
+B3_FN void f_7100c1525c(Ctx *c);      /* (x0 a widget's layout, w1 animation, w2 6 = at its end, s0 -1.0) play */
+static int opt_slot(uint64_t strip) {
+    for (int i = 0; game_opt_five && i < 4; i++) if (rd64(OPT_SLOT(i)) == strip) return i;
+    return -1;
+}
+/* The file read is not changed: the copy has the elements (0x1b4 bytes each, x at +0, the number at +0x48) and the table of
+ * numbers again at its end, where the header now points. Only the known file is taken. */
+void h_ui_file(Ctx *c) {
+    static _Alignas(16) uint8_t five[0x121c + 8 * 0x1b4 + 8 * 8];
+    static const uint32_t head[6] = {7, 7, 5, 0x30, 0x10a4, 0x10dc};
+    static const float x[8] = {0, -415, 455, -300, -140, 20, 180, 340};      /* the L and R pictures, the five tabs (the game: -380, 380, -250, -80, 80, 250) */
+    uint32_t number = (uint32_t)c->x[1];
+    f_7100c0f6d0(c);
+    const uint8_t *file = (const uint8_t *)(uintptr_t)c->x[0];
+    if (!game_opt_five || number != 0x11 || !file || memcmp(file, head, sizeof head)) return;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 0x121c; i++) h = (h ^ file[i]) * 0x100000001b3ull;
+    if (h != 0x4d453533ae09e664ull) {
+        static int told;
+        if (!told++) printf("options tabs: option0011.uid is not the file known: four tabs, the PC rows stay on Screen Display\n");
+        return;
+    }
+    if (game_opt_five == 1) {
+        uint8_t *el = five + 0x121c;
+        uint32_t *map = (uint32_t *)(el + 8 * 0x1b4);
+        memcpy(five, file, 0x121c);
+        memcpy(el, file + 0x30, 7 * 0x1b4);
+        memcpy(el + 7 * 0x1b4, file + 0x30 + 6 * 0x1b4, 0x1b4);
+        *(uint32_t *)(el + 7 * 0x1b4 + 0x48) = 7;
+        for (int i = 1; i < 8; i++) memcpy(el + i * 0x1b4, &x[i], 4);
+        for (uint32_t i = 0; i < 7; i++) { map[2 * i] = i + 1; map[2 * i + 1] = i + 1; }      /* {number, element}, by number */
+        map[14] = 0x63; map[15] = 0;
+        ((uint32_t *)five)[0] = ((uint32_t *)five)[1] = 8;
+        ((uint32_t *)five)[3] = 0x121c;
+        ((uint32_t *)five)[4] = 0x121c + 8 * 0x1b4;
+        game_opt_five = 2;
+    }
+    c->x[0] = (uint64_t)(uintptr_t)five;
+}
+void h_tabs_ctor(Ctx *c) {
+    uint64_t strip = c->x[0];
+    f_7100aa4c64(c);
+    for (int i = 0; game_opt_five && i < 4; i++) if (!rd64(OPT_SLOT(i))) {
+        uint64_t tab = OPT_SLOT(i) + 0x10;
+        c->x[0] = tab; f_7100b27ea4(c);
+        memcpy((void *)(uintptr_t)(tab + 0x38), (void *)(uintptr_t)(strip + 0xa0 + 0x38), 0xb0 - 0x38);      /* as the constructor leaves the four: method tables and constants */
+        wr64(tab, rd64(strip + 0xa0));
+        wr64(OPT_SLOT(i), strip);
+        memset(&opt_state[i], 0, sizeof opt_state[i]);
+        break;
+    }
+    c->x[0] = strip;
+}
+static void opt_unlink(uint64_t node) {      /* {next, previous, list}, as the destructor does for each tab */
+    uint64_t list = rd64(node + 0x10);
+    if (!list) return;
+    wr64(rd64(node) + 0x10, rd64(node + 8));
+    wr64(rd64(node + 8) + 8, rd64(node));
+    wr64(node, 0); wr64(node + 8, 0); wr64(node + 0x10, 0);
+    wr32(list + 0x18, rd32(list + 0x18) - 1);
+}
+void h_tabs_dtor(Ctx *c) {
+    uint64_t strip = c->x[0];
+    int s = opt_slot(strip);
+    if (s >= 0) {
+        uint64_t tab = OPT_SLOT(s) + 0x10;
+        wr64(tab + 0x70, rd64(0x71024aa2d0ull) + 0x10); opt_unlink(tab + 0x80);
+        wr64(tab + 0x48, rd64(0x71024aa2d8ull) + 0x10); opt_unlink(tab + 0x58);
+        c->x[0] = tab; f_7100b2866c(c);
+        wr64(OPT_SLOT(s), 0);
+        c->x[0] = strip;
+    }
+    f_7100aa4de4(c);
+}
+void h_tabs_select(Ctx *c) {
+    uint64_t strip = c->x[0], screen = strip - 0x1d0, cursor = screen + 0x40e0 + 4 * 3;
+    int to = (int)(uint32_t)c->x[1], at_once = (uint32_t)c->x[2] != 0, s = game_opt_five == 2 ? opt_slot(strip) : -1;
+    if (s < 0 || to < 0 || to > 3) { f_7100aa5718(c); return; }
+    int was = opt_state[s].at, step = (to - (was == 4 ? 3 : was)) & 3;
+    int at = at_once ? to : step == 1 ? (was + 1) % 5 : step == 3 ? (was + 4) % 5 : to;      /* the screen's entry, R, L */
+    if (at_once) opt_state[s].cursor[0] = opt_state[s].cursor[1] = 0;      /* the screen opens at Controller with its cursors at the top (0x7100a2f938) */
+    else if (was >= 3 && at != was) opt_state[s].cursor[was - 3] = rd32(cursor);
+    if (!at_once && at >= 3 && at != was) wr32(cursor, opt_state[s].cursor[at - 3]);
+    opt_state[s].at = at;
+    wr32(screen + 0x40c8, at == 4 ? 3 : (uint32_t)at);
+    c->x[1] = (uint32_t)at;                  /* 4: none of the four */
+    f_7100aa5718(c);
+    uint64_t tab = OPT_SLOT(s) + 0x10;
+    c->x[0] = tab; c->x[1] = OPT_PC_LABEL; c->x[2] = 1; f_7100aa6148(c);
+    if ((rd32(tab + 0xa0) & 1) != (uint32_t)(at == 4)) {      /* as the select does for each of the four */
+        c->x[0] = tab + 8; c->x[1] = at == 4 ? 4 : 5; c->x[2] = at_once ? 6 : 0;
+        c->v[0].d[0] = c->v[0].d[1] = 0; c->v[0].f[0] = -1.0f;
+        f_7100c1525c(c);
+        wr32(tab + 0xa0, rd32(tab + 0xa0) ^ 1);
+    }
+}
+void h_options_list(Ctx *c) {
+    if (game_opt_five == 2) {
+        int s = opt_slot(c->x[0] + 0x1d0);
+        const uint32_t *list = (const uint32_t *)(uintptr_t)OPT_LIST(s < 0 ? 0 : opt_state[s].at == 4 ? 2 : 1);
+        memcpy((void *)(uintptr_t)OPTX, list + 1, 4 * list[0]);
+        wr32(OPTX + 0xffc, list[0]);
+    }
+    f_7100a32390(c);
 }

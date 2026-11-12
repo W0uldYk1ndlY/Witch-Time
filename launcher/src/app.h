@@ -86,12 +86,14 @@ private:
 	std::vector<SettingRow> settings;  // the rows of the tab shown
 	int tab = 0;
 	float row_step = 26;              // dp each settings row steps right of the one above (refresh_settings)
+	int row_count = 0;                // rows of the tab shown (the rows under them come in after these)
 	float row_pitch = 56;             // dp from one settings row's top to the next one's
 	bool leaving = false;                  // a screen is on its way out (its leaving animations play); next_screen then opens
 	Rml::String next_screen; double leave_at = 0;
 	int bump_count[64] = {};               // per setting row: how many changes, signed by the last one                       // settings: 0 Display, 1 Graphics, 2 Controls
-	Rml::String tex_note, tex_action;  // settings: the converted textures (#54)
+	Rml::String tex_note, tex_action, tex_switch;  // settings: the converted textures (#54); tex_switch: "Turn off"/"Turn on" (#136)
 	bool tex_remove = false;
+	Rml::String shortcut_note = "Starts the game without the launcher";   // settings: the desktop shortcut (#143), then where it is
 
 	// work for the main loop
 	BuildRunner runner;
@@ -107,6 +109,9 @@ private:
 	std::mutex picked_mutex;
 	std::string picked_folder;         // from the folder dialog (another thread)
 	bool picked = false;
+	SDL_AudioStream* sound_stream = nullptr;   // navigation sounds (issue 141): open from the first one until Play
+	bool sound_failed = false;
+	Rml::Element* last_focus = nullptr;        // the control the focus was in at the last frame
 	int update_seen = 0;               // the update's state and line as the title last showed them
 	Rml::String update_message;
 
@@ -128,15 +133,18 @@ private:
 	void refresh_title();
 	void refresh_build();
 	void refresh_mods();
-	void refresh_settings();
+	void refresh_settings(int bumped = -1);
 	void set_tab(int t);
 	void step_setting(int index, int dir);
 	void convert_textures();
 	void remove_textures();
+	void switch_textures();
 	void toggle_mod(int index);
 	void check_dump();
 	void start_build();
 	void browse();
 	void play();
 	void release_window();
+	void sound(int which);
+	void close_sound();
 };

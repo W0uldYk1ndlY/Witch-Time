@@ -516,9 +516,22 @@ A GPU with ASTC never looks at the pack.
 The launcher's Remove, Continue, the chain after a build, and "off stays off" were run for real (a headless KWin, a stub for
 `setup`); so was a `graphics.ini` without the key. The branch for a drive without the room was not.
 
-#46: the mod's 4,442 paths each name an entry of the archive of that name, so "0 replace the game's" is expected: originals live
-in the `.pkz`. With all those paths in place, as unchanged copies of the game's files, the game opened none of them in a Shibuya
-run. That run's picture was broken, smaller parts of the tree were not; seen once, not repeated, not understood.
+#46 and #181 (2026-11-12): the mod's 4,442 paths each name an entry of the archive of that name (`romfs/ba_000/ba/ba0000.dat` =
+entry `ba/ba0000.dat` of `ba_000.pkz`): archives unpacked into folders. The game never opened such files, and its walk of
+`rom:/` at boot (0x7100cbd9c0) copies the name of every file and folder into a fixed pool it shares with the archives'
+entries: 372 blocks of 1 KB, 341 used by the game's own files. With the pool full the walk stopped after `sound_016.pkz` and
+the last 19 archives were never entered: the broken title screen of #46. Mods also replaced whole archives only, so one with
+just the changed entries hid the rest (#181). Now `nnfs.c` serves an archive the mods touch as a view: a table made in memory of
+the game's entries with the mods' put in by name, each source file mapped whole at an offset of its own; reads, the file's size
+and the pause menu's hint lookup go through it. A mod ships a partial `.pkz`, a file in a folder named like its archive, or a
+file at its entry's path (`tools/wtbuild/README.md`, "Data mods"); those single files are not listed to the game, so the pool
+stays as it was. Measured on the dump: 18,732 entry names in 72 archives, none twice; 12 archives have no `None` codec name and
+0 to 56 bytes after their table, which is why the view writes its own table instead of patching the game's.
+Run (Linux, RADV, headless): `Text_000` (394 of 394) and `core_000` (5 of 5, a 35 MB stored file in place of a Kraken one) from
+single files, half of `font_000` from a partial archive, 30 `ui/` files over the PC settings mod's whole `ui_000.pkz`: the
+title screen is the game's; with the partial archive's font textures damaged, its text turns to blocks. `WT_SDK_SELFTEST`
+checks the layers on made-up archives. **Not run**: Windows; a real mod; a level (only the title screen); a file added under a
+new name being asked for by the game (the game boots with some added).
 
 **Left**: no measurement on a Deck; Windows: `wtbuild.exe` cross-built and its tests run under Wine, not on Windows, and the MSVC
 `cargo test` of release.yml has not run. The launcher does not know the GPU, so one with ASTC (most Intel) gets a pack it never
@@ -767,6 +780,31 @@ stored. At 0.8, every fifth one: a fixed grid of zeros (the image's clear), so 6
 - **Not shown**: the reporter's squares on shadows and water (RX 560, RADV) did not come up here; a fight gives no same-pose
   pair. Not run on Windows.
 
+## Mist and fog walls at a scale (issue 126, 2026-11-12)
+
+Blocky dots and steps in the fog walls and the mist at 2160p, much less at 900p. Two things, both the game's own look drawn
+in the game's pixels while the rest of the picture is finer:
+- **The fog wall's dither.** Its fragment stages (fs6354, fs6384) fade through the 64 x 64 pattern,
+  `texelFetch(t14, uint(gl_FragCoord) & 63)`, and also read the mist's layers (520x360x3, a scaled image), so the own-pixels
+  rule of `resolve_sampler` left them at the game's pixels: dots of one game pixel on a grid of two, 2.8 and 5.6 pixels of a
+  2160p picture at the lower dynamic size (period measured: 5.626). **Fix** (`mx_translate.c`, the scaled translation's
+  `mx_tf`): a fetch from an image of the game's own size, a power of two, at exactly the game's pixel position masked by that
+  size takes the image's pixel. The scaled fragment stages are another text: key `rs3`, marker `_s4_`, so a PC at a scale or
+  another aspect ratio prepares once more (165 s here, 14 workers); 1.0 keeps its cache.
+- **The mist's cut-out.** Its patches (fs3856, fs3857, fs5332 ...) multiply their alpha by a fade against the minimum of
+  fs5548's half-size depth, kept at the game's size: steps of 2 game pixels. **Fix** (`g_rs_fine_*`, `nvn_vk_draw.c`): in a
+  pass of the 520x360 class those reads get fs5548's colour target (the same linear depth for every pixel of the scaled scene)
+  through a sampler that returns the minimum of its 2x2 texels; a plain linear read lets the depth of a dithered object
+  through as a grid. Needs samplerFilterMinmax and the format's support, else the game's image. `WT_VK_MISTDEPTH=0` off,
+  `=alt` on in odd frames.
+- **Measured** (Linux, RX 9070 XT, 2.4, the Shibuya fight by `WT_PRESS=Z,30,3`): the mist layer of two consecutive frames
+  (`WT_VK_MISTDEPTH=alt`, `WT_VK_DUMPTEX`), off and on: the cut-out's steps are gone; the fog wall's fade in the same fight
+  frame before and after: a stipple of the picture's pixels. 0 Vulkan call failures; under validation only the 10
+  unused-output warnings. 1.0: no preparation, neither path runs.
+- **Not done**: the Chapter 1 wave of the report was not reached; no Windows, NVIDIA or Intel run; FSR and other aspect
+  ratios not run with it. fs5548 still takes 2x2 texels of the scaled depth for each kept texel (the light tiles and the fog
+  march read that). A scene copy of a third by a half (453x384) stays at the game's size.
+
 ## Level of detail (2026-10-25)
 
 - **`texture_lod_bias`** (graphics.ini; `WT_TEXTURE_LOD_BIAS`; -3 .. 3, default 0 = the game's own): added to the mip
@@ -787,6 +825,13 @@ stored. At 0.8, every fifth one: a fixed grid of zeros (the image's clear), so 6
   registration, in the two tables of `0x7102632810` and `0x71026329d0`); stages are told by a hash of their code because
   12.9898 is also in glass, fog and sky. The game sets it per scene: 0 in Chapter 2 gameplay, 0.078-0.2 on frames 575-1248,
   0.5 on the opening book (2218-2423 of the test route). There the noise floor is 0.633 with grain, 0.180 without.
+- **Texture filtering fixed, every setting on the Options tab** (2026-11-10): anisotropic filtering is 16 and the mip bias -1
+  for everyone (`gfx_options.c`; `profile = low` keeps the game's own, `WT_TEXTURE_LOD_BIAS` still wins); the two keys are
+  read and ignored, and their rows are gone from the panel, the Options screen and the launcher. The Options screen's
+  "PC Settings" tab (`docs/RE_NOTES.md` section 8, "The fifth tab") has every row of the panel but Controls: window size,
+  FSR 3.1, picture fit, button prompts, Swap Confirm and face buttons are new there, and Internal Resolution has all 11
+  sizes. Texts: `text_strings.rs`, with shorter second spellings where a language's file lacks letters (Xbox is "MS" in
+  the Chinese and Korean files, which have no X). Checked on Linux in English only; the launcher was not rebuilt.
 - **Options screen rows** (`runtime/options_row.c`, rows 34 and 35): Model Detail (Default / Highest) and Film Grain (ON /
   OFF, the game's own words), after Texture Detail; their text in `tools/wtbuild/src/text_strings.rs`.
   "Highest" is spelled with each file's glyphs: Highest (en, ja, ko), Maximal, Maximum, Massimo, Максимум, Ultra (es, zh-Hans,
@@ -921,6 +966,66 @@ resolution. `fsr3` stays native AA.
   that fails at the first run applies the scales again (`rs_apply`; tried once with a forced failure: 30 images made again
   in 2.2 ms, the picture at its full size). Not run on Windows, the Deck, Android, NVIDIA
   or Intel.
+
+
+## Object motion vectors (2026-11-11; with FSR, experimental)
+
+FSR gets the camera's motion only (above). For things that move on their own, the plan: the vertex stage also gives last
+frame's position (step 1), the host keeps last frame's object constants (step 2), and a pass of our own draws the moving
+objects again into FSR's motion-vector image with a depth test for equality (step 3). `WT_FSR_MV=0` turns the pass off.
+- **What the game has** (the prologue's cutscene, 176-217 pre-pass draws, 19 vertex programs; four read as GLSL): position =
+  projection (c3[16..31]) x view (c3[0..11]) x a matrix of constant buffer 14, which is the object's palette of 3 x 4 bone
+  matrices (0x30 each, up to four weights a vertex: skinning is in the vertex stage) or, for the instanced stages, one 0x40-byte
+  record an instance. It holds this frame only: there is no previous transform anywhere, so `modelshadervelocitymap.vso` drawn
+  again would need ours too. Each object owns a ring of 3 slots (some 6) for it, its address changes every frame, and the draw
+  order changes between frames.
+- **Step 1** (`runtime/mx_translate.c`, `MxIn.prev_cbufs` / `prev_base`; `tests/mx_prev_test.c`): the chosen constant buffers
+  get a second block `mxpN[]`; the stage's code runs first on those, its `gl_Position` kept in the output `mx_prev`
+  (`MxOut.prev_loc`), then as always. A stage that reads none of them or stores gets the text as before. 400 of the game's
+  vertex stages translated that way compiled with glslang; with the option off the text is byte-identical.
+- **Step 2** (`runtime/mv_match.h`, `fsr_mv_draw` / `fsr_mv_last` in `runtime/nvn_vk_fsr.c`, `h_palette_upload` in
+  `runtime/game_shim_eh.c`; `tests/mv_match_test.c`): while FSR runs, buffer 14 of every pre-pass draw is kept for one frame
+  (100-200 KB) by its address, and the camera's c3 of the last frame (`F.c3_prev`). **The game says which slot was last
+  frame's**: `f_7100d17d44` (object x0, buffer table x1, mesh part x2; one caller, `f_7100d03668`, on three job threads)
+  writes a part's palette into slot `buffer[+0x30] + buffer[+0x38] * index` of the buffer `*(x1 + [object + 0x88] * 0x18)`.
+  That entry is one of two buffers in turn, each with its own index (+0x68, going 0, 1, 2 with each write), so a palette goes
+  through six slots and the phases differ from part to part. The override notes each write by (object, part) and exports
+  the pair (this slot, the slot of the write before) in `game_mv_pairs`; the runtime looks the pair up at the draw and
+  takes last frame's bytes of that slot. A block with no pair is looked for at its own address (a slot not written again).
+  TEST log `WT_FSR_MVLOG=1`.
+- **Measured** (Linux, RX 9070 XT, 300 s from New Game with `WT_SKIP_MOVIES=1`: title, the prologue's cutscenes and its
+  fight; 49 logged frames, 4,318 blocks): 3,827 have last frame's bytes (88.6 %; 3,497 of them changed), 454 have no pair
+  and 37 a pair whose slot was not drawn last frame. The ones without: the instanced stages' records (0x2000 blocks, copied
+  by `f_710080c698`, not hooked: they keep the camera's motion) and objects in their first frame. Validation layer: only the
+  known warning; `wtbuild smoke` and the lifter's golden (blessed: one more override) pass.
+- **Tried first, dropped**: pairing a block with last frame's nearest block of its size. Over 4,061 blocks 21 % were paired
+  at a squared distance over 100, which is no small motion, and it cost 0.26 ms a frame on the render thread.
+- **Fights** (the prologue's, frames 6000-8100 of that run): no pre-pass draw takes a vertex stream from a compute buffer
+  and no pre-pass vertex stage reads a storage buffer (0 of 10,020 logged draws). The dispatches of a fight (about 6 a frame)
+  feed one or two draws a frame outside the pre-pass (particles). So step 1's vertex variant is enough for what has depth.
+- **Step 3, the velocity pass** (`fsr_mv_prepare` / `_record` / `_commit` / `_pass` in `runtime/nvn_vk_fsr.c`, called from
+  `draw_prepare` and the two direct draw commands): a pre-pass draw whose palette has last frame's bytes and changed is noted
+  with what the command buffer holds for it (vertex input, buffers in the stream ring or kept vertex buffers, viewport,
+  culling, depth bias) and drawn again in `fsr_run`, after the camera's compute pass, into FI_MV: the stage's step-1 variant
+  with last frame's c14 and c3 at bindings 54 and 43, a fragment stage of ours (previous and current NDC without their
+  jitters, as the compute pass), depth test EQUAL on the scene's depth, no depth write. The game's draws and pipelines are
+  untouched. A stage's pipeline is made by a thread of its own at the stage's first draw (40 ms each on a cold cache, 0.3-6
+  warm); until then its draws keep the camera's vector. Not drawn: instanced and tessellated draws, vertex stages with a
+  texture or storage buffer, draws fed by compute, indirect draws, an object in its first frame, the draws noted before a
+  wrap of the stream ring.
+- **Checked** (Linux, RX 9070 XT, RADV; raw FI_MV of a frame before and after the pass, `WT_FSR_MVDUMP=<frame>`):
+  with `WT_FSR_MV_ALL=1` (TEST: unmoved objects drawn too) in a cutscene with a moving camera (vectors 0.53 px median, 4.6
+  max) the pass covered 93.3 % of the picture and 86.2 % of those pixels came out within 0.02 px of the camera's vector
+  (median difference 0.001 px): the depth test passes on whole objects, and the conventions, both jitters and last frame's
+  camera agree with the compute pass. In the prologue's fight the pass wrote 8.6 % of the picture (the character, her hair
+  and ribbons, the gun: 12 px median, 130 max, against 0.09 px of camera motion), in a cutscene 22 %. Validation layer:
+  only the known warning, also in a quality mode; shutdown clean.
+- **Cost** (resolution_scale 2.4, fsr3_quality, frames 4500-8400 of the route, two runs each way, alternating): batch replay
+  2.03 / 1.88 ms a frame with the pass against 1.82 / 1.79 without, GPU 5.44 / 5.27 against 5.22 / 5.28 ms, 59.7-59.8 fps
+  either way: at most 0.2 ms of each, inside the spread of the runs.
+- **Not shown**: that the picture is better. Two runs do not reach the same frames, so there is no pair of pictures with
+  and without; the frames with the pass look sound. Not run on Windows, NVIDIA, Intel, the Deck; a fight with many enemies
+  and the 30 fps cutscene mode not measured.
 
 ## Frame rates above 60: feasibility (2026-10-25; a study, not implemented)
 
@@ -1352,7 +1457,10 @@ Runs (muted, hidden window, copies of the save and of the user's graphics.ini; s
   "Personalizado", "Predeterminado"; ru "По умолчанию" and its label; the German "Automatisch" is now "Auto"), de (Randlos)
   and ko (전체 화면) again on the last build. **nl**: the game's own Dutch core text is empty (its ON / OFF and button guides are blank) and its messcore has
   no digits, so our values are partly blank there too; pt has the same files (not run). WT_LANGUAGE=en-GB showed the
-  Japanese text (the game's choice; gb not tested).
+  Japanese text: the game's defaults for a new save send en-GB, fr-CA and es-419 to Japanese (table at 0x71018541e4), so
+  since issue #160 `nn::oe::GetDesiredLanguage` answers en-US, fr and es for them (`runtime/language_pick.h`,
+  `tests/language_test.c`; empty save through the launcher on Linux: en-GB English, fr-CA French, es-MX Spanish). The
+  `_gb` layouts are no longer reached.
 - Without the mod (WT_MODS=none, `nomod_8rows`): the 8 rows, cursor wrap over 8.
 - Tests: pcmenu self-test (the new key API: set / get by key, a value none of the row's refused, the file's lines), pad
   self-test 61/61, lifter check 382 + 25 words and 200 words / 4,000 cases: all pass.
@@ -1634,6 +1742,28 @@ sampler showed it each time); only all four parts together free the render threa
 Not checked: Windows, NVIDIA and AMD's Windows driver (the paths were run on RADV only), the Steam Deck, other chapters
 (indirect dispatches whose group counts compute writes still wait on the CPU; none in Shibuya), the OpenGL renderer (unchanged).
 
+**Counts with more than one record (2026-11-09; issues 120, 156).** The demon rides, cutscenes and the title draw a few
+objects with `maxDrawCount` 2: the count is compute's, the records are the game's. Those counts were still read on the CPU,
+so in every such frame the render thread submitted and waited for the GPU once (`indirect_src` from the count read, found
+with a test-only histogram of `slot_wait` callers), and the frame again cost replay plus GPU: a Windows RX 6600 log has the
+Chapter 1 Gomorrah ride at 16 fps with 39 ms of GPU wait in a 54.5 ms replay. Now the GPU reads those counts too
+(`recs_bounded`: every record's indices must lie inside the index buffer, since the ones past the count are bound though
+never drawn; `WT_VK_GPUCOUNT_MULTI=0`: off). Measured in that ride on the RX 9070 XT at 1080p, scale 1.0: wait for the GPU
+3.7-6.7 ms to 0.2-0.3 ms a frame, batch replay 19-25 ms to 15.6-16.9 ms, 4.1 to 3.1 submissions, GPU time the same
+(4.4-7.8 ms). Not measured: Windows, AMD's and NVIDIA's own drivers, and whether the reporters' GPUs alone fit the frame.
+
+**The exposure copies when the GPU is behind (2026-11-12; issue 156).** A v0.9.1 log from an RX 6800 XT (1440p, scale 2.4)
+still had the ride at 22-26 fps in its busiest stretch: "GPU copies: ... 0.3-0.84 settled with a wait" a frame, 10-22 ms of
+GPU wait in a 27-40 ms replay. The four exposure copies of a frame are overlays that read the kept luminance buffer
+(`gcp_add`), and compute writes that buffer again every frame; `cb_new` then settled the overlays first, which waits for the
+last frame whenever the GPU has not finished it. Now the slot's `up` command buffer, which runs before the dispatch, copies
+those bytes into a slot of a small side buffer and the overlay reads the slot from then on (`gcp_src_rewritten`;
+`WT_VK_GPUCOPY_SIDE=0`: off; the log line counts "moved to a side slot"). Reproduced on the RX 9070 XT only with the GPU
+loaded by other copies of the game (Shibuya, 1440p, scale 2.4, on and off side by side under the same load): settled with a
+wait 0.96-0.97 to 0.00 a frame, wait for the GPU 15.7-22.9 to 0.4-0.8 ms, batch replay 22-31 to 7-8 ms, 29-33 to 45 fps. A
+test-only compare of the slot's bytes with the ones the wait would have read: 14,000 of 14,000 equal. Not measured: the ride
+itself, Windows, AMD's and NVIDIA's own drivers.
+
 ## Cutscenes on a slow disk (2026-11-05; issue 136)
 
 Issue 136 (Windows, RX 6600, v0.7.0): a cutscene's first viewing freezes for 1-4 s, less the second time. **Cause**: the
@@ -1662,10 +1792,49 @@ read once at start and about 119 MB of code resident.
   over 1 s (worst 1.4 s). With the pack, up to 9 frames went over 1 s, the worst 4.7 s.
 - `WT_VK_RS_PREP=0`: no measurable difference.
 
-On a hard disk `bc7_textures = off` is therefore the faster choice. The pack stays the default; issue 136's reporter was
-asked to try it.
+On a hard disk `bc7_textures = off` is therefore the faster choice. The pack stays the default.
 
-Not checked: Windows (the prefetch only compiled there, and Wine reads the whole image at load anyway), a real hard disk.
+**The reporter's hard disk** (2026-11-05, a version before v0.8.1: no `code prefetch` line): with `bc7_textures = off` the log has no
+watchdog report (three before), and the worst frame after loading is 0.8 s, at the cutscene's start (before: 3.7, 1.8 and
+2.5 s). The three decode threads kept up on their 4-core i3-12100F: 17 of 3500 textures were not ready at their use.
+
+**Decision**: the game does not turn the pack off by itself. A drive's seek-penalty flag is cheap to read, but USB
+enclosures and RAID report it wrongly, and timing the reads depends on what the page cache holds, so the picture would
+change from run to run. What off costs depends on the CPU, and this is one machine. Instead the launcher's Converted
+textures row has **Turn off / Turn on**, which only writes `bc7_textures` and keeps the folder, and its note names hard
+disks. Checked headless on Linux: the button flips the key both ways and the row keeps the focus.
+
+Not checked: Windows (the prefetch only compiled there, and Wine reads the whole image at load anyway), the prefetch on
+a real hard disk.
+
+## Video memory over a session (2026-11-10; issue 153)
+
+A GTX 1050 Ti (4 GB) log showed "device memory" climbing from 1425 MB to 3810 MB in 37 minutes. Measured on an RX 9070 XT
+(RADV), 1280x720, scale 1.0, `upscaler = fsr3`, with the `nvn_vk_mem:` line added for it (every 600 frames: MB in blocks,
+MB handed out, per class, and the driver's VK_EXT_memory_budget numbers):
+
+| point of a 40 minute session | MB in blocks | MB handed out |
+|---|---|---|
+| title | 1472 | 1149 |
+| Chapter 1, fight | 2688 | 2273 |
+| back at Chapter Select | 2688 | 1496 |
+| Chapter 3, fight | 3136 | 2730 |
+| back at Chapter Select | 3136 | 1500 |
+| Chapter 2, fight | 3456 | 3004 |
+
+- **Not a leak**: what is handed out returns to 1500 MB at every Chapter Select. The climb is each chapter's own need plus
+  the pool keeping its 64 MB blocks (`vmem_free` gives back only allocations above 16 MB): after a chapter 1.3 GB of the
+  image blocks is free, but only 7 of 39 blocks are empty; the next chapter fills the free ranges first (5 % free at a peak).
+  Nothing was lost to full free lists.
+- **Chapter 2 alone needs 3.3 GB** in blocks (2.9 GB handed out) straight from the title. `bc7_textures = off` changes
+  nothing: BC3 and BC7 are both 8 bits a texel, where the console's ASTC 8x8 is 2.
+- **The budget was not acted on.** New blocks went to system memory only when the driver refused one (issue 22); a 4 GB
+  card on Windows did not refuse at 3810 MB. Now a new block that would pass the driver's budget for its heap is treated
+  as refused (`vmem_over_budget`; `WT_VK_BUDGET=0` turns it off, `WT_VK_BUDGET=N` is a test budget of N MB). Chapter 2
+  with `WT_VK_BUDGET=2800`: 448 MB in system memory, the driver's count 2861 MB (its count trails the allocations),
+  57.7 fps against 60.0 here. Not run on Windows, on NVIDIA or on a 4 GB card.
+
+Left: a half-size option for the textures whose ASTC blocks are 8x8 or larger (the only thing that lowers the need).
 
 ## Aspect ratios: 21:9, 32:9, 9:10 ... (2026-10-28; experimental)
 
@@ -1856,6 +2025,41 @@ What it takes (found by reading main with `llvm-objdump` and by gdb watchpoints 
 
 Next: a run on a 21:9 monitor.
 
+## HDR: Linux, and the scene's lights above white (2026-11-11; issue 180)
+
+The HDR output of finding 147 (an HDR10 or scRGB swapchain, the game's 8-bit picture turned into light by one pass,
+`nvn_vk_draw.c` `hdr_*`) showed the SDR picture inside an HDR signal: nothing was brighter than `hdr_paper_white`. And it
+was Windows only. Now:
+
+- **Linux** (`hdr = auto | on`): the same swapchains on Wayland. Whether the desktop's HDR is on for the window, its white
+  and the monitor's peak are SDL's window properties, read at every present (`hdr_query`). The surface's format list was
+  read into 64 entries and Mesa lists 81 on Wayland (9 formats in 9 colour spaces), so the HDR ones were cut off: 256 now.
+  X11 offers no HDR swapchain. With `hdr = on` and the desktop's HDR off the white is 203 nits (BT.2408).
+- **The scene above white** (`hdr_peak`, auto = 203 nits x the headroom the desktop says on Linux (issue 180: the white is 203 there, the reference the desktop shows at its SDR brightness), 1000 on Windows). The four tone map stages
+  (`stage_fx` FX_GRAIN) get another translation while HDR is on (`nvn_vk_m4.c` `hdr_stage_text`, a part of the stage's
+  hash per peak / white): the game's curve is a toe, a straight part and from `c4[20]` a shoulder that ends at `c4[16]`
+  (in Shibuya the shoulder's size `c4[21]` is 0: a cut at white). The translation leaves it alone and multiplies the
+  finished colour by one gain per pixel, from the largest channel: the shoulder with the same start and slope that ends
+  at peak / white instead of at white, over the game's own value. So up to where the game's curve bends nothing changes,
+  and the hue the grading gave a pixel is kept.
+- **Where it goes**: the tone map's target is R11G11B10F, so it holds those values as it is. FXAA then draws it into the
+  8-bit window texture (cut at white), the HUD goes on top, the present is as before. The HDR pass reads that frame's
+  tone map target next to the 8-bit picture and adds what it holds above white, where the picture still shows the scene
+  (where the two differ by more than 0.06 .. 0.25 it adds nothing: the HUD, a menu, the PC panel). No image of the game
+  changes its format. A first version made the window textures 16-bit floating point instead: FXAA writes NaN where its
+  four corners are black (0 in 8 bits, kept in floating point), and the HUD's additive parts summed to 2.2 times white.
+- **Rows**: HDR, HDR white, HDR peak in the PC panel (the two brightness rows only while the picture goes out as HDR) and
+  in the launcher's Graphics section, and all three in the Options screen's PC Settings tab. All three apply while the game runs.
+- **Measured** (RX 9070 XT, RADV, KDE Wayland with the desktop's HDR off, `hdr = on`, white 200, peak 1000, Shibuya, the
+  presented HDR10 image read back with `WT_HDR_SHOT=<frame>` and decoded): white is 199 nits as before; in two frames 0.24 %
+  and 0.75 % of the pixels are above 205 nits, 0.12 % and 0.34 % above 400, the brightest 777 and 835 nits (930 with
+  `hdr_gamma = srgb`): fires, muzzle flashes, the magic circle and its sparks. The HUD stays at white. A 1250x1000 window (bars above and below): the same
+  places. Validation layer, 3,700 frames: no message from the pass.
+- **Not done or not seen**: nobody has looked at it on an HDR monitor (the numbers above are a read-back). `hdr = auto`
+  with the desktop's HDR on was not run. Windows was not built or run here (no SDK on this PC). Cutscenes, other chapters
+  and FSR were not run with it. `WT_VK_CACHE=<an empty folder>` crashes in a preparation worker (`stagelib_ensure`) on
+  this PC, also on the commit before this work: not looked into.
+
 ## Next blockers (most urgent first)
 
 Camera (right stick): confirmed working by hand on a real pad (2026-10-24); no work needed.
@@ -1896,9 +2100,11 @@ Camera (right stick): confirmed working by hand on a real pad (2026-10-24); no w
   same texel size as the shader's typed format (else logged as missing).
 - Movies (FFmpeg): packets of a selected track read ahead of time wait in a queue of 512; past that the oldest is dropped
   (`shortcut:` in `nnmovie_mf.c`).
+- HDR (`nvn_vk_draw.c`): Windows is not asked for the monitor's peak (`hdr_peak = auto` is 1000 there); the values above
+  white pass through the game's R11G11B10F target (6 bits of mantissa).
 - Indirect draws are read on the CPU (one Vulkan draw per record) unless compute wrote their count or records in this batch
-  (then `vkCmdDraw*Indirect*`, "The render thread and the GPU overlap"); a count with more than one record read on the CPU,
-  and indirect dispatches, still cost a submit and a wait.
+  (then `vkCmdDraw*Indirect*`, "The render thread and the GPU overlap"); a count whose records past it name indices outside
+  the index buffer, and indirect dispatches, still cost a submit and a wait.
 - Storage writes of a vertex / fragment stage are made visible at the end of the pass (a barrier), not between draws of the
   same pass (as on NVN without an explicit barrier).
 - Tessellation: a tessellated pipeline is made on the render thread at its first draw (one hitch; the driver's pipeline

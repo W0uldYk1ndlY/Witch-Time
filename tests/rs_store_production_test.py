@@ -102,6 +102,8 @@ static int nvn_front_draw_tag(void) { return 0; }
 #define ckpt(...) ((void)0)
 #define primlog_add(...) ((void)0)
 static void fsr_evidence_draw(void) {}
+/* Object-motion replay is outside this raster-store harness. */
+#define fsr_mv_commit(...) ((void)0)
 static void nvn_vk_missing(const char *s) { (void)s; missing++; }
 static int topology_valid(unsigned prim) {
     @TOPOLOGY@
@@ -112,6 +114,10 @@ static int topology_valid(unsigned prim) {
 static int gpu_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 0; }
 static int index_extent(uint64_t addr, uint64_t *extent) { (void)addr; *extent = 0; return 0; }
 static int cb_overlap(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 0; }
+static int recs_bounded(uint64_t addr, uint32_t n, uint32_t stride, uint32_t sz, int elements, uint64_t idx, unsigned type) {
+    (void)addr; (void)n; (void)stride; (void)sz; (void)elements; (void)idx; (void)type;
+    abort(); /* GPU-count paths are deliberately not exercised. */
+}
 static CB *cb_inside(uint64_t addr, uint64_t size) { (void)addr; (void)size; return NULL; }
 static const void *indirect_src(uint64_t addr, uint64_t size) { (void)addr; assert(size <= sizeof indirect_record); return indirect_record; }
 static uint64_t ring_raw(const void *p, uint64_t size) { (void)p; (void)size; abort(); }
