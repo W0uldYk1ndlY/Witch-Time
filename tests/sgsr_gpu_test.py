@@ -43,6 +43,9 @@ def main(glslc, dis):
             subprocess.run([str(exe), str(spv), *paths, *map(str, case), "1", "1"], check=True, timeout=60)
         for current, previous in [(1000, 4), (4, 1000), (60000, 0), (0, 60000)]:
             subprocess.run([str(exe), str(spv), *paths, "17", "13", "25", "19", str(current), "0", "0", str(previous)], check=True, timeout=60)
+        for camera in (1, 2, 3, 4, 5):
+            subprocess.run([str(exe), str(spv), *paths, "17", "13", "25", "19", "4", "0"],
+                           env={**os.environ, "WT_SGSR_TEST_CAMERA": str(camera)}, check=True, timeout=60)
         for intensity, reset in [(4, 0), (0, 1)]:
             negative = subprocess.run([str(exe), str(spv), *paths, "17", "13", "25", "19", str(intensity), str(reset)],
                                       env={**os.environ, "WT_SGSR_TEST_SKIP_FINAL": "1"}, capture_output=True, text=True, timeout=60)

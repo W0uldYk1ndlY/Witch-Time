@@ -3,11 +3,16 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "upscale_scene.h"
+#include "diag.h"
+#include "gfx_options.h"
+#include "fsr_evidence.h"
 
 enum { FX_GRAIN = 1, FX_DOWN = 2, VK_IMAGE_ASPECT_DEPTH_BIT = 1 };
 typedef struct { int width, height; } Builder;
 typedef struct Tex { Builder b; int dead; void *vk; } Tex;
-typedef struct { int aspect, samples, post, hdr; } VTex;
+typedef struct { int aspect, samples, post, hdr, w, h; } VTex;
+typedef uintptr_t VkImageView;
+#define VK_NULL_HANDLE 0
 typedef struct { uint64_t addr, size; } Range;
 typedef struct { int unused; } View, SamplerParams;
 typedef struct { int fx; } Stage;
@@ -19,15 +24,30 @@ static struct {
 } R;
 static UpscaleScene U = UPSCALE_SCENE_INITIALIZER;
 enum { FI_N = 3 };
-static struct { struct { VTex *vt; } img[FI_N]; int w, h, uw, uh, have_prev, t_last, res_index; } F;
+static struct { struct { VTex *vt; } img[FI_N]; int w, h, uw, uh, have_prev, t_last, res_index;
+    FsrEvidence evidence; int evidence_mode, evidence_reset; } F;
+enum { SG_HISTORY0, SC_OUTPUT };
+static struct { int ok, have_history, history, w, h, ow, oh, frame_reset; struct { VkImageView all; } image[3]; } SG, SC;
+static int g_diag_surface_gen;
+bool diag_is_enabled(void) { return false; }
+void diag_hook_temporal(const diag_temporal_observation_t *o) { (void)o; }
+static int sgsr_unable(void) { return 0; }
+static int sgsr_cs_unable(void) { return 0; }
+static long long nvn_front_frame_next(void) { return U.frame; }
+const GfxOptions *gfx_options(void) { static GfxOptions options; return &options; }
 static int game_fsr_w, game_fsr_h, garbage_count;
 static VTex *retired[FI_N];
 static void vt_garbage(VTex *v) { retired[garbage_count++] = v; }
 static int runs, last_fx, promoted;
 static int sgsr_selected, sgsr_runs, sgsr_retirements;
+static int sgsr_cs_selected, sgsr_cs_runs, sgsr_cs_retirements;
+static int g_rs_mode, variant;
+int gfx_sgsr_variant(void) { return variant; }
 static float rs_scale(void) { return 1.0f; }
 static int sgsr_want(void) { return sgsr_selected; }
 static void sgsr_retire_images(void) { sgsr_retirements++; }
+static int sgsr_cs_want(void) { return sgsr_cs_selected; }
+static void sgsr_cs_retire_images(void) { sgsr_cs_retirements++; }
 #define P(a) ((void *)(uintptr_t)(a))
 static int fsr_want(void) { return 1; }
 static int fsr_hdr(const VTex *v) { return v->hdr; }
@@ -38,6 +58,7 @@ static int nvn_front_handle(int tpool, int spool, uint64_t h, Tex **t, View *v, 
 }
 static void fsr_run(Tex *t, Tex *d, int fx) { assert(d == U.depth); U.col = t; U.ran = U.frame; runs++; last_fx = fx; }
 static void sgsr_run(Tex *t, Tex *d, int fx) { assert(d == U.depth); (void)fx; U.col = t; U.ran = U.frame; sgsr_runs++; }
+static void sgsr_cs_run(Tex *t, Tex *d, int fx) { assert(d == U.depth); (void)fx; U.col = t; U.ran = U.frame; sgsr_cs_runs++; }
 static void rs_promote(Tex *t) { (void)t; promoted++; }
 #include "../runtime/nvn_vk_upscale.c"
 
@@ -68,9 +89,22 @@ int main(void) {
     assert(!F.img[0].vt && !F.img[1].vt && !F.have_prev && !F.t_last && !F.res_index && !U.col && !game_fsr_w && !game_fsr_h);
     assert(cv.samples == 1 && cv2.samples == 1); /* retirement queues resources rather than destroying them */
     assert(sgsr_retirements == 1);
+    assert(sgsr_cs_retirements == 1);
     U.frame++; sgsr_selected = 1; R.col[0].tex = &color; R.depth.tex = &depth;
     upscale_draw(&fs); R.col[0].tex = &target; R.depth.tex = NULL;
     upscale_draw(&fs); assert(sgsr_runs == 1 && runs == 3);
+    U.frame++; sgsr_selected = 0; sgsr_cs_selected = 1;
+    R.col[0].tex = &color; R.depth.tex = &depth;
+    upscale_draw(&fs); R.col[0].tex = &target; R.depth.tex = NULL;
+    upscale_draw(&fs); assert(sgsr_cs_runs == 1 && sgsr_runs == 1 && runs == 3);
+    upscale_draw(&fs); assert(sgsr_cs_runs == 1);
+    g_rs_mode = 6; variant = 1;
+    upscale_mode_changed(6, 6);
+    assert(sgsr_retirements == 2 && sgsr_cs_retirements == 2 && !U.col && !U.have_surface);
+    upscale_mode_changed(6, 6);
+    assert(sgsr_cs_retirements == 2);
+    variant = 0; upscale_mode_changed(6, 6);
+    assert(sgsr_cs_retirements == 3);
     puts("temporal production route checks passed (mock renderer)");
     return 0;
 }

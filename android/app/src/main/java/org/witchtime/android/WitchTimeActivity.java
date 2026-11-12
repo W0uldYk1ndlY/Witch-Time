@@ -55,6 +55,13 @@ public final class WitchTimeActivity extends SDLActivity {
     }
 
     @Override
+    public void loadLibraries() {
+        if (!SaveExportActivity.beginGameLibraryLoad())
+            throw new UnsatisfiedLinkError("Committed save export is active; SDL startup refused.");
+        super.loadLibraries();
+    }
+
+    @Override
     protected String[] getArguments() {
         // Only an explicitly enabled diagnostic build accepts automated launch configuration.
         // Ordinary release/debug builds ignore any diagnostic intent extras.

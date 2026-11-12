@@ -573,6 +573,184 @@ fn treatments_unknown_legacy_provenance_stays_unknown() {
 }
 
 #[test]
+fn temporal_parser_is_bounded_and_legacy_default_is_absent() {
+    let mut req: serde_json::Value = serde_json::from_slice(include_bytes!("../../testdata/diagnostics/valid_request.json")).unwrap();
+    for selection in [
+        serde_json::json!({"mode":"sgsr2_quality","variant":"unsupported"}),
+        serde_json::json!({"mode":"sgsr2_quality"}),
+        serde_json::json!({"mode":"fsr3","variant":"2_pass_cs"}),
+        serde_json::json!({"mode":6}),
+        serde_json::json!({"mode":"native","env":{"WT_ANY":"1"}}),
+    ] {
+        req["treatments"] = serde_json::json!({"temporal":{"selection":selection,"cohort":"equal_output"}});
+        assert!(serde_json::from_value::<DiagnosticRequest>(req.clone()).is_err());
+    }
+    for variant in ["2_pass_fs", "2_pass_cs", "3_pass_cs"] {
+        req["treatments"] = serde_json::json!({"temporal":{"selection":{"mode":"sgsr2_quality","variant":variant},"cohort":"equal_output"}});
+        let parsed: DiagnosticRequest = serde_json::from_value(req.clone()).unwrap();
+        assert!(parsed.effective_treatments().temporal.is_some());
+    }
+    req["treatments"]["temporal"]["cohort"] = serde_json::json!("any_resolution");
+    assert!(serde_json::from_value::<DiagnosticRequest>(req).is_err());
+    assert!(DiagnosticTreatments::default().temporal.is_none());
+}
+
+#[test]
+fn gpu_component_payload_preserves_pass_serial_and_missing_time() {
+    for state in 0..8 {
+        let p = [41, (7i64 << 32) | state, 92, if state == 0 || state == 4 { 0 } else { -1 }];
+        let decoded = DiagnosticGpuComponent::from_payload(p).unwrap();
+        assert_eq!((decoded.frame, decoded.pass_id, decoded.submission_serial), (41, 7, 92));
+        assert_eq!(decoded.duration_ns, if state == 0 || state == 4 { Some(0) } else { None });
+        let json = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(json["duration_ns"].is_null(), state != 0 && state != 4);
+        assert_eq!(serde_json::from_value::<DiagnosticGpuComponent>(json).unwrap(), decoded);
+    }
+    assert!(DiagnosticGpuComponent::from_payload([41, 7i64 << 32, 92, -1]).is_err());
+    assert!(DiagnosticGpuComponent::from_payload([41, (7i64 << 32) | 6, 92, 0]).is_err());
+    assert!(DiagnosticGpuComponent::from_payload([41, (7i64 << 32) | 99, 92, -1]).is_err());
+}
+
+#[test]
+fn gpu_component_reduction_matches_submissions_and_preserves_unknown_tail() {
+    let event = |frame, pass, serial, state, ns| [frame, ((pass as i64) << 32) | state, serial, ns];
+    let events = [
+        event(10, 20, 40, 1, -1), event(10, 20, 41, 1, -1),
+        event(10, 20, 40, 0, 0), // measured zero replaces pending, not an extra sample
+        event(10, 20, 41, 4, 200), event(10, 21, 41, 1, -1),
+        event(11, 20, 42, 5, -1), event(11, 21, 42, 2, -1),
+        event(11, 22, 42, 3, -1), event(11, 23, 42, 7, -1),
+    ];
+    let reduced = DiagnosticGpuComponent::reduce_payloads(events, true).unwrap();
+    assert_eq!(reduced.len(), 7);
+    assert_eq!(reduced[0].duration_ns, Some(0));
+    assert_eq!(reduced[1].duration_ns, Some(200));
+    assert_eq!((reduced[2].frame, reduced[2].pass_id, reduced[2].submission_serial), (10, 21, 41));
+    assert_eq!(reduced[2].state, GpuComponentState::LostTail);
+    assert!(reduced[2..].iter().all(|r| r.duration_ns.is_none()));
+    let unfinished = DiagnosticGpuComponent::reduce_payloads([event(10, 21, 41, 1, -1)], false).unwrap();
+    assert_eq!(unfinished[0].state, GpuComponentState::Pending);
+    assert_eq!(unfinished[0].duration_ns, None);
+    let pending_updates = DiagnosticGpuComponent::reduce_payloads([event(10, 21, 41, 1, -1), event(10, 21, 41, 1, -1)], true).unwrap();
+    assert_eq!(pending_updates.len(), 1);
+    assert_eq!(pending_updates[0].state, GpuComponentState::LostTail);
+    assert!(DiagnosticGpuComponent::reduce_payloads([], true).unwrap().is_empty());
+    for events in [
+        vec![event(10, 20, 40, 0, 100), event(10, 20, 40, 0, 100)],
+        vec![event(10, 20, 40, 0, 100), event(10, 20, 40, 1, -1)],
+        vec![event(10, 20, 40, 1, -1), event(10, 20, 40, 99, -1)],
+        vec![event(10, 20, 40, 0, -1)], vec![event(-1, 20, 40, 0, 0)],
+    ] {
+        assert!(DiagnosticGpuComponent::reduce_payloads(events, true).is_err());
+    }
+}
+
+#[test]
+fn gpu_component_collector_is_opt_in_bounded_and_separate_from_legacy_profiles() {
+    let bytes = include_bytes!("../../testdata/diagnostics/valid_request.json");
+    let legacy: DiagnosticRequest = parse_diagnostic_json(bytes).unwrap();
+    assert!(!legacy.profile.collectors.iter().any(|c| c == "gpu_components"));
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    for collectors in [serde_json::json!(true), serde_json::json!([true]),
+        serde_json::json!(["gpu_components_unsupported"]),
+        serde_json::json!(["gpu_components", "gpu_components"]),
+        serde_json::json!([{"WT_VK_PASSTIME":1}])] {
+        value["profile"]["collectors"] = collectors;
+        assert!(serde_json::from_value::<DiagnosticRequest>(value.clone()).is_err());
+    }
+    value["profile"]["collectors"] = serde_json::json!(["gpu_timing", "gpu_components"]);
+    value["profile"]["profile_name"] = serde_json::json!("component_timing");
+    let components: DiagnosticRequest = serde_json::from_value(value).unwrap();
+    let manifest: DiagnosticManifest = parse_diagnostic_json(include_bytes!("../../testdata/diagnostics/valid_manifest.json")).unwrap();
+    let outcome: DiagnosticOutcome = parse_diagnostic_json(include_bytes!("../../testdata/diagnostics/valid_outcome.json")).unwrap();
+    let comparison = evaluate_comparison_eligibility(Some(&legacy), &manifest, &outcome,
+        Some(&components), &manifest, &outcome);
+    assert!(!comparison.is_eligible);
+    assert!(comparison.ineligibility_reasons.contains(&reasons::INCOMPATIBLE_PROFILES.to_string()));
+}
+
+#[test]
+fn temporal_cohorts_require_real_acknowledgement_and_matched_unrelated_settings() {
+    let mut br: DiagnosticRequest = parse_diagnostic_json(include_bytes!("../../testdata/diagnostics/valid_request.json")).unwrap();
+    let mut bm: DiagnosticManifest = parse_diagnostic_json(include_bytes!("../../testdata/diagnostics/valid_manifest.json")).unwrap();
+    let out: DiagnosticOutcome = parse_diagnostic_json(include_bytes!("../../testdata/diagnostics/valid_outcome.json")).unwrap();
+    br.treatments = Some(DiagnosticTreatments { temporal: Some(DiagnosticTemporalTreatment {
+        selection: TemporalSelection::Native {}, cohort: TemporalCohort::EqualOutput,
+    }), ..Default::default() });
+    bm.effective_treatments = br.treatments.clone();
+    bm.temporal_observation = Some(DiagnosticTemporalObservation {
+        effective: TemporalSelection::Native {},
+        scene_dimensions: bm.effective_settings.resolution,
+        output_dimensions: bm.effective_settings.resolution,
+        output_grid: TemporalOutputGrid::Reconstruction, surface_dimensions: Some([1600, 900]),
+        motion: TemporalSupport::Unavailable, reactive_consumed: false,
+        supported: false, initialized: false, dispatched: false, consumed: false,
+        skipped: false, reset_reason: None, fallback_reason: None,
+        scene_frame: 1, surface_generation: 1, unrelated_settings_hash: "matched_lod_mips_fxaa_grain_dynamic_resolution".into(),
+    });
+    let mut cr = br.clone();
+    cr.treatments.as_mut().unwrap().temporal.as_mut().unwrap().selection = TemporalSelection::Sgsr2Quality { variant: SgsrVariant::Compute2 };
+    let mut cm = bm.clone();
+    cm.effective_treatments = cr.treatments.clone();
+    let co = cm.temporal_observation.as_mut().unwrap();
+    co.effective = cr.treatments.as_ref().unwrap().temporal.as_ref().unwrap().selection.clone();
+    co.scene_dimensions = [640, 360];
+    co.supported = true; co.initialized = true; co.dispatched = true; co.consumed = true;
+    let eligible = |b: &DiagnosticRequest, bm: &DiagnosticManifest, c: &DiagnosticRequest, cm: &DiagnosticManifest| {
+        evaluate_comparison_eligibility(Some(b), bm, &out, Some(c), cm, &out).is_eligible
+    };
+    assert!(eligible(&br, &bm, &cr, &cm), "intentional equal-output treatment");
+    let mut drs_bm = bm.clone(); let mut drs_cm = cm.clone();
+    for m in [&mut drs_bm, &mut drs_cm] { m.temporal_observation.as_mut().unwrap().output_dimensions = [853, 479]; }
+    assert!(eligible(&br, &drs_bm, &cr, &drs_cm), "matching reconstruction grid need not equal configured display or actual surface grid");
+    drs_cm.temporal_observation.as_mut().unwrap().output_dimensions = [852, 479];
+    assert!(!eligible(&br, &drs_bm, &cr, &drs_cm), "same display does not excuse different reconstruction grid");
+    assert!(!evaluate_comparison_eligibility(None, &bm, &out, None, &cm, &out).is_eligible,
+        "observed temporal treatment requires declared request cohorts");
+    let mut missing_identity = cm.clone(); missing_identity.build_identity.runtime_lib_hash = None;
+    assert!(!eligible(&br, &bm, &cr, &missing_identity));
+    for split in [false, true] {
+        let mut r = cr.clone();
+        if split { r.treatments.as_mut().unwrap().vk_split = Some(64); }
+        else { r.treatments.as_mut().unwrap().vk_writerwait = true; }
+        let mut m = cm.clone(); m.effective_treatments = r.treatments.clone();
+        assert!(!eligible(&br, &bm, &r, &m), "unrelated acknowledged treatment differs");
+    }
+    let mut zero_br = br.clone(); let mut zero_cr = cr.clone();
+    let mut zero_bm = bm.clone(); let mut zero_cm = cm.clone();
+    zero_br.configuration.resolution = [0, 720]; zero_cr.configuration.resolution = [0, 720];
+    for m in [&mut zero_bm, &mut zero_cm] {
+        m.effective_settings.resolution = [0, 720];
+        m.temporal_observation.as_mut().unwrap().output_dimensions = [0, 720];
+    }
+    assert!(!eligible(&zero_br, &zero_bm, &zero_cr, &zero_cm), "zero output on both sides");
+    let mut bad = cm.clone(); bad.temporal_observation = None;
+    assert!(!eligible(&br, &bm, &cr, &bad));
+    for field in ["effective", "dimensions", "fallback", "consumed", "grid", "unrelated"] {
+        let mut bad = cm.clone(); let o = bad.temporal_observation.as_mut().unwrap();
+        match field {
+            "effective" => o.effective = TemporalSelection::Native {},
+            "dimensions" => o.scene_dimensions = [0, 360],
+            "fallback" => o.fallback_reason = Some("unsupported_format".into()),
+            "consumed" => o.consumed = false,
+            "grid" => o.output_grid = TemporalOutputGrid::Unknown,
+            _ => o.unrelated_settings_hash = "different_mip_bias".into(),
+        }
+        assert!(!eligible(&br, &bm, &cr, &bad), "{field}");
+    }
+    cr.treatments.as_mut().unwrap().temporal.as_mut().unwrap().cohort = TemporalCohort::EqualRender;
+    cm.effective_treatments = cr.treatments.clone();
+    assert!(!eligible(&br, &bm, &cr, &cm), "different cohorts");
+    br.treatments.as_mut().unwrap().temporal.as_mut().unwrap().cohort = TemporalCohort::EqualRender;
+    bm.effective_treatments = br.treatments.clone();
+    assert!(!eligible(&br, &bm, &cr, &cm), "different actual render extents");
+    bm.temporal_observation.as_mut().unwrap().scene_dimensions = [640, 360];
+    assert!(eligible(&br, &bm, &cr, &cm), "equal-render treatment");
+    cm.effective_settings.fps_target += 10.0;
+    assert!(!eligible(&br, &bm, &cr, &cm), "unrelated pacing mismatch");
+}
+
+#[test]
 fn comparison_eligibility_treatment_requested_effective_mismatch_ineligible() {
     let req_bytes = include_bytes!("../../testdata/diagnostics/valid_request.json");
     let man_bytes = include_bytes!("../../testdata/diagnostics/valid_manifest.json");
@@ -585,6 +763,7 @@ fn comparison_eligibility_treatment_requested_effective_mismatch_ineligible() {
     // Candidate requests ww_soft: true
     let mut c_req = b_req.clone();
     c_req.treatments = Some(DiagnosticTreatments {
+        temporal: None,
         ww_soft: true,
         vk_writerwait: false,
         vk_loadclear: false,
@@ -603,6 +782,7 @@ fn comparison_eligibility_treatment_requested_effective_mismatch_ineligible() {
     // 2. Manifest acknowledges mismatched effective treatments (ww_soft: false)
     let mut c_man_mismatch = b_man.clone();
     c_man_mismatch.effective_treatments = Some(DiagnosticTreatments {
+        temporal: None,
         ww_soft: false,
         vk_writerwait: false,
         vk_loadclear: false,
@@ -618,6 +798,7 @@ fn comparison_eligibility_treatment_requested_effective_mismatch_ineligible() {
     // 3. Manifest acknowledges matching effective treatments (ww_soft: true) -> eligible!
     let mut c_man_match = b_man.clone();
     c_man_match.effective_treatments = Some(DiagnosticTreatments {
+        temporal: None,
         ww_soft: true,
         vk_writerwait: false,
         vk_loadclear: false,
@@ -2681,7 +2862,3 @@ fn test_overhead_evaluation_capped_fps_and_budget_checks() {
     assert!(!assess_heavy.within_overall_budget);
     assert_eq!(assess_heavy.hardware_status, "device_calibrated");
 }
-
-
-
-

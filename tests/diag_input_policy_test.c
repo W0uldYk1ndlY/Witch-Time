@@ -294,13 +294,14 @@ static void test_neutral_release_on_eof_cancel_failure(void) {
     sess.record_count = 1;
     sess.records = &dummy_rec;
     sess.current_pos = 0;
+    sess.header.total_polls = 10;
 
     uint64_t b = 0;
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
     uint32_t attr = 0;
 
     /* Normal active poll */
-    bool ok = diag_replay_poll(&sess, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
+    bool ok = diag_replay_poll(&sess, 1, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
     assert(ok);
     assert(b == (DIAG_REPLAY_BTN_A | DIAG_REPLAY_BTN_ZR));
     assert(lx == 10000 && rx == 20000);
@@ -308,7 +309,7 @@ static void test_neutral_release_on_eof_cancel_failure(void) {
     /* Neutral release on cancellation */
     diag_replay_cancel(&sess);
     assert(sess.is_cancelled);
-    ok = diag_replay_poll(&sess, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
+    ok = diag_replay_poll(&sess, 2, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
     assert(ok);
     assert(b == 0);
     assert(lx == 0 && ly == 0 && rx == 0 && ry == 0);
@@ -318,7 +319,7 @@ static void test_neutral_release_on_eof_cancel_failure(void) {
     sess.is_cancelled = false;
     diag_replay_set_eof(&sess, true);
     assert(sess.is_eof);
-    ok = diag_replay_poll(&sess, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
+    ok = diag_replay_poll(&sess, 3, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
     assert(ok);
     assert(b == 0);
     assert(lx == 0 && ly == 0 && rx == 0 && ry == 0);
@@ -327,7 +328,7 @@ static void test_neutral_release_on_eof_cancel_failure(void) {
     /* Neutral release on session failure */
     sess.is_eof = false;
     sess.has_failed = true;
-    ok = diag_replay_poll(&sess, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
+    ok = diag_replay_poll(&sess, 4, -1, 0, &b, &lx, &ly, &rx, &ry, &attr);
     assert(!ok);
     assert(b == 0);
     assert(lx == 0 && ly == 0 && rx == 0 && ry == 0);

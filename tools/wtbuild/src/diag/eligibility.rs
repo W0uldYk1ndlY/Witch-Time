@@ -18,6 +18,56 @@ pub fn evaluate_comparison_eligibility(
 ) -> ComparisonEligibility {
     let mut reasons = Vec::new();
 
+    // Temporal treatments permit only the declared comparison axis to differ.
+    let temporal = |req: Option<&DiagnosticRequest>| {
+        req.and_then(|r| r.treatments.as_ref()).and_then(|t| t.temporal.as_ref()).cloned()
+    };
+    let bt = temporal(baseline_req);
+    let ct = temporal(candidate_req);
+    if bt.is_some() || ct.is_some()
+        || baseline_man.temporal_observation.is_some() || candidate_man.temporal_observation.is_some()
+        || baseline_man.effective_treatments.as_ref().and_then(|t| t.temporal.as_ref()).is_some()
+        || candidate_man.effective_treatments.as_ref().and_then(|t| t.temporal.as_ref()).is_some()
+    {
+        let mut b_other = baseline_man.effective_treatments.clone().unwrap_or_default();
+        let mut c_other = candidate_man.effective_treatments.clone().unwrap_or_default();
+        b_other.temporal = None;
+        c_other.temporal = None;
+        if b_other != c_other {
+            reasons.push(reasons::POLICY_MISMATCH.to_string());
+        }
+        match (&bt, &ct, &baseline_man.temporal_observation, &candidate_man.temporal_observation) {
+            (Some(b), Some(c), Some(bo), Some(co)) => {
+                use crate::diag::models::{TemporalCohort, TemporalSelection, TemporalOutputGrid};
+                for (t, o, m) in [(b, bo, baseline_man), (c, co, candidate_man)] {
+                    let identity = &m.build_identity;
+                    if t.selection != o.effective || o.scene_dimensions.contains(&0) || o.output_dimensions.contains(&0)
+                        || o.output_grid != TemporalOutputGrid::Reconstruction
+                        || o.unrelated_settings_hash.is_empty()
+                        || [&identity.apk_hash, &identity.runtime_lib_hash, &identity.game_shim_hash,
+                            &identity.main_executable_hash, &identity.generated_sdk_identity]
+                            .iter().any(|v| v.as_deref().map_or(true, str::is_empty))
+                        || o.fallback_reason.is_some() || o.skipped
+                        || (o.effective != (TemporalSelection::Native {})
+                            && !(o.supported && o.initialized && o.dispatched && o.consumed))
+                    {
+                        reasons.push(reasons::MISSING_ACKNOWLEDGEMENT.to_string());
+                    }
+                }
+                if b.cohort != c.cohort || bo.unrelated_settings_hash != co.unrelated_settings_hash {
+                    reasons.push(reasons::POLICY_MISMATCH.to_string());
+                }
+                if bo.output_dimensions != co.output_dimensions || bo.surface_dimensions != co.surface_dimensions {
+                    reasons.push(reasons::MISMATCHED_RESOLUTION.to_string());
+                }
+                if b.cohort == TemporalCohort::EqualRender && bo.scene_dimensions != co.scene_dimensions {
+                    reasons.push(reasons::MISMATCHED_RESOLUTION.to_string());
+                }
+            }
+            _ => reasons.push(reasons::MISSING_ACKNOWLEDGEMENT.to_string()),
+        }
+    }
+
     // 1. Execution outcomes: both runs must have completed cleanly without crash or timeout
     if baseline_out.execution_outcome != "completed" || !baseline_out.exit_status.clean_exit {
         reasons.push(reasons::FAILED_BASELINE.to_string());

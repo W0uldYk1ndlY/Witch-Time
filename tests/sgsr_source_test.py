@@ -20,6 +20,7 @@ def main(glslc, dis):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "upscale_motion.h"
 typedef struct { char *p; size_t n, cap; } FsrStr;
 ''' + append + '\n' + adapter + r'''
 int main(int argc, char **argv) {
@@ -39,14 +40,14 @@ int main(int argc, char **argv) {
         c = directory / "emit.c"
         exe = directory / ("emit.exe" if os.name == "nt" else "emit")
         c.write_text(harness, encoding="utf-8")
-        subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(exe)], check=True)
+        subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "runtime"), str(c), "-o", str(exe)], check=True)
         for name, count in [("sgsr2_convert.fs", 3), ("sgsr2_upscale.fs", 4)]:
             upstream = ROOT / "runtime/third_party/sgsr2/glsl_2_pass_fs" / name
             result = subprocess.run([str(exe), str(upstream)], check=True, capture_output=True, text=True)
             source = result.stdout
             assert source.startswith("#version 450\n") and "mediump" not in source
             if name == "sgsr2_convert.fs":
-                correction = "ScreenPos -= vec2(2.0 * params.jitterOffset.x * params.renderSizeRcp.x, -2.0 * params.jitterOffset.y * params.renderSizeRcp.y);"
+                correction = "ScreenPos = wtMotionUnjitterNdc(ScreenPos, params.jitterOffset, params.renderSizeRcp);"
                 assert correction in source and source.index(correction) < source.index("vec3 Position = vec3(ScreenPos,")
                 # Nonidentity camera reprojection: removing raster jitter must preserve both current and previous positions.
                 x, y, z = 0.2, -0.3, 0.7

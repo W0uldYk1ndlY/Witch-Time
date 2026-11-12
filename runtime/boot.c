@@ -16,6 +16,7 @@
 #include "diag.h"
 #include "diag_writer.h"
 #include "diag_replay.h"
+#include "temporal_source_capture.h"
 
 #include "image_layout.h"          /* [Recomps#1] entry points of our main, by exported name */
 #define NNINIT_STARTUP (GUEST_BASE + NNINIT_STARTUP_OFF)
@@ -321,7 +322,9 @@ static int b3_main(int argc, char **argv) {
             wcfg.storage_budget_bytes = 128 * 1024 * 1024;
             wcfg.incident_reserve_bytes = 16 * 1024 * 1024;
             wcfg.chunk_record_limit = 1000;
-            wcfg.flush_interval_ms = 500;
+            /* Component timestamps and requested source capture can outpace the 500 ms drain. */
+            const char *pass_time = getenv("WT_VK_PASSTIME");
+            wcfg.flush_interval_ms = wt_tsc_requested() || (pass_time && !strcmp(pass_time, "1")) ? 50 : 500;
             diag_writer_init(&wcfg);
             diag_writer_start();
 
@@ -456,13 +459,21 @@ static int b3_main(int argc, char **argv) {
         }
         report_and_exit(0);
     }
+    int capture_failed = 0;
     if (diag_is_enabled()) {
-        diag_writer_write_outcome("completed", "CLEAN_COMPLETION", "cp_combat_end");
+        bool quiescent = diag_seal_producers();
+        if (wt_tsc_requested()) {
+            wt_tsc_core_loss(diag_get_total_dropped());
+            if (!quiescent) wt_tsc_core_loss(1);
+            capture_failed = wt_tsc_finish() != 0;
+        }
+        diag_writer_write_outcome(capture_failed ? "failed" : "completed",
+                                  !quiescent ? "DIAG_PRODUCERS_NOT_QUIESCENT" : capture_failed ? "TEMPORAL_SOURCE_CAPTURE_INCOMPLETE" : "CLEAN_COMPLETION", NULL);
         diag_writer_stop();
         diag_writer_shutdown();
-        diag_shutdown();
+        if (quiescent) diag_shutdown();
     }
-    return 0;
+    return capture_failed ? 1 : 0;
 }
 
 int main(int argc, char **argv) { return b3_main(argc, argv); }

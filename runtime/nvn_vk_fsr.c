@@ -218,7 +218,7 @@ static struct {
     LONG64 t_last;
     VkImageView col_view, depth_view; VkImageLayout col_layout, depth_layout;
     LONG64 runs, resets;
-    FsrEvidence evidence, evidence_last; int evidence_pending, evidence_support, evidence_have_last, evidence_last_mode, evidence_last_requested, evidence_logged; char evidence_why[96];
+    FsrEvidence evidence, evidence_last; int evidence_pending, evidence_support, evidence_have_last, evidence_last_mode, evidence_last_requested, evidence_logged, evidence_reset, evidence_mode; char evidence_why[96];
 } F;
 
 static int fsr_want(void) { rs_scale(); return g_rs_mode >= 1 && g_rs_mode <= 5 && F.ok >= 0; }      /* the mode as latched with the scales (rs_scale) */
@@ -467,7 +467,9 @@ static void fsr_dispatch(int p, uint32_t gx, uint32_t gy) {
     vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, F.pl[p], 0, (uint32_t)n, w);
     ckpt(3, NULL, NULL, NULL);                     /* WT_VK_CHECKPOINTS: the dump names FSR's pass (hb[0]) */
     if (g_ck_on && g_ckn) g_ck[(g_ckn - 1) % CK_N].hb[0] = (uint64_t)p;
+    pt_begin(p == P_MV ? PT_CAMERA_VELOCITY : PT_FSR_BASE + p, p == P_ACC ? F.uw : F.w, p == P_ACC ? F.uh : F.h);
     vkCmdDispatch(R.cmd, gx ? gx : 1, gy ? gy : 1, 1);
+    pt_end();
     ckpt(2, NULL, NULL, NULL);
     fsr_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);      /* the next frame's clears too */
@@ -545,6 +547,7 @@ static void fsr_run(Tex *col, Tex *depth, int fx) {
         cut = dot < 0.9f || dx * dx + dy * dy + dz * dz > 25.0f;      /* shortcut: a camera cut is guessed (25 degrees or 5 units in a frame); a game signal would be exact */
     }
     int reset = upscale_scene_reset(&U, F.fresh, F.have_prev, cut, g_diag_surface_gen);
+    F.evidence_reset = reset;
     U.ran = U.frame;
     {   /* our motion vectors: M = previous VP x inverse(VP) (both without jitter), uploaded column major */
         float u[20];
@@ -617,6 +620,7 @@ static void fsr_run(Tex *col, Tex *depth, int fx) {
     fsr_dispatch(P_INST, src_x, src_y);
     fsr_dispatch(P_ACC, (uint32_t)(uw + 7) / 8, (uint32_t)(uh + 7) / 8);      /* at the output's size (AMD: dispatchDst) */
     F.evidence.dispatched = 1;
+    F.evidence_mode = g_rs_mode;
     U.surface_generation = g_diag_surface_gen; U.have_surface = 1;
     F.res_index = (F.res_index + 1) % 16;
 
@@ -628,18 +632,24 @@ static void fsr_run(Tex *col, Tex *depth, int fx) {
             vt_layout(vc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkImageBlit b; memset(&b, 0, sizeof b);
             b.srcSubresource = b.dstSubresource = sl; b.srcOffsets[1].x = uw; b.srcOffsets[1].y = uh; b.dstOffsets[1].x = w; b.dstOffsets[1].y = h; b.srcOffsets[1].z = b.dstOffsets[1].z = 1;
+            pt_begin(PT_COPY_CONVERT, w, h);
             vkCmdBlitImage(R.cmd, F.img[FI_OUT].vt->img, VK_IMAGE_LAYOUT_GENERAL, vc->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+            pt_end();
         }
     } else if (F.blit) {
         vt_layout(vc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageBlit b; memset(&b, 0, sizeof b);
         b.srcSubresource = b.dstSubresource = sl; b.srcOffsets[1].x = b.dstOffsets[1].x = w; b.srcOffsets[1].y = b.dstOffsets[1].y = h; b.srcOffsets[1].z = b.dstOffsets[1].z = 1;
+        pt_begin(PT_COPY_CONVERT, w, h);
         vkCmdBlitImage(R.cmd, F.img[FI_OUT].vt->img, VK_IMAGE_LAYOUT_GENERAL, vc->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+        pt_end();
     } else {
         vt_layout(vc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy c; memset(&c, 0, sizeof c);
         c.srcSubresource = c.dstSubresource = sl; c.extent.width = (uint32_t)w; c.extent.height = (uint32_t)h; c.extent.depth = 1;
+        pt_begin(PT_COPY_CONVERT, w, h);
         vkCmdCopyImage(R.cmd, F.img[FI_OUT].vt->img, VK_IMAGE_LAYOUT_GENERAL, vc->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        pt_end();
     }
     game_fsr_w = w; game_fsr_h = h;
     if (F.runs++ == 0) printf("nvn_vk_fsr: first run at %dx%d to %dx%d (%d jitter phases) before a %s draw, jitter %.3f, %.3f px\n", w, h, uw, uh, game_fsr_phases, fx == FX_DOWN ? "bloom downsample" : "tonemap",
@@ -758,13 +768,14 @@ static void fsr_shutdown(void) {
     memset(&F, 0, sizeof F);
     U = (UpscaleScene)UPSCALE_SCENE_INITIALIZER;
 }
-static void fsr_evidence_prepare(void) { F.evidence_pending = 0; }
+static void fsr_evidence_prepare(void) { F.evidence_pending = 0; upscale_diag_prepare(); }
 static void fsr_evidence_sample(int stage, Tex *tex, VkImageView view) {
+    upscale_diag_sample(stage, tex, view);
     if (stage != 1 || !F.evidence.dispatched || tex != U.col || !R.prog[1] || stage_fx(&R.prog[1]->st[1]) != FX_GRAIN) return;
     if ((F.uw != F.w || F.uh != F.h) && (!F.img[FI_OUT].vt || view != F.img[FI_OUT].all)) return;
     F.evidence.output_bound = F.evidence_pending = 1;
 }
-static void fsr_evidence_draw(void) { if (F.evidence_pending) F.evidence.draw_recorded = 1; }
+static void fsr_evidence_draw(void) { if (F.evidence_pending) F.evidence.draw_recorded = 1; upscale_diag_draw(); }
 /* nvn_vk_draw.c vk_present2: a frame ends */
 static void fsr_present(void) {
     rs_scale();
@@ -778,6 +789,7 @@ static void fsr_present(void) {
     F.evidence.supported = F.evidence.selected && F.evidence_support > 0;
     F.evidence.initialized = F.ok == 1;
     F.evidence.camera_conflict = U.camera_conflict && U.scene_frame == U.frame;
+    upscale_diag_present();
     const char *result = fsr_evidence_result(&F.evidence);
     if (F.evidence_logged < 32 && (requested != F.evidence_last_requested || g_rs_mode != F.evidence_last_mode || !F.evidence_have_last || memcmp(&F.evidence_last, &F.evidence, sizeof F.evidence_last))) {
         printf("nvn_vk_fsr: evidence frame=%lld requested=%d latched=%d effective=%d supported=%d initialized=%d eligible=%d camera_conflict=%d dispatched=%d bound=%d consumer_recorded=%d fallback=%d result=%s reason=%s (recorded commands, not GPU completion)\n", (long long)U.frame, requested, g_rs_mode, F.evidence.initialized && F.evidence.selected ? g_rs_mode : 0, F.evidence.supported, F.evidence.initialized, F.evidence.eligible, U.camera_conflict && U.scene_frame == U.frame, F.evidence.dispatched, F.evidence.output_bound, F.evidence.draw_recorded, F.evidence.fallback, result, F.evidence_support < 0 ? F.evidence_why : "none");

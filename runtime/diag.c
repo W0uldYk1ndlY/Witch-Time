@@ -7,6 +7,7 @@
 #define DIAG_ATOMIC_LOAD(p, order) __atomic_load_n((p), (order))
 #define DIAG_ATOMIC_STORE(p, v, order) __atomic_store_n((p), (v), (order))
 #define DIAG_ATOMIC_ADD(p, v, order) __atomic_fetch_add((p), (v), (order))
+#define DIAG_ATOMIC_OR(p, v, order) __atomic_fetch_or((p), (v), (order))
 #define DIAG_ATOMIC_CAS(p, expected_p, desired, succ, fail) \
     __atomic_compare_exchange_n((p), (expected_p), (desired), 0, (succ), (fail))
 #define DIAG_ORDER_RELAXED __ATOMIC_RELAXED
@@ -18,6 +19,7 @@
 #define DIAG_ATOMIC_LOAD(p, order) atomic_load_explicit((p), (order))
 #define DIAG_ATOMIC_STORE(p, v, order) atomic_store_explicit((p), (v), (order))
 #define DIAG_ATOMIC_ADD(p, v, order) atomic_fetch_add_explicit((p), (v), (order))
+#define DIAG_ATOMIC_OR(p, v, order) atomic_fetch_or_explicit((p), (v), (order))
 #define DIAG_ATOMIC_CAS(p, expected_p, desired, succ, fail) \
     atomic_compare_exchange_strong_explicit((p), (expected_p), (desired), (succ), (fail))
 #define DIAG_ORDER_RELAXED memory_order_relaxed
@@ -37,6 +39,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sched.h>
 #include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -64,13 +67,38 @@ typedef struct diag_spsc_ring {
 } diag_spsc_ring_t;
 
 static uint32_t g_diag_enabled = 0;
+#define DIAG_ADMISSION_CLOSED (1u << 31)
+static uint32_t g_diag_admissions = DIAG_ADMISSION_CLOSED;
+static uint32_t g_diag_seal_failed = 0;
+
+static bool diag_admit(void) {
+    uint32_t state = DIAG_ATOMIC_LOAD(&g_diag_admissions, DIAG_ORDER_RELAXED);
+    while (!(state & DIAG_ADMISSION_CLOSED)) {
+        if (DIAG_ATOMIC_CAS(&g_diag_admissions, &state, state + 1,
+                            DIAG_ORDER_ACQUIRE, DIAG_ORDER_RELAXED)) return true;
+    }
+    return false;
+}
+
+static void diag_leave(void) {
+    DIAG_ATOMIC_ADD(&g_diag_admissions, (uint32_t)-1, DIAG_ORDER_RELEASE);
+}
 static uint64_t g_diag_global_seq = 1;
 static uint64_t g_diag_total_emitted = 0;
 static uint64_t g_diag_total_dropped = 0;
 static char g_diag_run_id[128] = {0};
-static int g_diag_gfx_prod = -1;
-static int g_diag_fs_prod = -1;
-static int g_diag_audio_prod = -1;
+static uint64_t g_diag_epoch = 0;
+static _Thread_local uint64_t t_diag_epoch = 0;
+static _Thread_local int t_diag_hook_prod = -1;
+
+static int diag_hook_producer(void) {
+    uint64_t epoch = DIAG_ATOMIC_LOAD(&g_diag_epoch, DIAG_ORDER_ACQUIRE);
+    if (t_diag_epoch != epoch) {
+        t_diag_hook_prod = diag_register_producer("hooks");
+        t_diag_epoch = epoch;
+    }
+    return t_diag_hook_prod;
+}
 
 /* Continuous atomic counters state */
 static uint64_t g_cont_wait_events = 0;
@@ -174,21 +202,38 @@ int diag_init(const char *run_id) {
         ring->name[0] = '\0';
     }
 
+    DIAG_ATOMIC_STORE(&g_diag_admissions, 0, DIAG_ORDER_RELEASE);
+    DIAG_ATOMIC_STORE(&g_diag_seal_failed, 0, DIAG_ORDER_RELAXED);
+    DIAG_ATOMIC_ADD(&g_diag_epoch, 1, DIAG_ORDER_RELEASE);
     DIAG_ATOMIC_STORE(&g_diag_enabled, 1, DIAG_ORDER_SEQ_CST);
-    g_diag_gfx_prod = diag_register_producer("gfx");
-    g_diag_fs_prod = diag_register_producer("fs");
-    g_diag_audio_prod = diag_register_producer("audio");
     return 0;
 }
 
-void diag_shutdown(void) {
+bool diag_seal_producers(void) {
+    /* One atomic linearization point closes admission, including stale enabled reads. */
+    DIAG_ATOMIC_OR(&g_diag_admissions, DIAG_ADMISSION_CLOSED, DIAG_ORDER_SEQ_CST);
     DIAG_ATOMIC_STORE(&g_diag_enabled, 0, DIAG_ORDER_SEQ_CST);
-    g_diag_gfx_prod = -1;
-    g_diag_fs_prod = -1;
-    g_diag_audio_prod = -1;
-    for (int i = 0; i < DIAG_MAX_PRODUCERS; i++) {
-        diag_spsc_ring_t *ring = &g_diag_rings[i];
-        DIAG_ATOMIC_STORE(&ring->active, 0, DIAG_ORDER_RELEASE);
+    if (DIAG_ATOMIC_LOAD(&g_diag_seal_failed, DIAG_ORDER_ACQUIRE)) return false;
+    uint64_t start = diag_time_ns();
+    while (DIAG_ATOMIC_LOAD(&g_diag_admissions, DIAG_ORDER_ACQUIRE) != DIAG_ADMISSION_CLOSED) {
+        if (diag_time_ns() - start >= 50000000ULL) {
+            DIAG_ATOMIC_STORE(&g_diag_seal_failed, 1, DIAG_ORDER_RELEASE);
+            return false;
+        }
+#if defined(_WIN32)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+    return !DIAG_ATOMIC_LOAD(&g_diag_seal_failed, DIAG_ORDER_ACQUIRE);
+}
+
+void diag_shutdown(void) {
+    /* Keep rings and producer ids intact: a timed-out emitter may still own them. */
+    if (diag_seal_producers()) {
+        for (int i = 0; i < DIAG_MAX_PRODUCERS; i++)
+            DIAG_ATOMIC_STORE(&g_diag_rings[i].active, 0, DIAG_ORDER_RELEASE);
     }
 }
 
@@ -196,11 +241,12 @@ int diag_register_producer(const char *name) {
     if (!diag_is_enabled()) {
         return -1;
     }
+    if (!diag_admit()) return -1;
     uint32_t tid = diag_get_tid();
     for (int i = 0; i < DIAG_MAX_PRODUCERS; i++) {
         diag_spsc_ring_t *ring = &g_diag_rings[i];
         uint32_t expected = 0;
-        if (DIAG_ATOMIC_CAS(&ring->active, &expected, 1, DIAG_ORDER_SEQ_CST, DIAG_ORDER_RELAXED)) {
+        if (DIAG_ATOMIC_CAS(&ring->active, &expected, 2, DIAG_ORDER_SEQ_CST, DIAG_ORDER_RELAXED)) {
             ring->generation++;
             ring->thread_id = tid;
             DIAG_ATOMIC_STORE(&ring->head, 0, DIAG_ORDER_RELAXED);
@@ -213,9 +259,12 @@ int diag_register_producer(const char *name) {
             } else {
                 ring->name[0] = '\0';
             }
+            DIAG_ATOMIC_STORE(&ring->active, 1, DIAG_ORDER_RELEASE);
+            diag_leave();
             return i;
         }
     }
+    diag_leave();
     return -1; /* All producer slots full */
 }
 
@@ -223,20 +272,29 @@ void diag_unregister_producer(int producer_id) {
     if (producer_id < 0 || producer_id >= DIAG_MAX_PRODUCERS) {
         return;
     }
+    if (!diag_admit()) return;
     diag_spsc_ring_t *ring = &g_diag_rings[producer_id];
     ring->generation++;
     DIAG_ATOMIC_STORE(&ring->active, 0, DIAG_ORDER_RELEASE);
+    diag_leave();
 }
 
 void diag_emit(int producer_id, uint32_t type, int64_t p0, int64_t p1, int64_t p2, int64_t p3) {
     if (!diag_is_enabled()) {
         return;
     }
+    if (!diag_admit()) return;
     if (producer_id < 0 || producer_id >= DIAG_MAX_PRODUCERS) {
+        DIAG_ATOMIC_ADD(&g_diag_total_dropped, 1, DIAG_ORDER_RELAXED);
+        diag_leave();
         return;
     }
+#ifdef DIAG_TEST_ADMISSION_HOOK
+    DIAG_TEST_ADMISSION_HOOK();
+#endif
     diag_spsc_ring_t *ring = &g_diag_rings[producer_id];
-    if (!DIAG_ATOMIC_LOAD(&ring->active, DIAG_ORDER_RELAXED)) {
+    if (DIAG_ATOMIC_LOAD(&ring->active, DIAG_ORDER_ACQUIRE) != 1) {
+        diag_leave();
         return;
     }
 
@@ -248,6 +306,7 @@ void diag_emit(int producer_id, uint32_t type, int64_t p0, int64_t p1, int64_t p
         /* Drop-new semantics: non-blocking loss on full ring */
         DIAG_ATOMIC_ADD(&ring->dropped_count, 1, DIAG_ORDER_RELAXED);
         DIAG_ATOMIC_ADD(&g_diag_total_dropped, 1, DIAG_ORDER_RELAXED);
+        diag_leave();
         return;
     }
 
@@ -270,6 +329,7 @@ void diag_emit(int producer_id, uint32_t type, int64_t p0, int64_t p1, int64_t p
     DIAG_ATOMIC_STORE(&ring->head, next_head, DIAG_ORDER_RELEASE);
     DIAG_ATOMIC_ADD(&ring->emitted_count, 1, DIAG_ORDER_RELAXED);
     DIAG_ATOMIC_ADD(&g_diag_total_emitted, 1, DIAG_ORDER_RELAXED);
+    diag_leave();
 }
 
 size_t diag_drain_producer(int producer_id, diag_record_t *out_records, size_t max_count) {
@@ -299,6 +359,11 @@ bool diag_get_producer_stats(int producer_id, diag_producer_stats_t *out_stats) 
         return false;
     }
     diag_spsc_ring_t *ring = &g_diag_rings[producer_id];
+    /* Lazy registration publishes metadata only when the slot is ready. */
+    if (DIAG_ATOMIC_LOAD(&ring->active, DIAG_ORDER_ACQUIRE) != 1) {
+        memset(out_stats, 0, sizeof(*out_stats));
+        return true;
+    }
     out_stats->emitted_count = DIAG_ATOMIC_LOAD(&ring->emitted_count, DIAG_ORDER_RELAXED);
     out_stats->dropped_count = DIAG_ATOMIC_LOAD(&ring->dropped_count, DIAG_ORDER_RELAXED);
     out_stats->generation = ring->generation;
@@ -318,107 +383,107 @@ uint64_t diag_get_total_dropped(void) {
 
 void diag_hook_render_end(int64_t frame, int64_t draws, int64_t skipped, int64_t clears) {
     DIAG_ATOMIC_STORE(&g_last_render_timestamp_ns, diag_timestamp_ns(), DIAG_ORDER_RELAXED);
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_RENDER_END, frame, draws, skipped, clears);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_RENDER_END, frame, draws, skipped, clears);
 }
 
 void diag_hook_gpu_submit(int64_t slot, int64_t serial, int64_t flushes, int64_t cmd_count) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_GPU_SUBMIT, slot, serial, flushes, cmd_count);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_GPU_SUBMIT, slot, serial, flushes, cmd_count);
 }
 
 void diag_hook_gpu_complete(int64_t slot, int64_t serial, int64_t wait_ticks, int64_t gpu_ns) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_GPU_COMPLETE, slot, serial, wait_ticks, gpu_ns);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_GPU_COMPLETE, slot, serial, wait_ticks, gpu_ns);
 }
 
 void diag_hook_present_queued(int64_t frame, int64_t image_index, int64_t target_tick, int64_t is_fight) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_PRESENT_QUEUED, frame, image_index, target_tick, is_fight);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_PRESENT_QUEUED, frame, image_index, target_tick, is_fight);
 }
 
 void diag_hook_present_called(int64_t frame, int64_t image_index, int64_t result_code, int64_t is_progress) {
     DIAG_ATOMIC_STORE(&g_last_render_timestamp_ns, diag_timestamp_ns(), DIAG_ORDER_RELAXED);
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_PRESENT_CALLED, frame, image_index, result_code, is_progress);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_PRESENT_CALLED, frame, image_index, result_code, is_progress);
 }
 
 void diag_hook_present_discard(int64_t frame, int64_t image_index, int64_t reason, int64_t surface_gen) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_PRESENT_DISCARD, frame, image_index, reason, surface_gen);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_PRESENT_DISCARD, frame, image_index, reason, surface_gen);
 }
 
 void diag_hook_surface_gen(int64_t generation, int64_t width, int64_t height, int64_t format) {
     DIAG_ATOMIC_STORE(&g_surface_gen, (uint32_t)generation, DIAG_ORDER_RELAXED);
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_SURFACE_GEN, generation, width, height, format);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_SURFACE_GEN, generation, width, height, format);
 }
 
 void diag_stream_frame_sample(int64_t frame, int64_t cpu_ns, int64_t wall_ns, int64_t flags) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_FRAME_SAMPLE, frame, cpu_ns, wall_ns, flags);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_FRAME_SAMPLE, frame, cpu_ns, wall_ns, flags);
 }
 
 void diag_stream_gpu_sample(int64_t frame, int64_t gpu_ns, int64_t slot, int64_t status) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_GPU_SAMPLE, frame, gpu_ns, slot, status);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_GPU_SAMPLE, frame, gpu_ns, slot, status);
 }
 
 void diag_stream_domain_anchor(int64_t anchor_type, int64_t monotonic_ns, int64_t wall_ns, int64_t frame) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_DOMAIN_ANCHOR, anchor_type, monotonic_ns, wall_ns, frame);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_DOMAIN_ANCHOR, anchor_type, monotonic_ns, wall_ns, frame);
 }
 
 void diag_hook_opt_ww(int64_t backend, int64_t faults, int64_t rearms, int64_t queries) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_OPT_WW_STATS, backend, faults, rearms, queries);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_OPT_WW_STATS, backend, faults, rearms, queries);
 }
 
 void diag_hook_opt_ww_mem(int64_t page_size, int64_t coverage_bytes, int64_t tracker_mem_bytes, int64_t leases) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_OPT_WW_MEM, page_size, coverage_bytes, tracker_mem_bytes, leases);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_OPT_WW_MEM, page_size, coverage_bytes, tracker_mem_bytes, leases);
 }
 
 void diag_hook_opt_mem_inspect(int64_t hash_words_visited, int64_t snapshot_compare_bytes, int64_t copies, int64_t uploads) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_OPT_MEM_INSPECT, hash_words_visited, snapshot_compare_bytes, copies, uploads);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_OPT_MEM_INSPECT, hash_words_visited, snapshot_compare_bytes, copies, uploads);
 }
 
 void diag_hook_opt_gpu_wait(int64_t required_serial, int64_t chosen_serial, int64_t wait_needed, int64_t slot) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_OPT_GPU_WAIT, required_serial, chosen_serial, wait_needed, slot);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_OPT_GPU_WAIT, required_serial, chosen_serial, wait_needed, slot);
 }
 
 void diag_hook_opt_clear_fold(int64_t eligible_clears, int64_t folded_clears, int64_t rejected_clears, int64_t attachment) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_OPT_CLEAR_FOLD, eligible_clears, folded_clears, rejected_clears, attachment);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_OPT_CLEAR_FOLD, eligible_clears, folded_clears, rejected_clears, attachment);
 }
 
 void diag_hook_thread_role(uint32_t thread_id, uint32_t role, uint64_t name_hash) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_THREAD_ROLE, (int64_t)thread_id, (int64_t)role, (int64_t)name_hash, 0);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_THREAD_ROLE, (int64_t)thread_id, (int64_t)role, (int64_t)name_hash, 0);
 }
 
 void diag_hook_thread_wait(uint32_t thread_id, uint32_t wait_type, int64_t wait_ns, int32_t result) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (wait_ns != DIAG_MEASUREMENT_UNAVAILABLE && wait_ns >= 0) {
         DIAG_ATOMIC_ADD(&g_cont_wait_events, 1, DIAG_ORDER_RELAXED);
         DIAG_ATOMIC_ADD(&g_cont_wait_ns, (uint64_t)wait_ns, DIAG_ORDER_RELAXED);
     }
-    diag_emit(g_diag_gfx_prod, DIAG_EV_THREAD_WAIT, (int64_t)thread_id, (int64_t)wait_type, wait_ns, (int64_t)result);
+    diag_emit(diag_hook_producer(), DIAG_EV_THREAD_WAIT, (int64_t)thread_id, (int64_t)wait_type, wait_ns, (int64_t)result);
 }
 
 void diag_hook_shader_queue(int64_t queued_jobs, int64_t completed_jobs, int64_t active_workers, int64_t avg_compile_ns) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (queued_jobs >= 0) DIAG_ATOMIC_STORE(&g_cont_shader_queued, queued_jobs, DIAG_ORDER_RELAXED);
     if (completed_jobs >= 0) DIAG_ATOMIC_STORE(&g_cont_shader_completed, completed_jobs, DIAG_ORDER_RELAXED);
     if (active_workers >= 0) DIAG_ATOMIC_STORE(&g_cont_shader_active_workers, active_workers, DIAG_ORDER_RELAXED);
     if (avg_compile_ns >= 0) DIAG_ATOMIC_STORE(&g_cont_shader_avg_compile_ns, avg_compile_ns, DIAG_ORDER_RELAXED);
-    diag_emit(g_diag_gfx_prod, DIAG_EV_SHADER_QUEUE, queued_jobs, completed_jobs, active_workers, avg_compile_ns);
+    diag_emit(diag_hook_producer(), DIAG_EV_SHADER_QUEUE, queued_jobs, completed_jobs, active_workers, avg_compile_ns);
 }
 
 void diag_hook_file_op(uint32_t op_type, int64_t duration_ns, int64_t bytes_transferred, int32_t status) {
-    if (!diag_is_enabled() || g_diag_fs_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (duration_ns != DIAG_MEASUREMENT_UNAVAILABLE && duration_ns >= 0) {
         DIAG_ATOMIC_ADD(&g_cont_file_ops, 1, DIAG_ORDER_RELAXED);
         DIAG_ATOMIC_ADD(&g_cont_file_duration_ns, (uint64_t)duration_ns, DIAG_ORDER_RELAXED);
@@ -426,19 +491,19 @@ void diag_hook_file_op(uint32_t op_type, int64_t duration_ns, int64_t bytes_tran
     if (bytes_transferred > 0) {
         DIAG_ATOMIC_ADD(&g_cont_file_bytes, (uint64_t)bytes_transferred, DIAG_ORDER_RELAXED);
     }
-    diag_emit(g_diag_fs_prod, DIAG_EV_FILE_OP, (int64_t)op_type, duration_ns, bytes_transferred, (int64_t)status);
+    diag_emit(diag_hook_producer(), DIAG_EV_FILE_OP, (int64_t)op_type, duration_ns, bytes_transferred, (int64_t)status);
 }
 
 void diag_hook_mem_stream(int64_t compare_bytes, int64_t copy_bytes, int64_t stream_bytes, int64_t uploads) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (compare_bytes > 0) DIAG_ATOMIC_ADD(&g_cont_mem_compare_bytes, (uint64_t)compare_bytes, DIAG_ORDER_RELAXED);
     if (copy_bytes > 0) DIAG_ATOMIC_ADD(&g_cont_mem_copy_bytes, (uint64_t)copy_bytes, DIAG_ORDER_RELAXED);
     if (stream_bytes > 0) DIAG_ATOMIC_ADD(&g_cont_mem_stream_bytes, (uint64_t)stream_bytes, DIAG_ORDER_RELAXED);
-    diag_emit(g_diag_gfx_prod, DIAG_EV_MEM_STREAM, compare_bytes, copy_bytes, stream_bytes, uploads);
+    diag_emit(diag_hook_producer(), DIAG_EV_MEM_STREAM, compare_bytes, copy_bytes, stream_bytes, uploads);
 }
 
 void diag_hook_mem_alloc(int64_t current_allocated_bytes, int64_t peak_allocated_bytes, int64_t total_alloc_count, int64_t total_free_count) {
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (current_allocated_bytes >= 0) {
         DIAG_ATOMIC_STORE(&g_cont_mem_allocated_bytes, current_allocated_bytes, DIAG_ORDER_RELAXED);
     }
@@ -448,16 +513,16 @@ void diag_hook_mem_alloc(int64_t current_allocated_bytes, int64_t peak_allocated
             DIAG_ATOMIC_STORE(&g_cont_mem_peak_allocated_bytes, peak_allocated_bytes, DIAG_ORDER_RELAXED);
         }
     }
-    diag_emit(g_diag_gfx_prod, DIAG_EV_MEM_ALLOC, current_allocated_bytes, peak_allocated_bytes, total_alloc_count, total_free_count);
+    diag_emit(diag_hook_producer(), DIAG_EV_MEM_ALLOC, current_allocated_bytes, peak_allocated_bytes, total_alloc_count, total_free_count);
 }
 
 void diag_hook_audio_counters(int64_t appended_frames, int64_t released_frames, int64_t underruns, int64_t starved) {
-    if (!diag_is_enabled() || g_diag_audio_prod < 0) return;
+    if (!diag_is_enabled()) return;
     if (appended_frames >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_appended, appended_frames, DIAG_ORDER_RELAXED);
     if (released_frames >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_released, released_frames, DIAG_ORDER_RELAXED);
     if (underruns >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_underruns, underruns, DIAG_ORDER_RELAXED);
     if (starved >= 0) DIAG_ATOMIC_STORE(&g_cont_audio_starved, starved, DIAG_ORDER_RELAXED);
-    diag_emit(g_diag_audio_prod, DIAG_EV_AUDIO_COUNTERS, appended_frames, released_frames, underruns, starved);
+    diag_emit(diag_hook_producer(), DIAG_EV_AUDIO_COUNTERS, appended_frames, released_frames, underruns, starved);
 }
 
 void diag_get_continuous_counters(diag_continuous_counters_t *out_counters) {
@@ -528,11 +593,11 @@ void diag_publish_semantic_observation(int32_t chapter,
     g_last_semantic_obs = obs;
     g_has_semantic_obs = true;
 
-    if (diag_is_enabled() && g_diag_gfx_prod >= 0) {
+    if (diag_is_enabled()) {
         int64_t a = ((int64_t)chapter << 32) | (uint32_t)verse;
         int64_t b = ((int64_t)difficulty << 32) | (uint32_t)area;
         int64_t c = ((int64_t)(movie_active ? 1 : 0) << 32) | (uint32_t)draws;
-        diag_emit(g_diag_gfx_prod, DIAG_EV_SEMANTIC_OBS, a, b, c, (int64_t)obs.timestamp_ns);
+        diag_emit(diag_hook_producer(), DIAG_EV_SEMANTIC_OBS, a, b, c, (int64_t)obs.timestamp_ns);
     }
 
     if (g_host_shim_bound && g_host_diag_binding.on_semantic_observation) {
@@ -589,10 +654,33 @@ bool diag_is_shim_bound(void) {
     return g_host_shim_bound;
 }
 
+void diag_hook_temporal(const diag_temporal_observation_t *o) {
+    if (!o || !diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_TEMPORAL_SELECTION, o->scene_frame,
+              o->selected_mode, o->effective_mode, o->variant);
+    diag_emit(diag_hook_producer(), DIAG_EV_TEMPORAL_DIMENSIONS, o->scene_frame,
+              (int64_t)(((uint64_t)o->scene_width << 32) | o->scene_height),
+              (int64_t)(((uint64_t)o->output_width << 32) | o->output_height),
+              o->surface_generation);
+    diag_emit(diag_hook_producer(), DIAG_EV_TEMPORAL_STATE, o->scene_frame,
+              o->flags, o->motion_support, o->reset_reason);
+    diag_emit(diag_hook_producer(), DIAG_EV_TEMPORAL_FAILURE, o->scene_frame,
+              o->fallback_reason, o->failing_pass, o->error_code);
+}
+
+void diag_stream_gpu_component(int64_t frame, uint32_t pass_id, int64_t serial,
+                               int64_t gpu_ns, uint32_t state) {
+    if (!diag_is_enabled()) return;
+    if (state > 7 || ((state == 0 || state == 4) && gpu_ns < 0)) state = 3;
+    if ((state != 0 && state != 4) || gpu_ns < 0) gpu_ns = DIAG_MEASUREMENT_UNAVAILABLE;
+    diag_emit(diag_hook_producer(), DIAG_EV_GPU_COMPONENT, frame,
+              (int64_t)(((uint64_t)pass_id << 32) | state), serial, gpu_ns);
+}
+
 void diag_hook_lifecycle(diag_lifecycle_state_t state) {
     DIAG_ATOMIC_STORE(&g_lifecycle_state, state, DIAG_ORDER_RELAXED);
-    if (!diag_is_enabled() || g_diag_gfx_prod < 0) return;
-    diag_emit(g_diag_gfx_prod, DIAG_EV_LIFECYCLE, (int64_t)state, 0, 0, 0);
+    if (!diag_is_enabled()) return;
+    diag_emit(diag_hook_producer(), DIAG_EV_LIFECYCLE, (int64_t)state, 0, 0, 0);
 }
 
 bool diag_hook_thermal(float headroom, diag_thermal_status_t status) {
@@ -611,10 +699,10 @@ bool diag_hook_thermal(float headroom, diag_thermal_status_t status) {
         g_thermal_status = status;
     }
 
-    if (diag_is_enabled() && g_diag_gfx_prod >= 0) {
+    if (diag_is_enabled()) {
         int64_t hr_bits = 0;
         memcpy(&hr_bits, &headroom, sizeof(float));
-        diag_emit(g_diag_gfx_prod, DIAG_EV_CUSTOM, hr_bits, (int64_t)status, 0, 0);
+        diag_emit(diag_hook_producer(), DIAG_EV_CUSTOM, hr_bits, (int64_t)status, 0, 0);
     }
     return true;
 }
@@ -815,5 +903,3 @@ void diag_atrace_counter(const char *name, int64_t val) {
 bool diag_atrace_is_active(void) {
     return g_atrace_active;
 }
-
-

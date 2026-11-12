@@ -7,7 +7,9 @@ name: wtbuild
 on:
   pull_request:
     paths: ['tools/wtbuild/**', 'lifter/**', 'runtime/gen_static/**', 'runtime/freestanding/**',
-            'runtime/nvn_vk_fsr.c', 'runtime/nvn_vk_sgsr.c', 'runtime/nvn_vk_upscale.c', 'runtime/gfx_options.c', 'runtime/pcmenu.c', 'runtime/third_party/fsr3/**', 'runtime/third_party/sgsr2/**', 'tests/fsr_*', 'tests/sgsr_*', 'tests/upscale_*', 'tests/upscaler_config_test.py', 'tests/pcmenu_selftest.c', 'tests/rs_store_test.py', 'tests/rs_store_coverage_test.c',
+            'tests/gpu_component_report_test.py', 'tests/temporal_diag_wiring_test.py',
+            'android/app/src/main/cpp/save_export*', 'android/app/src/main/java/org/witchtime/android/*Activity.java', 'android/app/src/main/AndroidManifest.xml', 'android/app/src/main/cpp/CMakeLists.txt', 'tests/save_export*',
+            'runtime/nvn_vk.c', 'runtime/nvn_vk_fsr.c', 'runtime/nvn_vk_sgsr.c', 'runtime/nvn_vk_sgsr_cs.c', 'runtime/nvn_vk_upscale.c', 'runtime/gfx_options.c', 'runtime/pcmenu.c', 'runtime/third_party/fsr3/**', 'runtime/third_party/sgsr2/**', 'tests/fsr_*', 'tests/sgsr_*', 'tests/upscale_*', 'tests/upscaler_config_test.py', 'tests/pcmenu_selftest.c', 'tests/rs_store_*', 'tests/pass_timestamp*.py', 'tests/android_surface_test.py', 'tests/vulkan_only_test.py', 'tests/vulkan_requirements_test.c',
             'runtime/*.h', 'runtime/plat_posix.c', 'runtime/nvn_gl.c', 'runtime/mx_translate.c', 'runtime/tex_decode.c', 'runtime/tex_pack.c', 'runtime/nvn_vk_draw.c', 'runtime/nvn_vk_flash.c', 'runtime/diag.c', 'runtime/diag_writer.c', 'runtime/diag_replay.c', 'runtime/game_shim.c', 'android/app/src/main/cpp/main.c', 'android/app/src/main/cpp/diag_bootstrap.c', 'android/app/src/main/cpp/diag_bootstrap.h', 'scripts/android-package.sh', 'tests/bc7_encode_test.c', 'tests/rebind_test.c', 'tests/presence_test.c', 'runtime/presence.c', 'tests/rs_pyramid_test.c', 'tests/tex_pack_test.c', 'tests/plat_hash_test.c', 'tests/mx_loop_guard_test.c', 'tests/mx_quad_test.c', 'tests/scene_step_test.c', 'tests/quad_walk_test.c', 'tests/ordered_helpers_test.c', 'tests/compute_buffer_coherency_test.py', 'tests/android_bootstrap_test.py', 'tests/flash_detector_policy_test.py', 'tests/treatment_controls_test.py', 'tests/soft_ww_metadata_test.py', 'tests/soft_ww_query_reset_test.py', 'tests/soft_ww_transaction_test.py', 'tests/soft_ww_fault_handler_test.py', 'tests/soft_ww_chaining_test.py', 'tests/soft_ww_lease_test.py', 'tests/soft_ww_consumer_test.py', 'tests/producer_wait_test.py', 'tests/loadclear_command_test.py', 'tests/diag_*', 'tests/gfx_diag_hook_test.c', 'tools/lifter-check/**', '.gitattributes', '.github/workflows/wtbuild.yml']
   workflow_dispatch:
 
@@ -78,17 +80,40 @@ jobs:
           python3 tests/fsr_cleanup_test.py
           python3 tests/sgsr_cleanup_test.py
           python3 tests/sgsr_resources_test.py
+          python3 tests/sgsr_cs_gpu_env_test.py
+          python3 tests/upscale_retirement_test.py
+          python3 tests/pass_timestamp_test.py
+          python3 tests/gpu_component_report_test.py
+          python3 tests/temporal_diag_wiring_test.py
+          if printf '#include <vulkan/vulkan.h>\n' | clang -E -I deps/android-arm64/include -x c - >/dev/null 2>&1; then
+            python3 tests/sgsr_cs_resources_test.py
+            python3 tests/sgsr_cs_compile_test.py
+            python3 tests/pass_timestamp_lifecycle_test.py
+            python3 tests/upscale_reset_lifecycle_test.py
+          else
+            echo "Vulkan-header compile/lifecycle checks not run: existing headers unavailable"
+          fi
           python3 tests/fsr_image_usage_test.py
           python3 tests/upscaler_config_test.py
           python3 tests/upscale_lifecycle_wiring_test.py
           python3 tests/upscale_scale_test.py
           python3 tests/rs_store_test.py
+          python3 tests/rs_store_production_test.py
           clang -O2 -Wall tests/rs_store_coverage_test.c -o "$RUNNER_TEMP/rs_store_coverage_test"
           "$RUNNER_TEMP/rs_store_coverage_test"
           if command -v glslc >/dev/null && command -v spirv-dis >/dev/null; then
             python3 tests/fsr_shader_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
             python3 tests/sgsr_shader_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
             python3 tests/sgsr_source_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
+            python3 tests/sgsr_cs_source_test.py "$(command -v glslc)" "$(command -v spirv-dis)"
+            python3 tests/upscale_motion_test.py "$(command -v glslc)" "$(command -v spirv-dis)" --compile-only
+            python3 tests/upscale_reactive_test.py "$(command -v glslc)" "$(command -v spirv-dis)" --compile-only
+            if printf '#include <vulkan/vulkan.h>\n' | clang -E -I deps/android-arm64/include -x c - >/dev/null 2>&1; then
+              python3 tests/rs_store_gpu_test.py "$(command -v glslc)" --compile-only
+              python3 tests/sgsr_cs_focused_gpu_test.py "$(command -v glslc)" "$(command -v spirv-dis)" --compile-only
+            else
+              echo "Full-grid Vulkan harness compile not run: existing headers unavailable"
+            fi
           else
             echo 'FSR shader reflection skipped: glslc or spirv-dis is unavailable'
           fi
@@ -108,6 +133,9 @@ jobs:
 
       - name: Android bootstrap hint order and failure test (android/app/src/main/cpp/main.c, tests/android_bootstrap_test.py)
         run: python3 tests/android_bootstrap_test.py
+
+      - name: Committed save export trust boundaries (synthetic POSIX fixtures only)
+        run: python3 tests/save_export_test.py
 
       - name: Flash detector policy and capture guard test (runtime/nvn_vk_flash.c, tests/flash_detector_policy_test.py)
         run: python3 tests/flash_detector_policy_test.py
@@ -150,8 +178,17 @@ jobs:
           "$RUNNER_TEMP/diag_bootstrap_test"
           clang -O2 -Wall -I runtime tests/diag_writer_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_writer_test"
           "$RUNNER_TEMP/diag_writer_test"
+          python3 tests/diag_boot_config_test.py
+          python3 tests/temporal_source_capture_test.py
+          python3 tests/temporal_source_lifecycle_test.py
+          clang -O2 -Wall -I runtime tests/diag_seal_test.c runtime/diag_writer.c -lpthread -o "$RUNNER_TEMP/diag_seal_test"
+          "$RUNNER_TEMP/diag_seal_test"
+          clang -O2 -Wall -I runtime tests/diag_hook_ownership_test.c -lpthread -o "$RUNNER_TEMP/diag_hook_ownership_test"
+          "$RUNNER_TEMP/diag_hook_ownership_test"
           clang -O2 -Wall -I runtime tests/diag_streaming_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_streaming_test"
           "$RUNNER_TEMP/diag_streaming_test"
+          clang -O2 -Wall -I runtime tests/diag_timestamp_test.c -o "$RUNNER_TEMP/diag_timestamp_test"
+          "$RUNNER_TEMP/diag_timestamp_test"
           clang -O2 -Wall -I runtime tests/diag_incident_test.c runtime/diag_writer.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_incident_test"
           "$RUNNER_TEMP/diag_incident_test"
           clang -O2 -Wall -I runtime tests/diag_crash_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_crash_test"
@@ -166,6 +203,7 @@ jobs:
           "$RUNNER_TEMP/diag_input_policy_test"
           clang -O2 -Wall -I runtime tests/diag_replay_test.c runtime/diag_replay.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/diag_replay_test"
           "$RUNNER_TEMP/diag_replay_test"
+          python3 tests/diag_replay_hid_test.py
           clang -O2 -Wall -I runtime tests/gfx_diag_hook_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/gfx_diag_hook_test"
           "$RUNNER_TEMP/gfx_diag_hook_test" 
 

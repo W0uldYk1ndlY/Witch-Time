@@ -48,7 +48,9 @@ int SDL_ShowSimpleMessageBox(unsigned flags, const char *title, const char *mess
     "dlfcn.h": """#pragma once
 #define RTLD_NOW 2
 #define RTLD_GLOBAL 0x100
+#define RTLD_NOLOAD 4
 void *dlopen(const char *filename, int flags);
+int dlclose(void *handle);
 void *dlsym(void *handle, const char *symbol);
 char *dlerror(void);
 """,
@@ -73,6 +75,7 @@ int mkdir(const char *path, int mode);
 
 TEST_DRIVER_C = r"""
 #include <stdio.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -193,14 +196,18 @@ static int mock_display_android_run(int argc, char **argv) {
 }
 
 void *dlopen(const char *filename, int flags) {
-    (void)flags;
+    if (flags & RTLD_NOLOAD) return g_test_mode == 4 ? (void *)(uintptr_t)0x5678 : NULL;
     record(EV_DLOPEN, filename, NULL);
     return (void *)(uintptr_t)0x1234;
 }
 
+int dlclose(void *handle) { (void)handle; return 0; }
+static int mock_exporting(void) { return 1; }
+
 void *dlsym(void *handle, const char *symbol) {
     (void)handle;
     record(EV_DLSYM, symbol, NULL);
+    if (strcmp(symbol, "wt_save_export_in_progress") == 0) return (void *)(uintptr_t)mock_exporting;
     if (strcmp(symbol, "display_android_run") == 0) {
         return (void *)(uintptr_t)mock_display_android_run;
     }
@@ -285,6 +292,7 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
             "-O2",
             "-Wall",
             f"-I{cls.tmppath}",
+            f"-I{ROOT / 'runtime'}",
             str(cls.tmppath / "driver.c"),
             str(cls.tmppath / "diag_bootstrap.c"),
             "-o",
@@ -365,6 +373,8 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
         # Crucial ordering assertion: SET_HINT before DLOPEN and before DISPLAY_RUN
         self.assertLess(idx_set_hint, idx_dlopen, "SDL_SetHint must be called before dlopen")
         self.assertLess(idx_dlopen, idx_display_run, "dlopen must precede display_android_run")
+        # Ordinary startup must not acquire diagnostic trace ownership.
+        self.assertFalse(any(e["kind"] == "SETENV" and e["name"] == "WT_TRACE" for e in events))
 
     def test_storage_failure(self):
         # Mode 3: SDL_GetAndroidExternalStoragePath returns NULL
@@ -383,6 +393,11 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
 
         # No dlopen
         self.assertEqual(len([e for e in events if e["kind"] == "DLOPEN"]), 0)
+
+    def test_export_blocks_game_before_storage_or_runtime(self):
+        ret, events = self.run_mode(4)
+        self.assertEqual(ret, 1)
+        self.assertFalse(any(e['kind'] in ('GET_STORAGE', 'FREOPEN', 'MKDIR', 'SETENV', 'DLOPEN', 'DISPLAY_RUN') for e in events))
 
 
 if __name__ == "__main__":

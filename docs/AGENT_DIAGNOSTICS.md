@@ -1,5 +1,25 @@
 # Agent Guide: Android Diagnostics & Performance Profiling
 
+### Temporal comparison status
+
+The optional `treatments.temporal` host contract and renderer recorder hook are
+documented in `android/DIAGNOSTICS.md`. Native bootstrap now applies only the
+validated fixed mode/variant selectors before loading the renderer. Shared
+renderer events now report actual stage/consumer decisions; the host runner can
+derive a latest-scene temporal manifest observation from complete healthy chunks.
+A pre-dlopen
+acknowledgement is **not** an effective mode or execution acknowledgement.
+Do not use an ad-hoc environment bridge to work around missing observations.
+Missing chunks/events or recorder loss leave observations unknown. The adapter
+does not fabricate missing build/fixture identities or unrelated-settings hashes;
+those missing facts still block comparison and all device acceptance.
+
+For offline fixtures, declare `equal_output` or `equal_render` on both sides.
+Both require matching actual output, pacing and unrelated settings; equal-render
+also requires matching actual scene dimensions. Require real effective mode,
+variant, dimensions, execution stages, support/fallback and build identities.
+Missing or unsupported evidence is ineligible, never measured zero or success.
+
 This guide provides operational instructions for AI coding agents running, monitoring, and evaluating diagnostic sessions on Android devices (e.g. Oppo Find N5 / Snapdragon 8 Elite).
 
 ---
@@ -130,6 +150,17 @@ adb shell "chmod 666 '$remoteDir/request.json'"
 ```
 
 ### 3.3 Launching with Diagnostic Intent
+
+For separately budgeted component GPU timing, add the fixed `gpu_components`
+collector to the request. It enables whole-submission and per-component markers;
+the existing `gpu_timing` collector alone remains whole-span-only. Do not inject
+arbitrary environment settings or reuse lightweight recorder A/A calibration:
+component markers add separate overhead requiring separate calibration. The
+runner publishes event-36 aggregates by frame/pass/submission and converts
+pending-only records to null-duration `lost_tail` only after validating complete
+sequence coverage and healthy stopped-writer EOF. Missing time is not zero;
+summed marked costs are not whole-frame time or utilization.
+
 Launch `WitchTimeActivity` with the `diag_run_id` extra:
 ```powershell
 adb shell "am force-stop org.witchtime.android; logcat -c; am start -n org.witchtime.android/.WitchTimeActivity -a android.intent.action.MAIN -c android.intent.category.LAUNCHER --es diag_run_id $runId"

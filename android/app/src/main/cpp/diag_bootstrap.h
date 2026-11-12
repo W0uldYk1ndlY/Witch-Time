@@ -24,6 +24,12 @@ extern "C" {
 
 /* Returns 1 if WT_DIAGNOSTIC_ENABLED is defined, 0 otherwise */
 int diag_bootstrap_is_diagnostic_variant(void);
+/* Typed flag, only for a successfully validated diagnostic request; never exported as an environment variable. */
+int diag_bootstrap_temporal_source_requested(void);
+int diag_bootstrap_save_export_requested(void);
+/* Same validator for a descriptor-read request; no pathname reopen by export-only callers. */
+int diag_bootstrap_validate_request_data(const uint8_t *data, size_t size, const char *run_id,
+                                         const char *digest, char *error, size_t error_cap);
 
 /* Validates run_id: alphanumeric, '_', '-', length 1..64. No '..', '/', '\' */
 int diag_bootstrap_validate_run_id(const char *run_id);

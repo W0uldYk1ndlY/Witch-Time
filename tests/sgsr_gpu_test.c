@@ -119,6 +119,8 @@ int main(int argc, char **argv) {
     float intensity = argc >= 9 ? (float)atof(argv[8]) : 4.0f;
     int reset = argc >= 10 ? atoi(argv[9]) : 1; if (reset != 0 && reset != 1) return 2;
     int pattern = argc >= 11 ? atoi(argv[10]) : 0;
+    int camera_case = getenv("WT_SGSR_TEST_CAMERA") ? atoi(getenv("WT_SGSR_TEST_CAMERA")) : 0;
+    if (camera_case < 0 || camera_case > 5 || (camera_case && pattern)) return 2;
     float history_intensity = argc == 12 ? (float)atof(argv[11]) : intensity;
     if (!isfinite(history_intensity) || history_intensity < 0 || history_intensity > 60000) return 2;
     if (pattern && (!reset || W > 100 || H > 100)) return 2;
@@ -159,6 +161,8 @@ int main(int argc, char **argv) {
     Buffer uniform = buffer_new(sizeof(Sgsr2FsParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     Buffer readback = buffer_new((VkDeviceSize)OW * OH * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer upload = buffer_new((VkDeviceSize)W * H * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Buffer motion_readback = buffer_new((VkDeviceSize)W * H * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    memset(motion_readback.mapped, 0xff, (size_t)W * H * 8);
     uint16_t *input = upload.mapped;
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 4; c++)
         input[(y * W + x) * 4 + c] = c < 3 ? float_half(pattern_value(x, y, c)) : 0;
@@ -170,6 +174,21 @@ int main(int argc, char **argv) {
     params.scale_ratio[0] = (float)OW / W;
     float area = (float)OW * OH / ((float)W * H); params.scale_ratio[1] = fminf(20.0f, area * area * area);
     params.camera_fov_angle_hor = 1; params.reset = (float)reset;
+    if (camera_case) {
+        params.clip_to_prev_clip[0] = 1.1f;
+        params.clip_to_prev_clip[5] = 0.9f;
+        params.clip_to_prev_clip[8] = 0.2f;
+        params.clip_to_prev_clip[9] = -0.1f;
+        params.clip_to_prev_clip[12] = 0.05f;
+        params.clip_to_prev_clip[13] = -0.03f;
+        params.jitter_offset[0] = camera_case == 1 ? 0.375f : -0.125f;
+        params.jitter_offset[1] = camera_case == 1 ? -0.25f : 0.375f;
+        if (camera_case == 5) {
+            params.clip_to_prev_clip[3] = 0.15f;
+            params.clip_to_prev_clip[7] = -0.08f;
+            params.clip_to_prev_clip[15] = 1.2f;
+        }
+    }
     memcpy(uniform.mapped, &params, sizeof params);
     VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -221,7 +240,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < IMAGES; i++) {
         barrier(cmd, images[i].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue color = {{0, 0, 0, 0}};
-        if (i == 0) color.float32[0] = 1;
+        if (i == 1 && (camera_case == 3 || camera_case == 4)) {
+            color.float32[0] = camera_case == 3 ? 0.5f : 0.5625f;
+            color.float32[1] = camera_case == 3 ? 0.5f : 0.4375f;
+        }
+        if (i == 0) color.float32[0] = camera_case == 5 ? 0.5f : 1;
         if (i == 2 || (i == 3 && !reset)) {
             float value = i == 2 ? intensity : history_intensity;
             color.float32[0] = value; color.float32[1] = value * 0.5f; color.float32[2] = value * 0.25f;
@@ -262,6 +285,11 @@ int main(int argc, char **argv) {
     barrier(cmd, images[3].image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy copy = {0}; copy.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = (VkExtent3D){(uint32_t)OW, (uint32_t)OH, 1};
     vkCmdCopyImageToBuffer(cmd, images[3].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
+    if (camera_case) {
+        barrier(cmd, images[4].image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        copy.imageExtent = (VkExtent3D){(uint32_t)W, (uint32_t)H, 1};
+        vkCmdCopyImageToBuffer(cmd, images[4].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, motion_readback.buffer, 1, &copy);
+    }
     VkMemoryBarrier host = {VK_STRUCTURE_TYPE_MEMORY_BARRIER}; host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
     CHECK(vkEndCommandBuffer(cmd)); VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd;
@@ -272,11 +300,34 @@ int main(int argc, char **argv) {
         float reference = pattern ? pattern_reference(i % OW, i / OW, W, H, OW, OH, c) : expected[c];
         if (!isfinite(value) || fabsf(value - reference) > fmaxf(0.02f, fabsf(reference) * 0.002f)) { if (!failed) fprintf(stderr, "pixel=%d channel=%d value=%g expected=%g\n", i, c, value, reference); failed++; }
     }
+    if (camera_case) {
+        const uint16_t *motion = motion_readback.mapped;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            float sx = 2.0f * (x + 0.5f) / W - 1.0f - 2.0f * params.jitter_offset[0] / W;
+            float sy = 1.0f - 2.0f * (y + 0.5f) / H + 2.0f * params.jitter_offset[1] / H;
+            float depth = camera_case == 5 ? 0.5f : 1.0f;
+            float previous_w = camera_case == 5 ? 0.15f * sx - 0.08f * sy + 1.2f : 1.0f;
+            float reference[4] = {sx - (1.1f * sx + 0.2f * depth + 0.05f) / previous_w,
+                                  sy - (0.9f * sy - 0.1f * depth - 0.03f) / previous_w, 0, 0};
+            if (camera_case == 3 || camera_case == 4) {
+                reference[0] = ((camera_case == 3 ? 0.5f : 0.5625f) - 32767.0f / 65535.0f) / 0.2495f;
+                reference[1] = ((camera_case == 3 ? 0.5f : 0.4375f) - 32767.0f / 65535.0f) / 0.2495f;
+            }
+            for (int c = 0; c < 4; c++) {
+                float value = half_float(motion[(y * W + x) * 4 + c]);
+                if (!isfinite(value) || fabsf(value - reference[c]) > (camera_case == 3 ? 0.000001f : 0.001f)) {
+                    if (!failed) fprintf(stderr, "camera=%d motion(%d,%d)[%d]=%g expected=%g\n", camera_case, x, y, c, value, reference[c]);
+                    failed++;
+                }
+            }
+        }
+        printf("SGSR Convert nonidentity+jitter case=%d analytic readback: %s\n", camera_case, failed ? "FAIL" : "PASS");
+    }
     vkDestroyDescriptorPool(device, descriptors, NULL); vkDestroySampler(device, sampler, NULL);
     for (int i = 0; i < 2; i++) { vkDestroyPipeline(device, pipelines[i], NULL); vkDestroyPipelineLayout(device, pipeline_layouts[i], NULL); vkDestroyDescriptorSetLayout(device, layouts[i], NULL); }
     for (int i = 0; i < 3; i++) vkDestroyShaderModule(device, modules[i], NULL);
     for (int i = 0; i < IMAGES; i++) { vkDestroyImageView(device, images[i].view, NULL); vkDestroyImage(device, images[i].image, NULL); vkFreeMemory(device, images[i].memory, NULL); }
-    Buffer buffers[] = {uniform, readback, upload}; for (int i = 0; i < 3; i++) { vkUnmapMemory(device, buffers[i].memory); vkDestroyBuffer(device, buffers[i].buffer, NULL); vkFreeMemory(device, buffers[i].memory, NULL); }
+    Buffer buffers[] = {uniform, readback, upload, motion_readback}; for (int i = 0; i < 4; i++) { vkUnmapMemory(device, buffers[i].memory); vkDestroyBuffer(device, buffers[i].buffer, NULL); vkFreeMemory(device, buffers[i].memory, NULL); }
     vkDestroyCommandPool(device, pool, NULL); vkDestroyDevice(device, NULL); vkDestroyInstance(instance, NULL);
     printf("SGSR FS %dx%d -> %dx%d intensity=%g history=%g reset=%d pattern=%d ping-pong readback: %s (%d failed channels)\n", W, H, OW, OH, intensity, history_intensity, reset, pattern, failed ? "FAIL" : "PASS", failed);
     return failed ? 1 : 0;
