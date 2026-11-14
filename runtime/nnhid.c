@@ -16,6 +16,9 @@
 #include "nnpad.h"
 #include "diag_replay.h"
 #include "diag_writer.h"
+#ifdef __ANDROID__
+#include "touch_controls.h"
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -538,6 +541,12 @@ static int player_connected(uint32_t id) {
     else if ((int)id == g_keyboard_player) phys = 1;
     else if (sdl_on()) phys = nnpad_present((int)id);
     else phys = x_present(g_source[id]);
+#ifdef __ANDROID__
+    if (id == 0 && !diag_input_is_synthetic_player1_enabled() && !getenv("WT_PLAY")) {
+        TouchSnapshot touch = touch_runtime_snapshot();
+        if (touch.ready && touch.gamepad_valid && touch.config.enabled) phys = 1;
+    }
+#endif
 
     return diag_input_is_player_connected(id, g_supported_styles, g_supported_ids, g_supported_id_count, phys) ? 1 : 0;
 }
@@ -650,7 +659,7 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
             int mx, my;
             if (sdl_on() && (int)id == g_keyboard_player && mouse_stick(&mx, &my)) {      /* [Recomps#1] the mouse moves the camera */
                 /* #178: ignore low-speed mouse drift while the pad is in use. */
-                if (g_used == 0 && abs(mx) <= STICK_MAX / 4 && abs(my) <= STICK_MAX / 4) mx = my = 0;
+                if ((g_used == 0 || g_used == 2) && abs(mx) <= STICK_MAX / 4 && abs(my) <= STICK_MAX / 4) mx = my = 0;
                 rx += mx; ry += my;
                 if (rx > STICK_MAX) rx = STICK_MAX; if (rx < -STICK_MAX) rx = -STICK_MAX;
                 if (ry > STICK_MAX) ry = STICK_MAX; if (ry < -STICK_MAX) ry = -STICK_MAX;
@@ -686,6 +695,15 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
             ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
             wired = !g_x[slot].wireless;
         }
+#ifdef __ANDROID__
+        if (id == 0 && !getenv("WT_PLAY")) {
+            static unsigned touch_activity;
+            TouchPad touch = touch_runtime_snapshot().pad;
+            touch_pad_merge(touch, &buttons, &lx, &ly, &rx, &ry);
+            if (touch.activity != touch_activity && (touch.buttons || touch.left_owned || touch.right_owned)) prompts_used = 2;
+            touch_activity = touch.activity;
+        }
+#endif
     }
     if (id == 0) {                                            /* [witchtime] button prompts follow the device: at once when it changes, else a few times a second */
         void prompts_tick(void);

@@ -450,6 +450,8 @@ int display_window_apply(void) { return 0; }      /* [witchtime] Windows: the PC
 #include <SDL3/SDL.h>
 #include "nnpad.h"
 #ifdef __ANDROID__
+#include "touch_controls.h"
+#include "diag.h"
 /* SDLActivity calls SDL_main on SDL's native main thread. Video creation and
  * event pumping stay there; the guest bootstrap runs separately and requests
  * its window through display_init. Lifecycle events must be handled by a
@@ -459,8 +461,25 @@ static int g_android_background, g_android_generation;
 static int g_android_argc;
 static char **g_android_argv;
 static int g_android_pw, g_android_ph;
+static Uint64 g_android_touch_cutoff;
+static void android_touch_cutoff(void) {
+    Uint64 now = SDL_GetTicksNS(), old = __atomic_load_n(&g_android_touch_cutoff, __ATOMIC_ACQUIRE);
+    while (old < now && !__atomic_compare_exchange_n(&g_android_touch_cutoff, &old, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { }
+}
 static bool SDLCALL android_lifecycle(void *unused, SDL_Event *event) {
     (void)unused;
+    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND || event->type == SDL_EVENT_TERMINATING) {
+        android_touch_cutoff();
+        touch_runtime_foreground(0);
+    }
+    if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) touch_runtime_foreground(1);
+    if (event->type == SDL_EVENT_WINDOW_FOCUS_LOST) { android_touch_cutoff(); touch_runtime_focus(0, 0); }
+    if (event->type == SDL_EVENT_WINDOW_FOCUS_GAINED) touch_runtime_focus(1, 0);
+    if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+        event->type == SDL_EVENT_WINDOW_SAFE_AREA_CHANGED || event->type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) {
+        android_touch_cutoff();
+        touch_runtime_invalidate();
+    }
     if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND)
         __atomic_store_n(&g_android_background, 1, __ATOMIC_RELEASE);
     if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
@@ -673,6 +692,25 @@ static void window_apply(SDL_Window *w) {
     SDL_GetWindowSizeInPixels(w, &pw, &ph);
     printf("display: window %s, client %dx%d pixels now%c", go->window_mode ? "desktop fullscreen" : "windowed", pw, ph, 10);
 }
+#ifdef __ANDROID__
+static void android_touch_geometry(SDL_Window *w, int pw, int ph) {
+    int ww = 0, wh = 0;
+    SDL_Rect safe;
+    if (!SDL_GetWindowSize(w, &ww, &wh) || ww <= 0 || wh <= 0 || pw <= 0 || ph <= 0) {
+        touch_runtime_set_ready(0);
+        return;
+    }
+    if (!SDL_GetWindowSafeArea(w, &safe)) safe = (SDL_Rect){0, 0, ww, wh};
+    TouchRect pixels;
+    if (!touch_safe_pixels((TouchRect){safe.x, safe.y, safe.w, safe.h}, ww, wh, pw, ph, &pixels)) {
+        touch_runtime_set_ready(0);
+        return;
+    }
+    float dp = SDL_GetWindowDisplayScale(w);
+    if (dp <= 0) { touch_runtime_set_ready(0); return; }
+    touch_runtime_geometry(pixels, dp, pw, ph);
+}
+#endif
 static DWORD WINAPI window_thread(LPVOID arg) {
     (void)arg;
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video cannot start: %s%c", SDL_GetError(), 10); fflush(stdout); ExitProcess(5); }
@@ -702,6 +740,10 @@ static DWORD WINAPI window_thread(LPVOID arg) {
 #ifdef __ANDROID__
     __atomic_store_n(&g_android_pw, pw, __ATOMIC_RELEASE);
     __atomic_store_n(&g_android_ph, ph, __ATOMIC_RELEASE);
+    touch_runtime_init(getenv("WT_CONFIG"));
+    touch_runtime_focus((SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0, 1);
+    if (getenv("WT_PLAY")) touch_runtime_set_replay(1);
+    android_touch_geometry(w, pw, ph);
 #endif
     InterlockedExchange(&g_ready, 1);
     { const char *ks = getenv("WT_KBM_SCRIPT"); if (ks && ks[0]) { g_kbm_test = 1; CreateThread(NULL, 0, kbm_script_thread, (LPVOID)ks, 0, NULL); } }
@@ -713,15 +755,67 @@ static DWORD WINAPI window_thread(LPVOID arg) {
 #endif
         int got = SDL_WaitEventTimeout(&e, 20);
 #ifdef __ANDROID__
-        if (got && (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_DID_ENTER_FOREGROUND)) {
+        if (got && (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_DID_ENTER_FOREGROUND ||
+                    e.type == SDL_EVENT_WINDOW_SAFE_AREA_CHANGED || e.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED)) {
             SDL_GetWindowSizeInPixels(w, &pw, &ph);
             __atomic_store_n(&g_android_pw, pw, __ATOMIC_RELEASE);
             __atomic_store_n(&g_android_ph, ph, __ATOMIC_RELEASE);
             gfx_aspect_window(pw, ph);
+            android_touch_geometry(w, pw, ph);
         }
 #endif
         sdl_mouse_update(w);                         /* also when display_mouse_want changed (nnhid.c, any thread) */
         if (!got) continue;
+#ifdef __ANDROID__
+        /* Independent lifetime caps keep mouse emulation/motion from hiding the finger evidence. */
+        if (diag_is_enabled()) {
+            static unsigned finger_logs, mouse_logs;
+            if ((e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_MOTION ||
+                 e.type == SDL_EVENT_FINGER_UP || e.type == SDL_EVENT_FINGER_CANCELED) && finger_logs < 64) {
+                finger_logs++;
+                Uint64 diagnostic_cutoff = __atomic_load_n(&g_android_touch_cutoff, __ATOMIC_ACQUIRE);
+                int diagnostic_replay = getenv("WT_PLAY") != NULL;
+                /* Advisory snapshot: lifecycle/replay may change before the routing checks below. */
+                fprintf(stderr, "touch-diag dequeue finger type=%u timestamp=%llu cutoff=%llu nx=%.6f ny=%.6f px=%.3f py=%.3f pixels=%dx%d touch=%lld finger=%lld generation=%u replay=%d disposition=%s snapshot=advisory\n",
+                        (unsigned)e.type, (unsigned long long)e.tfinger.timestamp,
+                        (unsigned long long)diagnostic_cutoff,
+                        e.tfinger.x, e.tfinger.y, e.tfinger.x * pw, e.tfinger.y * ph, pw, ph,
+                        (long long)e.tfinger.touchID, (long long)e.tfinger.fingerID,
+                        touch_runtime_generation(), diagnostic_replay,
+                        e.tfinger.timestamp <= diagnostic_cutoff ? "stale" : diagnostic_replay ? "replay" : "forward");
+            }
+            if (((e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which == SDL_TOUCH_MOUSEID) ||
+                 ((e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) && e.button.which == SDL_TOUCH_MOUSEID)) && mouse_logs < 32) {
+                mouse_logs++;
+                fprintf(stderr, "touch-diag dequeue touch-mouse type=%u timestamp=%llu x=%.3f y=%.3f generation=%u routing=ignored\n",
+                        (unsigned)e.type, (unsigned long long)e.common.timestamp,
+                        e.type == SDL_EVENT_MOUSE_MOTION ? e.motion.x : e.button.x,
+                        e.type == SDL_EVENT_MOUSE_MOTION ? e.motion.y : e.button.y, touch_runtime_generation());
+            }
+        }
+        if ((e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which == SDL_TOUCH_MOUSEID) ||
+            ((e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) && e.button.which == SDL_TOUCH_MOUSEID))
+            continue;
+        if (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_MOTION ||
+            e.type == SDL_EVENT_FINGER_UP || e.type == SDL_EVENT_FINGER_CANCELED) {
+            unsigned touch_generation = touch_runtime_generation();
+            if (e.tfinger.timestamp <= __atomic_load_n(&g_android_touch_cutoff, __ATOMIC_ACQUIRE)) continue;
+            if (!getenv("WT_PLAY")) {
+                int type = e.type == SDL_EVENT_FINGER_DOWN ? 0 : e.type == SDL_EVENT_FINGER_MOTION ? 1 : e.type == SDL_EVENT_FINGER_UP ? 2 : 3;
+                touch_runtime_event_at(touch_generation, type, e.tfinger.touchID, e.tfinger.fingerID, e.tfinger.x * pw, e.tfinger.y * ph);
+                if (touch_runtime_take_settings()) {
+                    void pcmenu_open_touch(void);
+                    static unsigned menu_logs;
+                    if (diag_is_enabled() && menu_logs < 32) {
+                        menu_logs++;
+                        fprintf(stderr, "touch-diag menu-open call generation=%u\n", touch_runtime_generation());
+                    }
+                    pcmenu_open_touch();
+                }
+            }
+            continue;
+        }
+#endif
         if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && e.key.scancode < SDL_SCANCODE_COUNT) g_keys[e.key.scancode] = e.key.down;
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) __atomic_fetch_or(&g_mbtn, SDL_BUTTON_MASK(e.button.button), __ATOMIC_SEQ_CST);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP) __atomic_fetch_and(&g_mbtn, ~SDL_BUTTON_MASK(e.button.button), __ATOMIC_SEQ_CST);

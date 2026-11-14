@@ -5602,7 +5602,8 @@ static VkImage hdr_picture(VkFormat fmt) {
         g_hdr.mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
         VKC(vkBindImageMemory(V.device, g_hdr.img, g_hdr.mem.mem, g_hdr.mem.off));
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = g_hdr.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_B8G8R8A8_UNORM;
+        vi.image = g_hdr.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
         vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
         VKC(vkCreateImageView(V.device, &vi, NULL, &g_hdr.view));
         g_hdr.fmt = fmt; g_hdr.w = V.extent.width; g_hdr.h = V.extent.height;
@@ -5790,6 +5791,13 @@ static void hdr_pass(uint32_t index, VkImage pic) {
 }
 static void vk_present2(void *arg, int progress);
 static PresentJob g_pcm_last; static void pcm_vk_draw(VkImage tgt); static void pcm_vk_free(void); static void pcm_upload(int wait);      /* [witchtime] the PC menu (nvn_vk_pcmenu.c) */
+#ifdef __ANDROID__
+int pcmenu_is_open(void);
+int touch_runtime_editing(void);
+void touch_runtime_set_ready(int ready);
+static int touch_vk_prepare(VkFormat format);
+static void touch_vk_draw(VkImage tgt);
+#endif
 void pcmenu_prep_show(int pct, long long done, long long total, int eta, int reading, const char *info);      /* pcmenu.c: the first-start screen */
 void pcmenu_prep_hide(void);
 /* Session 14: THE KEPT PRESENT. vk_present2 has blitted and submitted the frame; when display.c says the frame is to be shown
@@ -6054,6 +6062,11 @@ swap: ;
     }
     else {
         int suboptimal = r == VK_SUBOPTIMAL_KHR;
+#ifdef __ANDROID__
+        if (g_ovl.screen) touch_runtime_set_ready(0);
+        int touch_draw = !g_ovl.screen && (!pcmenu_is_open() || touch_runtime_editing()) && touch_vk_prepare(want);
+        int touch_indirect = touch_draw && !V.hdr && !g_sc_src;
+#endif
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         {   /* session 11: the semaphore a present waits for is one PER SWAPCHAIN IMAGE (validation run s11v3, twice in 9,783
              * frames: VUID-vkQueueSubmit-pSignalSemaphores-00067, "may still be in use by the swapchain", when the driver
@@ -6068,7 +6081,11 @@ swap: ;
         if (vt) vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         cmd_begin();
         g_hdr.frame = frame; g_hdr.rect[2] = 0;
-        VkImage tgt = V.hdr ? hdr_picture(want) : V.images[index];      /* [Recomps#1] finding 147: in HDR the 8-bit picture, which hdr_pass writes into the swapchain image */
+        VkImage tgt = V.hdr
+#ifdef __ANDROID__
+            || touch_indirect
+#endif
+            ? hdr_picture(want) : V.images[index];      /* [Recomps#1] finding 147: in HDR the 8-bit picture, which hdr_pass writes into the swapchain image */
         image_barrier(tgt, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         if (vt && vt->samples == 1 && !(progress && g_ovl.screen)) {      /* the first-run screen is ours: a dark picture, not the game's frame */
             VkImageBlit b;
@@ -6108,9 +6125,28 @@ swap: ;
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         fl_capture(vt, fl_s4, frame, fl_layout);      /* session 13: 16x9 copy of what is presented, for the flash detector */
         overlay_draw(tgt);
-        pcm_vk_draw(tgt);                             /* [witchtime] the PC menu's panel (nvn_vk_pcmenu.c); nothing while it is closed */
+#ifdef __ANDROID__
+        if (touch_draw) touch_vk_draw(tgt);
+#endif
+#ifdef __ANDROID__
+        if (!touch_runtime_editing())
+#endif
+            pcm_vk_draw(tgt);                         /* [witchtime] the PC menu's panel (nvn_vk_pcmenu.c); nothing while it is closed */
         if (V.hdr) hdr_pass(index, tgt);              /* [Recomps#1] finding 147: leaves the swapchain image in PRESENT_SRC */
-        else image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        else {
+#ifdef __ANDROID__
+            if (touch_indirect) {
+                VkImageCopy copy; memset(&copy, 0, sizeof copy);
+                copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; copy.srcSubresource.layerCount = 1; copy.dstSubresource = copy.srcSubresource;
+                copy.extent = (VkExtent3D){V.extent.width, V.extent.height, 1};
+                xfer_wait();
+                image_barrier(tgt, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vkCmdCopyImage(R.cmd, tgt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            }
+#endif
+            image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
         InterlockedExchange(&g_hdr_var, hdr_var());   /* [witchtime] the tone map stages of the next frame */
         tp[3] = tk();
         cmd_submit(acq, rend);

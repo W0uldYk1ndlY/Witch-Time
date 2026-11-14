@@ -24,12 +24,17 @@ PRELUDE = r'''
 #define __ANDROID__ 1
 #include <vulkan/vulkan.h>
 #include <assert.h>
+#include <stdbool.h>
+#include "touch_controls.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 typedef void SDL_Window;
 typedef int LONG;
+static bool diag_is_enabled(void) { return false; }
+TouchSnapshot touch_runtime_snapshot(void) { TouchSnapshot s = {0}; return s; }
+void touch_runtime_presentation(TouchPresentation presentation) { (void)presentation; }
 typedef struct { int right, bottom; } RECT;
 static struct {
     VkInstance instance; void *hwnd; VkPhysicalDevice gpu; VkDevice device;
@@ -99,7 +104,7 @@ class AndroidSurfaceTest(unittest.TestCase):
             src, exe = Path(tmp) / "surface.c", Path(tmp) / "surface"
             src.write_text(PRELUDE + code)
             cc = shlex.split(os.environ.get("HOST_CC", "cc"))
-            result = subprocess.run(cc + ["-std=gnu11", "-I", str(ROOT / "deps/android-arm64/include"), str(src), "-o", str(exe)], capture_output=True, text=True)
+            result = subprocess.run(cc + ["-std=gnu11", "-I", str(ROOT / "deps/android-arm64/include"), "-I", str(ROOT / "runtime"), str(src), "-o", str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, expected_exit, result.stderr)

@@ -19,7 +19,8 @@ volatile int game_cutscene_fps, game_model_lod;
 volatile int game_hud_centre;
 static int g_vsync_applied, g_win_applied;
 void nnhid_menu_read(uint64_t *b, int *lx, int *ly, int swap_ab) { (void)swap_ab; *b = 0; *lx = *ly = 0; }
-int nnhid_menu_key(int vk) { (void)vk; return 0; }
+static int g_menu_back;
+int nnhid_menu_key(int vk) { return vk == VK_ESCAPE && g_menu_back; }
 int nvn_front_post_pcmenu(void) { return 1; }
 int nvn_vk_hdr_on(void) { return 0; }
 void display_vsync_apply(void) { g_vsync_applied++; }
@@ -71,12 +72,33 @@ static void panel(const char *dir, const char *name, int W, int H) {
     printf("panel %dx%d in a %dx%d window: %s\n", r[2], r[3], W, H, path);
     free(px);
 }
+#ifdef __ANDROID__
+#include "diag.h"
+bool diag_is_enabled(void) { return false; }
+static void finger(int type, float x, float y) { touch_runtime_event(type, 1, 77, x, y); }
+static void finger_tap(float x, float y) { finger(0, x, y); finger(2, x, y); Sleep(100); }
+static void redraw_menu(void) { int r[4]; unsigned generation; assert(pcmenu_panel_size(1920, 1080, r, &generation)); }
+#endif
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "/tmp";
     char ini[300], buf[64];
+#ifdef __ANDROID__
+    TouchPointer queued;
+#endif
     snprintf(ini, sizeof ini, "%s/graphics_test.ini", dir);
     mkdir(dir, 0755);
+#ifdef __ANDROID__
+    char touch_path[300];
+    snprintf(touch_path, sizeof touch_path, "%s/controllers.ini", dir);
+    touch_runtime_init(touch_path);
+    touch_runtime_focus(1, 1);
+    touch_runtime_geometry((TouchRect){0, 0, 1920, 1080}, 1, 1920, 1080);
+    touch_runtime_set_ready(1);
+    assert(!touch_runtime_snapshot().presentation.valid);
+    touch_runtime_presentation((TouchPresentation){1, 1920, 1080, 1920, 1080, 1, 0});
+    assert(touch_runtime_snapshot().presentation.valid);
+#endif
     /* a file of CRLF lines with comments, an unknown key, a key twice, no newline at the end */
     spit(ini, "; comment = not a key\r\nwindow = windowed\r\nvsync   =   auto   \r\nmystery = 7\r\naspect_ratio = 21:9\r\nhud_area = 16:9\r\n[section]\r\nvsync = clock\r\nresolution_scale = 1.0");
     setenv("WT_GRAPHICS_CONFIG", ini, 1);
@@ -227,6 +249,91 @@ int main(int argc, char **argv) {
     { char *d = strstr(s, "\nvsync = auto\n") + 1; memmove(d, d + 13, strlen(d + 13) + 1); }      /* a key gone: LF stays */
     spit(old, s);
     assert(gfx_ini_refresh(old) == 1 && !strstr(slurp(old), "\r\n") && strstr(slurp(old), "\nvsync = auto\n"));
+#ifdef __ANDROID__
+    TouchConfig cfg = touch_runtime_snapshot().config;
+    cfg.enabled = 0;
+    assert(touch_runtime_save(&cfg));
+    TouchSnapshot touch = touch_runtime_snapshot();
+    finger(0, touch.settings.x + 1, touch.settings.y + 1);
+    assert(!touch_runtime_take_settings());
+    pcmenu_gate(0, 0);
+    assert(pcmenu_gate(0, 0xc00) == 1 && g_open); /* OFF recovery uses the physical controller chord. */
+    finger(2, touch.settings.x + 1, touch.settings.y + 1);
+    Sleep(100);
+    assert(g_open && g_guest_frozen && !touch_runtime_snapshot().pad.buttons);
+    finger(0, touch.geometry.control[TOUCH_A].x + 1, touch.geometry.control[TOUCH_A].y + 1);
+    assert(!touch_runtime_snapshot().pad.buttons);
+    finger(3, touch.geometry.control[TOUCH_A].x + 1, touch.geometry.control[TOUCH_A].y + 1);
+    redraw_menu();
+    for (int i = 0; i < 4; i++) { finger(0, 1100, 800); finger(1, 1100, 300); finger(2, 1100, 300); Sleep(100); redraw_menu(); }
+    int touch_page = row_of("touch_page");
+    assert(touch_page >= 0 && g_row_y[touch_page] >= 0);
+    int target_x = g_rect[0] + (g_row_x0[touch_page] + g_row_x1[touch_page]) / 2;
+    int target_y = g_rect[1] + g_row_y[touch_page] + g_row_h / 2;
+    touch_runtime_presentation((TouchPresentation){4, 1920, 1080, 1920, 1080, 1, 0});
+    finger_tap(target_x, target_y); /* Ordinary menu layout and hit testing both stay in SDL pixels. */
+    assert(g_page == PAGE_TOUCH);
+    touch_runtime_presentation((TouchPresentation){1, 1920, 1080, 1920, 1080, 1, 0});
+    redraw_menu();
+    int enabled = row_of("touch_enabled");
+#ifdef _WIN32
+    char saved_touch[300]; snprintf(saved_touch, sizeof saved_touch, "%s/touch_controls.ini", dir);
+    HANDLE held_touch = CreateFileA(saved_touch, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    assert(held_touch != INVALID_HANDLE_VALUE);
+    finger_tap(g_rect[0] + (g_row_x0[enabled] + g_row_x1[enabled]) / 2, g_rect[1] + g_row_y[enabled] + g_row_h / 2);
+    assert(g_touch_error && !touch_runtime_snapshot().config.enabled);
+    assert(CloseHandle(held_touch));
+#endif
+    finger_tap(g_rect[0] + (g_row_x0[enabled] + g_row_x1[enabled]) / 2, g_rect[1] + g_row_y[enabled] + g_row_h / 2);
+    assert(touch_runtime_snapshot().config.enabled);
+    redraw_menu();
+    int edit = row_of("touch_edit");
+    finger_tap(g_rect[0] + (g_row_x0[edit] + g_row_x1[edit]) / 2, g_rect[1] + g_row_y[edit] + g_row_h / 2);
+    assert(touch_runtime_snapshot().editing && g_guest_frozen);
+    /* Editor coordinates also stay in SDL pixels, bypassing ordinary-menu gesture handling. */
+    TouchSnapshot editor_snapshot = touch_runtime_snapshot();
+    TouchRect editor_target = editor_snapshot.geometry.control[TOUCH_B];
+    touch_runtime_presentation((TouchPresentation){4, 1920, 1080, 1920, 1080, 1, 0});
+    touch_runtime_menu(1);
+    finger(0, editor_target.x + editor_target.w / 2, editor_target.y + editor_target.h / 2);
+    assert(touch_runtime_pointer(&queued));
+    assert(touch_runtime_editor_event(queued) == 0);
+    assert(touch_runtime_snapshot().selected == TOUCH_B);
+    finger(3, editor_target.x, editor_target.y);
+    while (touch_runtime_pointer(&queued)) { }
+    assert(touch_runtime_editor_event((TouchPointer){0, editor_target.x + editor_target.w / 2, editor_target.y + editor_target.h / 2}) == 0);
+    assert(touch_runtime_snapshot().selected == TOUCH_B);
+    assert(touch_runtime_editor_event((TouchPointer){3, 0, 0}) == 0);
+    touch_runtime_presentation((TouchPresentation){1, 1920, 1080, 1920, 1080, 1, 0});
+    g_menu_back = 1; Sleep(100); g_menu_back = 0; Sleep(100);
+    assert(!touch_runtime_snapshot().editing && g_page == PAGE_TOUCH && g_open);
+    redraw_menu();
+    finger_tap(g_rect[0] + g_close_r[0] + g_close_r[2] / 2, g_rect[1] + g_close_r[1] + g_close_r[3] / 2);
+    assert(g_page == PAGE_SETTINGS && g_open);
+    redraw_menu();
+    finger_tap(g_rect[0] + g_close_r[0] + g_close_r[2] / 2, g_rect[1] + g_close_r[1] + g_close_r[3] / 2);
+    Sleep(250);
+    assert(!g_open && !g_guest_frozen && !touch_runtime_snapshot().pad.buttons);
+    /* A changed presentation invalidates queued gesture fragments rather than joining taps across epochs. */
+    touch_runtime_menu(1);
+    finger(0, 200, 200);
+    assert(touch_runtime_pointer(&queued) && queued.type == 0);
+    touch_runtime_presentation((TouchPresentation){1, 1920, 1080, 1920, 1080, 1, 0});
+    finger(2, 200, 200);
+    assert(!touch_runtime_pointer(&queued));
+    touch_runtime_menu(0);
+    TouchRect hit_a = touch.geometry.control[TOUCH_A];
+    finger(1, hit_a.x + hit_a.w / 2, hit_a.y + hit_a.h / 2);
+    assert(!touch_runtime_snapshot().pad.buttons);
+    finger(0, hit_a.x + hit_a.w / 2, hit_a.y + hit_a.h / 2);
+    assert(touch_runtime_snapshot().pad.buttons & 1);
+    finger(2, hit_a.x + hit_a.w / 2, hit_a.y + hit_a.h / 2);
+#endif
+    pcmenu_open_controls(0);
+    Sleep(100);
+    assert(g_open && g_page == PAGE_CONTROLS && g_direct);
+    g_menu_back = 1; Sleep(150); g_menu_back = 0; Sleep(250);
+    assert(!g_open && !g_guest_frozen);
     printf("pcmenu self-test: all checks passed\n");
     return 0;
 }

@@ -442,6 +442,10 @@ static diag_replay_session_t *g_diag_active_replay_session = NULL;
 
 void diag_input_enable_synthetic_player1(bool enable) {
     g_diag_synthetic_player1_enabled = enable;
+#ifdef __ANDROID__
+    void touch_runtime_set_replay(int replay);
+    touch_runtime_set_replay(enable || (g_diag_active_replay_session && g_diag_active_replay_session->is_loaded) || getenv("WT_PLAY") != NULL);
+#endif
 }
 
 bool diag_input_is_synthetic_player1_enabled(void) {
@@ -453,6 +457,10 @@ void diag_input_set_active_replay(diag_replay_session_t *sess) {
     if (sess && sess->is_loaded) {
         g_diag_synthetic_player1_enabled = true;
     }
+#ifdef __ANDROID__
+    void touch_runtime_set_replay(int replay);
+    touch_runtime_set_replay(g_diag_synthetic_player1_enabled || (sess && sess->is_loaded) || getenv("WT_PLAY") != NULL);
+#endif
 }
 
 diag_replay_session_t *diag_input_get_active_replay(void) {
