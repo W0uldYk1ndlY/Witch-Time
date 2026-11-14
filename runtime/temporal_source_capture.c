@@ -27,7 +27,7 @@ uint32_t wt_tsc_active = WT_TSC_CLOSED;
 static uint32_t lock;
 static FILE *output, *summary;
 static WtTscBind game_bind;
-static uint64_t frame_now, first_frame, generation;
+static uint64_t frame_now, first_frame, generation, capture_epoch;
 static uint32_t reserved, overflow, unavailable, started, window_complete;
 static uint64_t core_loss;
 static uint32_t core_loss_checked;
@@ -42,15 +42,27 @@ static void stop(void) {
     __atomic_fetch_or(&admission, WT_TSC_CLOSED, __ATOMIC_ACQ_REL);
 }
 static void lost(void) { __atomic_fetch_add(&unavailable, 1, __ATOMIC_RELAXED); }
-static void append(WtTscRecord *r) {
+static void append_epoch(WtTscRecord *r, uint64_t epoch) {
     if (!wt_tsc_enabled()) return;
+    if (epoch && epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE)) return;
     uint64_t frame_snapshot = __atomic_load_n(&frame_now, __ATOMIC_ACQUIRE);
     uint32_t state = __atomic_load_n(&admission, __ATOMIC_ACQUIRE);
+#ifdef WT_TSC_TEST_BEFORE_ADMIT
+    WT_TSC_TEST_BEFORE_ADMIT();
+#endif
     do { if (!wt_tsc_gate_open(state)) return; }
     while (!__atomic_compare_exchange_n(&admission, &state, state + 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 #ifdef WT_TSC_TEST_AFTER_ADMIT
     WT_TSC_TEST_AFTER_ADMIT();
 #endif
+    /* An old callback may resume after CLOSED -> OPEN in a new run. Once admitted,
+       its writer count prevents reset until this second epoch check completes. */
+    if (epoch && epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE)) {
+        __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
+    }
+    if (epoch && (!r || r->version != WT_TSC_VERSION || r->size != sizeof *r || r->kind != WT_TSC_GUEST)) {
+        lost(); stop(); __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
+    }
     /* Freeze the label across admission; a racing interior-frame change is explicit loss. */
     if (frame_snapshot != __atomic_load_n(&frame_now, __ATOMIC_ACQUIRE)) {
         lost(); __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
@@ -69,11 +81,11 @@ static void append(WtTscRecord *r) {
     }
     __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE);
 }
-static void guest_emit(const WtTscRecord *in) {
-    if (!wt_tsc_enabled()) return;
-    if (!in || in->version != WT_TSC_VERSION || in->size != sizeof *in || in->kind != WT_TSC_GUEST) {
-        lost(); stop();
-    } else { WtTscRecord r = *in; append(&r); }
+static void append(WtTscRecord *r) { append_epoch(r, 0); }
+static void guest_emit(uint64_t epoch, const WtTscRecord *in) {
+    if (!epoch || epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE) || !wt_tsc_enabled()) return;
+    if (!in) append_epoch(NULL, epoch);
+    else { WtTscRecord r = *in; append_epoch(&r, epoch); }
 }
 int wt_tsc_start(const char *dir, int requested, WtTscBind bind) {
     /* The run owner must finish before restarting; do not overwrite live state. */
@@ -102,8 +114,11 @@ int wt_tsc_start(const char *dir, int requested, WtTscBind bind) {
     __atomic_store_n(&admission, WT_TSC_CLOSED, __ATOMIC_RELEASE);
     memset(slots, 0, sizeof slots);
     memset(buffers, 0, sizeof buffers);
+    uint64_t epoch = __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE) + 1;
+    if (!epoch) epoch = 1;
+    __atomic_store_n(&capture_epoch, epoch, __ATOMIC_RELEASE);
     game_bind = bind;
-    if (!bind || bind(WT_TSC_VERSION, sizeof(WtTscRecord), &admission, guest_emit)) lost();
+    if (!bind || bind(WT_TSC_VERSION, sizeof(WtTscRecord), epoch, &admission, guest_emit)) lost();
     else bound = 1;
     __atomic_store_n(&requested_run, 1, __ATOMIC_RELEASE);
     return bound ? 0 : -1;
@@ -219,7 +234,7 @@ int wt_tsc_finish(void) {
         if (r->kind == WT_TSC_GUEST) guest_records++;
         if (r->kind == WT_TSC_BACKEND) backend_records++;
     }
-    if (bound) game_bind(WT_TSC_VERSION, sizeof(WtTscRecord), NULL, NULL);
+    if (bound) game_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 0, NULL, NULL);
     if (fclose(output)) io_error = 1;
     uint32_t loss = __atomic_load_n(&unavailable, __ATOMIC_ACQUIRE);
     uint32_t over = __atomic_load_n(&overflow, __ATOMIC_ACQUIRE);

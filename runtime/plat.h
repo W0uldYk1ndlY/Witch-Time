@@ -63,6 +63,7 @@ static inline int plat_soft_ww_teardown(void) { return 0; }
 #include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
