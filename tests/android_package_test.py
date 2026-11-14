@@ -43,14 +43,16 @@ class AndroidPackageTests(unittest.TestCase):
     def test_no_broad_storage_or_network_permissions(self):
         root = ET.parse(ROOT / 'android/app/src/main/AndroidManifest.xml').getroot()
         self.assertEqual(root.findall('uses-permission'), [])
-        activity = root.find('application/activity')
+        activity = next(a for a in root.findall('application/activity') if a.get(ANDROID + 'name') == '.WitchTimeActivity')
         self.assertEqual(activity.get(ANDROID + 'resizeableActivity'), 'true')
 
     def test_private_paths_and_missing_game_check_precede_loading(self):
         source = (ROOT / 'android/app/src/main/cpp/main.c').read_text()
         self.assertIn('SDL_GetAndroidExternalStoragePath()', source)
-        self.assertLess(source.index('freopen("runtime.log"'), source.index('dlopen('))
-        self.assertLess(source.index('access("targets/exefs/main.elf"'), source.index('dlopen('))
+        runtime_load = source.index('dlopen("libwitchtime.so"')
+        self.assertLess(source.index('freopen("runtime.log"'), runtime_load)
+        self.assertLess(source.index('access("targets/exefs/main.elf"'), runtime_load)
+        self.assertLess(source.index('dlopen("libsave_export.so", RTLD_NOW | RTLD_NOLOAD)'), runtime_load)
         for name in ['WT_USERDATA', 'WT_ROMFS', 'WT_CONFIG', 'WT_GRAPHICS_CONFIG']:
             self.assertIn('setenv("' + name + '"', source)
 

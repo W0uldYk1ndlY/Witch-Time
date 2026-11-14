@@ -34,6 +34,25 @@
 #include "hostrt.h"
 #include "diag.h"
 
+#ifdef __ANDROID__
+#include "restart_admission.h"
+static WtRestartAdmission g_fs_admission = WT_RESTART_ADMISSION_INIT;
+static _Thread_local unsigned g_fs_admission_depth;
+static int fs_admit(void) {
+    if (!g_fs_admission_depth++) wt_restart_enter(&g_fs_admission);
+    return 0;
+}
+static void fs_depart(int *unused) {
+    (void)unused;
+    if (!--g_fs_admission_depth) wt_restart_leave(&g_fs_admission);
+}
+#define FS_ADMIT() int fs_admitted __attribute__((cleanup(fs_depart))) = fs_admit()
+int wt_fs_restart_prepare(unsigned timeout_ms) { return wt_restart_close(&g_fs_admission, timeout_ms); }
+void wt_fs_restart_cancel(void) { wt_restart_open(&g_fs_admission); }
+#else
+#define FS_ADMIT() ((void)0)
+#endif
+
 #define A0 (c->x[0])
 #define A1 (c->x[1])
 #define A2 (c->x[2])
@@ -88,6 +107,7 @@ static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
 
 static void rom_mods_init(void);
 static void fs_roots(void) {
+    FS_ADMIT();
     if (g_rom_root[0]) return;
     const char *env = getenv("WT_ROMFS"), *user = getenv("WT_USERDATA");
     strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
@@ -720,6 +740,7 @@ int fs_dir_hidden(const char *guest_dir, const char *name) {      /* 1 = this en
     return hidden;
 }
 uint32_t fs_delete_directory(const char *guest) {
+    FS_ADMIT();
     Mount *m; char rel[MAX_PATH], host[MAX_PATH], roots[FS_DIR_ROOTS][MAX_PATH];
     uint32_t r;
     fs_lock();
@@ -866,6 +887,7 @@ static void journal_recover(const char *root) {
     commit_done(mx);
 }
 static uint32_t mount_add(const char *name, int kind, const char *root) {
+    FS_ADMIT();
     Mount *m = NULL;
     size_t n = name ? strlen(name) : 0;
     if (!n || n >= sizeof m->name) return RESULT_GENERIC_FAILURE;
@@ -891,12 +913,14 @@ static void save_dir(char *dir, const char *leaf) { fs_roots(); snprintf(dir, MA
  * MountSaveData of save data that does not exist fails as on the console. */
 static int save_exists(void) { char dir[MAX_PATH]; save_dir(dir, "save"); return is_dir(dir); }
 static void fs_MountRom(Ctx *c) {                        /* (name, cache buffer, cache size): the buffer holds the RomFS metadata cache of the SDK's reader; the host reads the extracted tree */
+    FS_ADMIT();
     fs_roots();
     uint32_t r = mount_add(STR(0), MK_ROM, g_rom_root);
     trace_printf("     fs mount rom \"%s\" -> %s (%x)\n", STR(0), g_rom_root, r);
     RET(r);
 }
 static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, const Uid &) */
+    FS_ADMIT();
     char dir[MAX_PATH];
     save_dir(dir, "save");
     if (!save_exists()) { trace_printf("     fs mount save data \"%s\": no save data (EnsureSaveData was not called)\n", STR(0)); RET(RESULT_TARGET_NOT_FOUND); return; }
@@ -906,6 +930,7 @@ static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, c
     RET(r);
 }
 static void fs_Unmount(Ctx *c) {                         /* (const char *name): uncommitted changes are dropped */
+    FS_ADMIT();
     const char *name = STR(0);
     fs_lock();
     Mount *m = name ? mount_find(name, strlen(name)) : NULL;
@@ -919,12 +944,14 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     fs_unlock();
 }
 static void fs_EnsureSaveData(Ctx *c) {                  /* (const Uid &): creates the user's save data if there is none */
+    FS_ADMIT();
     char dir[MAX_PATH];
     save_dir(dir, "save");
     RET(CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_IsSaveDataExisting(Ctx *c) { RET(save_exists()); }
 static void fs_Commit(Ctx *c) {                          /* (const char *mount name) */
+    FS_ADMIT();
     const char *name = STR(0);
     char journal[MAX_PATH], marker[MAX_PATH];
     fs_lock();
@@ -1190,6 +1217,7 @@ static void ui_pkz_read(HANDLE h, int64_t off) {
     for (int i = 0; i < 4; i++) if (g_ui_h[i] == h) { pcmenu_hint(); return; }
 }
 static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const char *path, int mode) */
+    FS_ADMIT();
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m = NULL;
     HANDLE h = INVALID_HANDLE_VALUE;
@@ -1229,7 +1257,7 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
     if (diag_is_enabled()) diag_hook_file_op(DIAG_FILE_OP_OPEN, 0, 0, 0);
     RET(0);
 }
-static void fs_CloseFile(Ctx *c) { if (A0) { open_mode((HANDLE)A0, 1); prompt_swap_close((HANDLE)A0); pkz_open_close((HANDLE)A0); CloseHandle((HANDLE)A0); } }
+static void fs_CloseFile(Ctx *c) { FS_ADMIT(); if (A0) { open_mode((HANDLE)A0, 1); prompt_swap_close((HANDLE)A0); pkz_open_close((HANDLE)A0); CloseHandle((HANDLE)A0); } }
 extern int g_hitch_ms; void hitch_note(const char *s);      /* hitch.c: WT_HITCH */
 static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     if (g_hitch_ms) { char note[80]; snprintf(note, sizeof note, "read of %llu KB", (unsigned long long)(size >> 10)); hitch_note(note); }
@@ -1265,6 +1293,7 @@ static void fs_ReadFileCount(Ctx *c) {                /* (size_t *outRead, handl
     RET(0);
 }
 static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer, size, option) */
+    FS_ADMIT();
     OVERLAPPED ov = {0};
     ov.Offset = (DWORD)A1;
     ov.OffsetHigh = (DWORD)(A1 >> 32);
@@ -1282,8 +1311,9 @@ static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer
     }
     RET(0);
 }
-static void fs_FlushFile(Ctx *c) { FlushFileBuffers((HANDLE)A0); RET(0); }   /* [witchtime] (handle) */
+static void fs_FlushFile(Ctx *c) { FS_ADMIT(); FlushFileBuffers((HANDLE)A0); RET(0); }   /* [witchtime] (handle) */
 static void fs_SetFileSize(Ctx *c) {                  /* [witchtime] (handle, size) */
+    FS_ADMIT();
     LARGE_INTEGER to; to.QuadPart = (LONGLONG)A1;
     if (!(open_mode((HANDLE)A0, 0) & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
     RET(SetFilePointerEx((HANDLE)A0, to, NULL, FILE_BEGIN) && SetEndOfFile((HANDLE)A0) ? 0 : RESULT_GENERIC_FAILURE);
@@ -1309,6 +1339,7 @@ static uint32_t create_target(const char *guest, Mount **mount, char *rel, char 
     return 0;
 }
 static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
+    FS_ADMIT();
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m;
     fs_lock();
@@ -1329,6 +1360,7 @@ static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
     RET(r);
 }
 static void fs_DeleteFile(Ctx *c) {
+    FS_ADMIT();
     char rel[MAX_PATH], path[MAX_PATH], w[MAX_PATH], cm[MAX_PATH];
     Mount *m;
     fs_lock();
@@ -1344,6 +1376,7 @@ static void fs_DeleteFile(Ctx *c) {
     RET(r);
 }
 static void fs_CreateDirectory(Ctx *c) {
+    FS_ADMIT();
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m;
     fs_lock();
@@ -1367,7 +1400,7 @@ static void fs_OpenDirectory(Ctx *c) { wr64(A0, 0); RET(RESULT_PATH_NOT_FOUND); 
 static void fs_false(Ctx *c) { RET(0); }
 
 /* ---- self-test of the mount table and of the save data journal, in a scratch folder under %TEMP% (WT_SDK_SELFTEST) */
-uint32_t fs_mount_plain(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_PLAIN, host_dir); }
+uint32_t fs_mount_plain(const char *name, const char *host_dir) { FS_ADMIT(); fs_roots(); return mount_add(name, MK_PLAIN, host_dir); }
 static int st_host_is(const char *path, const char *text) {
     char buf[64] = "";
     FILE *f = fopen(path, "rb");

@@ -139,6 +139,31 @@ static struct {
 static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
 
+#ifdef __ANDROID__
+/* Bootstrap sets these before starting the render thread; the loader remains bootstrap-owned. */
+static void *g_android_vk_loader;
+static void (*g_android_vk_presented)(void);
+static int g_android_vk_init_started;
+__attribute__((visibility("default")))
+void nvn_vk_android_set_driver(void *loader, void (*presented)(void)) {
+    if (g_android_vk_init_started) return;
+    g_android_vk_loader = loader;
+    g_android_vk_presented = presented;
+}
+#endif
+
+static void vk_presented(VkResult r) {
+#ifdef __ANDROID__
+    if ((r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && g_android_vk_presented) {
+        void (*presented)(void) = g_android_vk_presented;
+        g_android_vk_presented = NULL;
+        presented();
+    }
+#else
+    (void)r;
+#endif
+}
+
 static const char *vk_result_name(VkResult r) {
     static char buf[32];
     switch (r) {
@@ -414,7 +439,14 @@ int nvn_vk_init(void *hwnd) {
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+#ifdef __ANDROID__
+    g_android_vk_init_started = 1;
+    V.loader = g_android_vk_loader ? g_android_vk_loader : LoadLibraryA("vulkan-1.dll");
+    printf("nvn_vk: Android Vulkan loader source: %s (device identity follows; custom driver not verified)\n",
+           g_android_vk_loader ? "bootstrap-supplied loader" : "system default");
+#else
     V.loader = LoadLibraryA("vulkan-1.dll");
+#endif
     if (!V.loader) { printf("nvn_vk: the Vulkan loader cannot be loaded (error %lu): no usable Vulkan driver\n", (unsigned long)GetLastError()); fflush(stdout); ExitProcess(5); }
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
@@ -664,6 +696,7 @@ static void present_colour(const float rgba[4]) {
     pr.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &V.rendered; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
     r = vkQueuePresentKHR(V.queue, &pr);
+    vk_presented(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
     else vk_ok("vkQueuePresentKHR", r);
     InterlockedIncrement64(&g_vk_frames);
@@ -678,6 +711,11 @@ void nvn_vk_present_black(void) {
 
 /* nvnQueueFlush / nvnQueueFinish: nothing is recorded between presents yet; Finish waits for the last submit. */
 void nvn_vk_flush(int finish) { if (V.alive && finish) wait_last_submit(); }
+/* Restart parks the live device; unlike teardown, driver failure is not fatal. */
+int nvn_vk_driver_restart_idle(void) {
+    if (!V.alive || !V.device || !vkDeviceWaitIdle) return 0;
+    return vkDeviceWaitIdle(V.device) == VK_SUCCESS;
+}
 
 void nvn_vk_shutdown(void) {
     if (!V.alive) return;

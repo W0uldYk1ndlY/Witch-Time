@@ -46,6 +46,7 @@ class Wiring(unittest.TestCase):
                 public class ExportGateTest {
                     public static void main(String[] args) throws Exception {
                         SaveExportActivity rejected=new SaveExportActivity();
+                        if(SaveExportActivity.gameLibrariesRequested()) throw new AssertionError("game load already requested");
                         rejected.onCreate(null);
                         if(!rejected.finished) throw new AssertionError("invalid action did not stop");
                         Method begin=SaveExportActivity.class.getDeclaredMethod("beginExport");
@@ -56,6 +57,7 @@ class Wiring(unittest.TestCase):
                         if(SaveExportActivity.beginGameLibraryLoad()) throw new AssertionError("SDL allowed during export");
                         end.invoke(null);
                         if(!SaveExportActivity.beginGameLibraryLoad()) throw new AssertionError();
+                        if(!SaveExportActivity.gameLibrariesRequested()) throw new AssertionError("game load request missing");
                         if((Boolean)begin.invoke(null)) throw new AssertionError("export allowed after game loading");
                     }
                 }''',
@@ -103,6 +105,7 @@ class Wiring(unittest.TestCase):
 
     def test_game_entry_fails_closed(self):
         main = (CPP / 'main.c').read_text()
+        main = main[main.index('int SDL_main('):]
         self.assertLess(main.index('wt_save_export_in_progress'), main.index('SDL_SetHint'))
         self.assertLess(main.index('diag_bootstrap_save_export_requested()'), main.index('diag_bootstrap_apply_session_environment'))
         self.assertLess(main.index('diag_bootstrap_save_export_requested()'), main.index('dlopen("libwitchtime.so"'))

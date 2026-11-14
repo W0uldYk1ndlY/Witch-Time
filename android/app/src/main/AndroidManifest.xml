@@ -2,13 +2,16 @@
     <uses-feature android:glEsVersion="0x00030000" android:required="false" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="4206592" android:required="true" />
     <application android:label="Witch Time (experimental)" android:allowBackup="false" android:extractNativeLibs="true" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
-        <activity android:name=".SaveExportActivity" android:exported="true" android:noHistory="true" />
-        <profileable android:shell="true" />
-        <activity android:name=".WitchTimeActivity" android:exported="true" android:resizeableActivity="true" android:showWhenLocked="true" android:turnScreenOn="true" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density">
+        <activity android:name=".LauncherActivity" android:exported="true" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|fontScale">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".GpuDriverActivity" android:exported="false" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|fontScale" />
+        <activity android:name=".GpuDriverRestartActivity" android:exported="false" android:process=":restart" />
+        <activity android:name=".SaveExportActivity" android:exported="true" android:noHistory="true" />
+        <profileable android:shell="true" />
+        <activity android:name=".WitchTimeActivity" android:exported="true" android:resizeableActivity="true" android:showWhenLocked="true" android:turnScreenOn="true" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density" />
     </application>
 </manifest>

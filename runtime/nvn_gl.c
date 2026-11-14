@@ -257,6 +257,25 @@ static Job *g_job_head, *g_job_tail;
 static volatile LONG64 g_job_posted_n, g_job_ran_n;      /* finding 138: jobs posted (under g_job_lock) / run by the render thread; jobs run in the order posted */
 static HANDLE g_job_event, g_ready_event;
 static DWORD g_render_tid;
+/* No FS locks may be held across prepare/cancel. Nested admitted calls must drain. */
+static SRWLOCK g_restart_lock = SRWLOCK_INIT, g_restart_op = SRWLOCK_INIT;
+static int g_restart_closed, g_restart_active, g_restart_teardown;
+static _Thread_local unsigned t_restart_depth;
+void wt_gpu_restart_enter(void) {
+    if (GetCurrentThreadId() == g_render_tid || t_restart_depth++) return;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_restart_lock);
+        if (!g_restart_closed) { g_restart_active++; ReleaseSRWLockExclusive(&g_restart_lock); return; }
+        ReleaseSRWLockExclusive(&g_restart_lock);
+        Sleep(1);
+    }
+}
+void wt_gpu_restart_leave(void) {
+    if (GetCurrentThreadId() == g_render_tid || --t_restart_depth) return;
+    AcquireSRWLockExclusive(&g_restart_lock);
+    g_restart_active--;
+    ReleaseSRWLockExclusive(&g_restart_lock);
+}
 static HWND g_hwnd;
 static HDC g_dc;
 static _Thread_local HANDLE t_done;
@@ -304,6 +323,7 @@ static int jw_kind(void (*fn)(void *)) {
 }
 static void gl_run(void (*fn)(void *), void *arg) {
     if (GetCurrentThreadId() == g_render_tid) { fn(arg); return; }
+    wt_gpu_restart_enter();
     if (!t_done) t_done = CreateEventA(NULL, FALSE, FALSE, NULL);
     Job j = {fn, arg, t_done, NULL};
     LONG64 pf0 = pf_now();
@@ -327,6 +347,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     t_jw[0] = 1; t_jw[1] = j.t0 - pf0; t_jw[2] = j.t1 - j.t0; t_jw[3] = now - j.t1;      /* finding 138 */
     t_jw[4] = busy && (busy == g_rb->submit || busy == g_rb->submit_async); t_jw[5] = subs; t_jw[6] = pres + (busy && busy == g_rb->present);
     if (fn != g_rb->sync_wait) jw_add(jw_kind(fn), t_jw);
+    wt_gpu_restart_leave();
 }
 
 /* P3: nvnQueueSubmitCommands / FenceSync / Flush do not wait for the render thread (WT_SYNC_SUBMIT=1: they wait, as before).
@@ -351,6 +372,7 @@ static int gl_async_on(void) {
 }
 static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /* run fn(copy of arg) on the render thread, in order, without waiting */
     if (GetCurrentThreadId() == g_render_tid) { fn((void *)arg); return; }
+    wt_gpu_restart_enter();
     Job *j = malloc(sizeof *j + size + 8);
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
@@ -362,8 +384,64 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     g_job_tail = j;
     LeaveCriticalSection(&g_job_lock);
     SetEvent(g_job_event);
+    wt_gpu_restart_leave();
 }
 static void gl_barrier(void) { if (g_async_pending) gl_run(job_nop, NULL); }   /* everything queued so far has run when this returns */
+
+static Job g_restart_job;
+static int g_restart_pending, g_restart_result;
+int nvn_vk_driver_restart_idle(void);
+static void job_restart_idle(void *arg) {
+    (void)arg;
+    if (g_rb == &rb_vk) g_restart_result = nvn_vk_driver_restart_idle();
+    else { glFinish(); g_restart_result = 1; }
+}
+/* Timeout leaves admission CLOSED and the persistent job alive until cancel. */
+int wt_gpu_restart_prepare(unsigned timeout_ms) {
+    if (GetCurrentThreadId() == g_render_tid || t_restart_depth) return 0;
+    AcquireSRWLockExclusive(&g_restart_op);
+    ULONGLONG start = GetTickCount64();
+    AcquireSRWLockExclusive(&g_restart_lock);
+    if (g_restart_closed) { ReleaseSRWLockExclusive(&g_restart_lock); ReleaseSRWLockExclusive(&g_restart_op); return 0; }
+    g_restart_closed = 1;
+    for (;;) {
+        int active = g_restart_active;
+        ReleaseSRWLockExclusive(&g_restart_lock);
+        if (!active) break;
+        if (GetTickCount64() - start >= timeout_ms) { ReleaseSRWLockExclusive(&g_restart_op); return 0; }
+        Sleep(1);
+        AcquireSRWLockExclusive(&g_restart_lock);
+    }
+    int ok = 0;
+    if (!g_restart_teardown && g_render_tid && g_job_event) {
+        if (!g_restart_job.done) g_restart_job.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (g_restart_job.done) {
+            g_restart_job.fn = job_restart_idle; g_restart_job.arg = NULL; g_restart_job.next = NULL;
+            g_restart_result = 0; g_restart_pending = 1;
+            EnterCriticalSection(&g_job_lock);
+            if (g_job_tail) g_job_tail->next = &g_restart_job; else g_job_head = &g_restart_job;
+            g_job_tail = &g_restart_job; g_job_posted_n++;
+            LeaveCriticalSection(&g_job_lock);
+            SetEvent(g_job_event);
+            ULONGLONG elapsed = GetTickCount64() - start;
+            DWORD left = elapsed >= timeout_ms ? 0 : timeout_ms - (DWORD)elapsed;
+            if (left == INFINITE) left--;
+            if (WaitForSingleObject(g_restart_job.done, left) == WAIT_OBJECT_0) { g_restart_pending = 0; ok = g_restart_result; }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_restart_op);
+    return ok;
+}
+void wt_gpu_restart_cancel(void) {
+    if (GetCurrentThreadId() == g_render_tid || t_restart_depth) return;
+    AcquireSRWLockExclusive(&g_restart_op);
+    /* A hung driver remains fail-closed: never reopen beneath its outstanding idle. */
+    if (g_restart_pending) { WaitForSingleObject(g_restart_job.done, INFINITE); g_restart_pending = 0; }
+    AcquireSRWLockExclusive(&g_restart_lock);
+    g_restart_closed = 0;
+    ReleaseSRWLockExclusive(&g_restart_lock);
+    ReleaseSRWLockExclusive(&g_restart_op);
+}
 
 /* ---------------------------------------------------------------- statistics and diagnostics */
 static struct {
@@ -6166,11 +6244,15 @@ int nvn_front_clip_modes(void) { return g_origin_mode | g_depth_mode << 8; }
 const char *nvn_front_op_name(unsigned op) { return k_op_name[op < OP_COUNT ? op : 0]; }
 void *nvn_front_hwnd(void) { return g_hwnd; }
 static void job_vk_shutdown(void *arg) { (void)arg; nvn_vk_shutdown(); }
-/* At exit (nvn_gl_report): the render thread destroys the Vulkan objects. It is given 3 s: a render thread that is held
- * in a job at that moment is left alone (the process is ending) and that is said. */
+/* At exit only: admission orders publication; teardown permanently invalidates restart readiness. */
 static void vk_shutdown_at_exit(void) {
     static Job j;
-    if (GetCurrentThreadId() == g_render_tid) { nvn_vk_shutdown(); return; }
+    int render = GetCurrentThreadId() == g_render_tid;
+    if (!render) wt_gpu_restart_enter();
+    AcquireSRWLockExclusive(&g_restart_lock);
+    g_restart_teardown = 1;
+    ReleaseSRWLockExclusive(&g_restart_lock);
+    if (render) { nvn_vk_shutdown(); return; }
     j.fn = job_vk_shutdown; j.arg = NULL; j.next = NULL; j.done = CreateEventA(NULL, FALSE, FALSE, NULL);
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
@@ -6188,6 +6270,7 @@ static void vk_shutdown_at_exit(void) {
         else printf("nvn_vk: shutdown finished %.1f s after the first 3 s\n", (double)(GetTickCount64() - t0) / 1000.0);
         fflush(stdout);
     }
+    wt_gpu_restart_leave();
 }
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
@@ -6436,8 +6519,17 @@ static const struct { const char *name; ImportFn fn; } k_nvn[] = {
     {"nvnCommandBufferSetZCullZF32CompressionEnable", n55_nop}, {"nvnMemoryPoolMapVirtual", n55_true},
 };
 
+#define WG(fn) static void restart_##fn(Ctx *c) { wt_gpu_restart_enter(); fn(c); wt_gpu_restart_leave(); }
+#include "nvn_restart_entries.inc"
+#undef WG
+static ImportFn restart_entry(ImportFn fn) {
+#define WG(impl) if (fn == impl) return restart_##impl;
+#include "nvn_restart_entries.inc"
+#undef WG
+    return NULL; /* Fail closed if a new table entry has no admission wrapper. */
+}
 /* The host function for an NVN entry point, or NULL when this backend does not implement it. */
 ImportFn nvn_gl_pick(const char *name) {
-    for (size_t i = 0; i < sizeof k_nvn / sizeof k_nvn[0]; i++) if (strcmp(name, k_nvn[i].name) == 0) return k_nvn[i].fn;
+    for (size_t i = 0; i < sizeof k_nvn / sizeof k_nvn[0]; i++) if (strcmp(name, k_nvn[i].name) == 0) return restart_entry(k_nvn[i].fn);
     return NULL;
 }

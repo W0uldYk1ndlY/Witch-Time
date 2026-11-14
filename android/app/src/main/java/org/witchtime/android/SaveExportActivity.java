@@ -10,6 +10,9 @@ import java.util.List;
 /** Deliberately not an SDLActivity: no SDL/native game lifecycle is entered. */
 public final class SaveExportActivity extends Activity {
     private static boolean exporting, gameLibrariesRequested;
+    static synchronized boolean gameLibrariesRequested() {
+        return gameLibrariesRequested;
+    }
     static synchronized boolean beginGameLibraryLoad() {
         if (exporting) return false;
         gameLibrariesRequested = true;
