@@ -1,6 +1,4 @@
 plugins { id 'com.android.application' }
-ext.wtTurnipBundleSource = file('../third_party/turnip_adreno830')
-apply from: new File(wtTurnipBundleSource, 'bundle.gradle')
 def sdlSource = providers.environmentVariable('WT_SDL_SOURCE').orNull
 def nativePrefix = providers.environmentVariable('WTBUILD_ANDROID_DEPS').orNull
 if (!sdlSource || !nativePrefix) throw new GradleException('Set WT_SDL_SOURCE to SDL 3 source and WTBUILD_ANDROID_DEPS to the Android dependency prefix.')
@@ -48,11 +46,9 @@ android {
     }
     sourceSets.main {
         assets.srcDir '../third_party/gpu_driver'
-        assets.srcDir layout.buildDirectory.dir('generated/turnipAssets')
         java.srcDir "${sdlSource}/android-project/app/src/main/java"
         jniLibs.srcDirs = ['src/main/jniLibs']
     }
     externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
     packaging { jniLibs { useLegacyPackaging = true } }
 }
-tasks.named('preBuild').configure { dependsOn tasks.named('generateTurnipBundleAssets') }

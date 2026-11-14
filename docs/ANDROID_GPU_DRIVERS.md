@@ -2,8 +2,8 @@
 
 ## Scope and safety
 
-The in-game PC Settings menu offers System default, the bundled Turnip Adreno
-830 profile and imported driver packages. Ordinary startup skips the chooser.
+The in-game PC Settings menu offers System default and imported driver packages.
+No driver binary is bundled, generated or downloaded by the build. Ordinary startup skips the chooser.
 Changes apply through a fresh-process restart, never to the live Vulkan loader.
 This changes only the application's Vulkan loading path, not the system driver.
 
@@ -16,13 +16,13 @@ Turnip is not a universal solution for Mali or Samsung Xclipse devices.
 Existing resolution, 16× anisotropy, LOD −1, upscaling and pacing settings are
 unchanged. Driver selection is not a promise of higher FPS or lower power use.
 Texture-quality reductions and application-side driver downloads are outside
-this change. Only the verified bundled profile applies its reference
+this change. Only an already-installed, verified legacy profile applies its reference
 `TU_DEBUG=sysmem,nobin` preset; System, imported drivers and fallback do not.
 
 ## Selecting a driver
 
 1. Open **Graphics driver** in the in-game PC Settings menu. Choose System,
-   bundled Turnip Adreno 830, or a trusted imported ZIP. Import alone does not
+   or a trusted imported ZIP. Import alone does not
    change the selection.
 2. Confirm the restart warning. Unsaved gameplay progress is not automatically
    saved. The chooser returns to the resumed game Activity before draining work.
@@ -97,8 +97,8 @@ Reject unsafe paths, duplicate destinations, invalid metadata, incompatible
 ELF libraries and archives exceeding bounded resource limits. Failure must
 leave the previous selected package intact.
 
-The initial importer accepts a flat ZIP containing `meta.json` with string
-`name`, `version` and `libraryName` fields; optional `minApi` must be compatible
+The importer accepts a flat ZIP containing `meta.json` with string
+`name`, `version` (or `packageVersion` when `version` is absent) and `libraryName` fields; optional `minApi` must be compatible
 with the running Android version. The entry library must be little-endian
 AArch64 ELF64 `ET_DYN`. Nested/directory entries, links, encrypted/split archives
 and ZIP64 are not supported. Limits are 64 MiB archive input, 128 files,
@@ -125,21 +125,20 @@ Do not copy that project's unrestricted archive extraction or unrelated presets.
 Dependency pins, source acquisition and BSD-2-Clause notices are maintained in
 `android/third_party/gpu_driver/`. SDL is consumed unchanged.
 
-### Bundled Adreno 830 profile
+### Legacy Adreno 830 upgrade compatibility
 
-`android/third_party/turnip_adreno830/` records provenance and notices. The build
-generates, rather than commits, the exact reference binary as
-`bundled_driver/adreno830/vulkan.mesa26_3_gralloc_a8xx.so` (14,495,432 bytes;
-SHA-256 `64ad4fbab81e787eb4373bccc4d02604e1b8a87bd2dc7e850bc9f7e91f881221`).
-Local input and cached assets are hash-checked too. Provisioning publishes an
-immutable private package and revalidates it before selection/preparation.
+The former built-in profile is no longer packaged, provisioned or offered in the
+chooser. Driver releases are user-managed through ZIP import. Stale generated
+Turnip assets are not a Gradle asset source.
 
-Profile ID: `turnip-adreno830-unleashed-mesa26.3-gralloc`. Its API 35 floor is a
-chosen support boundary, not an inferred ELF minimum. Reference provenance names
-Mesa `6b9cd5ab9cc3bfd0c79d9500a07a5e74351c72d1` and the gralloc UBWC patch 0010.
-The exact binary is pinned; a reproducible rebuild and complete binary-component
-redistribution inventory are not established. This batch targets a private local
-APK, not public distribution. Hardware compatibility remains unverified.
+An existing selected private `turnip-adreno830-unleashed-mesa26.3-gralloc` package
+continues to launch silently only after the original metadata, API 35, size and
+SHA-256 checks pass. Invalid or quarantined packages fall back to System. Opening
+the chooser does not change that selection; confirming System or an imported
+driver applies the usual next-process restart. No existing package, startup
+marker or pending restart request is automatically deleted by this removal.
+The historical verification records below describe earlier APKs with different
+packaging, not the current build.
 
 ## Verification boundary
 

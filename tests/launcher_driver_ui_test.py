@@ -52,12 +52,11 @@ class LauncherDriverUiTest(unittest.TestCase):
         self.assertIn("showProgress(Activity activity, String message)", RESTART_UI)
         self.assertIn("showError(Activity activity, String message)", RESTART_UI)
 
-    def test_chooser_offers_system_turnip_and_imported_then_stages_nonce(self):
-        self.assertIn("store.ensureBundledDriver()", CHOOSER)
-        self.assertIn("GpuDriverStore.BUNDLED_ID", CHOOSER)
+    def test_chooser_offers_only_system_and_imported_then_stages_nonce(self):
+        self.assertNotIn("ensureBundledDriver", CHOOSER)
+        self.assertNotIn("BUNDLED_ID", CHOOSER)
         self.assertIn('addOption("system", "System default"', CHOOSER)
-        self.assertIn('"Turnip', CHOOSER)
-        self.assertIn('Adreno 830"', CHOOSER)
+        self.assertNotIn('"Turnip', CHOOSER)
         self.assertIn("store.importZip(in)", CHOOSER)
         self.assertIn("store.stageRestart(id, !\"system\".equals(id))", CHOOSER)
         self.assertIn("EXTRA_RESTART_NONCE", CHOOSER)

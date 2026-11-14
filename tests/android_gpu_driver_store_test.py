@@ -146,24 +146,15 @@ public class Harness {
     File[] staging=new File(root,"gpu-drivers").listFiles((dir,name) -> name.startsWith(".stage-"));
     if(staging==null || staging.length!=0) throw new AssertionError("Staging not cleaned");
      break;
-    case "bundle":
-     String previous=store.selectedId();
-     GpuDriverStore.Driver bundled=store.ensureBundledDriver();
-     if(!bundled.id.equals(GpuDriverStore.BUNDLED_ID) || !store.selectedId().equals(previous)) throw new AssertionError("Provision selected driver");
-     if(store.listDrivers().stream().noneMatch(d -> d.id.equals(bundled.id))) throw new AssertionError("Missing bundle choice");
-     store.select(bundled.id);
-     String[] snapshot=store.prepare();
-     if(snapshot==null || snapshot.length!=5 || !snapshot[4].equals(GpuDriverStore.BUNDLED_ID)) throw new AssertionError("Bundled profile snapshot");
-     break;
-    case "bundle-frozen":
-     if(store.prepare()!=null) throw new AssertionError("Expected system");
-     store.ensureBundledDriver();
-     if(!store.selectedId().equals("system")) throw new AssertionError("Live selection changed");
-     try { store.select(GpuDriverStore.BUNDLED_ID); throw new AssertionError("Unfrozen select"); } catch(IOException expected) {}
-     break;
-    case "bundle-reject":
-     try { store.ensureBundledDriver(); throw new AssertionError("Accepted corrupt bundle"); } catch(IOException expected) {}
-     break;
+     case "legacy":
+      if(!store.selectedId().equals(GpuDriverStore.BUNDLED_ID)) throw new AssertionError("Lost legacy selection");
+      if(!store.listDrivers().isEmpty()) throw new AssertionError("Legacy chooser entry");
+      String[] snapshot=store.prepare();
+      if(snapshot==null || snapshot.length!=5 || !snapshot[4].equals(GpuDriverStore.BUNDLED_ID)) throw new AssertionError("Bundled profile snapshot");
+      break;
+     case "legacy-fallback":
+      if(!store.selectedId().equals(GpuDriverStore.BUNDLED_ID) || store.prepare()!=null || !store.listDrivers().isEmpty()) throw new AssertionError("Unsafe legacy fallback");
+      break;
     case "stage": case "live-stage":
      String active=store.selectedId();
      String[] live=args[0].equals("live-stage") ? store.prepare() : null;
@@ -451,16 +442,18 @@ class StoreTest(unittest.TestCase):
         self.run_java('seal-discard-fsync')
         self.assertFalse((self.files / 'gpu-drivers/restart').exists())
 
-    def bundle_assets(self, real=False):
-        profile = pathlib.Path('bundled_driver/adreno830')
-        source = ROOT / 'android/third_party/turnip_adreno830/assets' / profile
-        destination = self.files / 'assets' / profile
-        shutil.copytree(source, destination)
+    def legacy_package(self, real=False):
+        ident = 'turnip-adreno830-unleashed-mesa26.3-gralloc'
+        destination = self.files / 'gpu-drivers' / ident
+        destination.mkdir(parents=True)
+        (destination.parent / 'selected').write_text(ident)
+        (destination / 'meta.json').write_text(json.dumps(dict(name='Turnip — Adreno 830', version='Mesa 26.3.0-devel (Unleashed)', libraryName='vulkan.mesa26_3_gralloc_a8xx.so', minApi=35), ensure_ascii=False), encoding='utf-8')
+        (destination / 'bundle-manifest.json').write_text(json.dumps(dict(profileId=ident, sha256='64ad4fbab81e787eb4373bccc4d02604e1b8a87bd2dc7e850bc9f7e91f881221', sizeBytes=14495432)))
         library = destination / 'vulkan.mesa26_3_gralloc_a8xx.so'
         if real:
             binary = pathlib.Path(os.environ.get('WT_TURNIP_TEST_DRIVER', 'C:/Users/HomePC/AppData/Local/Temp/opencode/vulkan.mesa26_3_gralloc_a8xx.so'))
             if not binary.is_file():
-                self.skipTest('Set WT_TURNIP_TEST_DRIVER to the exact approved binary for provisioning success')
+                self.skipTest('Set WT_TURNIP_TEST_DRIVER to the exact legacy binary for upgrade success')
             shutil.copyfile(binary, library)
         else:
             header = bytearray(64)
@@ -471,35 +464,34 @@ class StoreTest(unittest.TestCase):
                 stream.truncate(14495432)
         return destination, library
 
-    def test_bundled_hash_failure_does_not_publish_or_select(self):
-        assets, library = self.bundle_assets()
-        self.run_java('bundle-reject')
-        store = self.files / 'gpu-drivers'
-        self.assertFalse((store / 'turnip-adreno830-unleashed-mesa26.3-gralloc').exists())
-        self.assertFalse(list(store.glob('.stage-*')))
-        self.assertFalse((store / 'selected').exists())
+    def test_invalid_legacy_upgrade_falls_back_without_deleting_private_state(self):
+        package, library = self.legacy_package()
+        restart = package.parent / 'restart'
+        restart.write_text('SEALED\nstale')
+        before = library.read_bytes()
+        self.run_java('legacy-fallback')
+        self.assertEqual(library.read_bytes(), before)
+        self.assertEqual(restart.read_text(), 'SEALED\nstale')
+        self.assertEqual((package.parent / 'selected').read_text(), package.name)
         with library.open('ab') as stream:
             stream.write(b'x')
-        self.run_java('bundle-reject')
-        self.assertFalse(list(store.glob('.stage-*')))
+        self.run_java('legacy-fallback')
 
-    def test_exact_bundle_provisioning_while_frozen_and_verified_profile(self):
-        self.bundle_assets(real=True)
-        self.run_java('bundle-frozen')
-        store = self.files / 'gpu-drivers'
-        bundled = store / 'turnip-adreno830-unleashed-mesa26.3-gralloc'
-        self.assertTrue(bundled.is_dir())
-        self.assertFalse((store / 'selected').exists())
-        self.run_java('bundle')
-        library = bundled / 'vulkan.mesa26_3_gralloc_a8xx.so'
+    def test_verified_legacy_upgrade_launches_silently_until_user_changes_driver(self):
+        package, library = self.legacy_package(real=True)
+        self.run_java('legacy')
+        self.run_java('quarantine')
+        self.run_java('retry')
         library.chmod(0o600)
         with library.open('r+b') as stream:
             stream.seek(100)
             value = stream.read(1)
             stream.seek(100)
             stream.write(bytes([value[0] ^ 1]))
-        self.run_java('bundle-reject')
+        self.run_java('legacy-fallback')
         self.assertTrue(library.exists(), 'Never replace/remove a corrupt published immutable package implicitly')
+        self.run_java('system')
+        self.assertTrue(library.exists())
 
 
 if __name__ == '__main__':
