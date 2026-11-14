@@ -119,7 +119,11 @@ than assigning an invented generation. Backend evidence is standalone pipeline
 selection, not proof that a Vulkan draw or GPU work executed. Absence at a hooked
 site is not proof that the broader route is unreachable.
 
-## Binary schema, version 1
+## Binary schema, version 2
+
+The binary record and bind/emit ABI use `WT_TSC_VERSION == 2`; the JSON
+sidecar's own schema version remains 1. Bindings carry a nonzero capture epoch,
+which is checked again after callback admission to isolate successive runs.
 
 Little-endian `WtTscRecord` contains four u32 fields (`version`, `size`, `kind`,
 `reserved`), then u64 `frame`, `sequence`, `site`, and sixteen u64 `word` entries.

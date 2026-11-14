@@ -47,5 +47,6 @@ Further changes (2026-10-15):
   Options-row patches (`options_row_patches`), the UI size sites of the aspect ratios (`UI_SIZE_SITES`) and, new in
   Rust, the frame-counter sites (`fps.rs`, `tools/wtbuild/fps_counters.txt`).
 - `test_ext.py` and `test_b3.py` -> `tools/lifter-check`, which runs words of both kinds of forms through the shipped
-  lifter (`wtbuild lift-words`), Unicorn and C. It finds `sq{r}dmulh` by element wrong when both 32-bit lanes are
-  INT32_MIN (`v_ielem` in `runtime/rt_ext.h`; open).
+  lifter (`wtbuild lift-words`), Unicorn and C. The by-element `sq{r}dmulh` INT32_MIN overflow
+  in `v_ielem` is fixed with a wide intermediate. Exact host and NDK machine-code regressions
+  are recorded in [`docs/ANDROID_TOP10.md`](../docs/ANDROID_TOP10.md); rebuild affected game objects.
