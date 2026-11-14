@@ -55,6 +55,7 @@ static float g_fr_gpu[FRSTAT_N];
 static LONG64 tk(void) { static LONG64 t; return ++t; }
 static void noop(void) {}
 #define dsh_forget noop
+#define draw_buffer_sets_forget noop
 #define garbage_collect noop
 #define gcp_settle_done noop
 #define nvn_front_done_moved noop

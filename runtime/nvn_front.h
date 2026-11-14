@@ -133,6 +133,12 @@ int nvn_front_tex_changed(Tex *t, uint32_t gen);
  * rgba8 = 0); decode == 3 into BC7 blocks from the pack (tex_pack.c), by tex_encode_bc7 where the pack lacks those bytes. Returns 0 when the memory is not readable. */
 typedef void nvn_front_put_fn(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t row_stride);
 int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put);
+/* Optional mapped upload destination for unchanged-format, tiled texels.
+ * Return NULL to use scratch storage. The pointer must hold size bytes and
+ * remain valid through the immediately following put() call; it is not retained.
+ * Linear sources and software-decoded formats keep their existing path. */
+typedef void *nvn_front_reserve_fn(Tex *t, int level, int layer, size_t size);
+int nvn_front_tex_read_into(Tex *t, int decode, nvn_front_put_fn *put, nvn_front_reserve_fn *reserve);
 int nvn_front_tex_prep(Tex *t, size_t *bytes);                               /* #45: starts the decode of an ASTC texture; 1 = done (*bytes of BC3), 0 = not yet, -1 = not this way */
 int nvn_front_tex_bc7(Tex *t);                                               /* #54: 1 = this ASTC texture's image takes BC7 from the pack */
 void nvn_front_tex_prep_drop(Tex *t);

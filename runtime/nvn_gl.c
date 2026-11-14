@@ -6050,7 +6050,7 @@ void nvn_front_tex_prep_report(void) {
     if (getenv("WT_TEXPREP_CHECK")) printf("nvn_vk_tex: TEST: %lld levels decoded ahead differ from a decode at the use\n", (long long)g_tp_diff);
 }
 /* tex_upload_memory with the texels handed to the caller instead of glTexSubImage. */
-int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
+int nvn_front_tex_read_into(Tex *t, int decode, nvn_front_put_fn *put, nvn_front_reserve_fn *reserve) {
     static uint8_t *tmp;
     static size_t tmp_cap;
     Fmt f;
@@ -6112,8 +6112,12 @@ encode:
                 g_st.tex_bytes += (LONG64)lin;
                 continue;
             }
-            if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
-            if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
+            if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) { if (pj) tp_free(pj); free(pack); return 0; }
+            /* Native ASTC/BC and ordinary texels can be deswizzled straight
+             * into the backend's coherent upload allocation. This removes
+             * the scratch -> mapped-buffer copy without changing any bytes. */
+            uint8_t *direct = !decode && reserve ? reserve(t, l, layer, lin) : NULL;
+            if (!direct && need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             {   /* TEST ONLY: WT_TEX_RAWDUMP=<dir> (with WT_ASTC_DUMP_ONLY=<format hex>): level 0 as it is in pool memory, and its layout */
                 static const char *rd = (const char *)1; static int only = -2;
                 if (rd == (const char *)1) { rd = getenv("WT_TEX_RAWDUMP"); only = getenv("WT_ASTC_DUMP_ONLY") ? (int)strtol(getenv("WT_ASTC_DUMP_ONLY"), NULL, 16) : -1; }
@@ -6126,7 +6130,7 @@ encode:
                     if ((fp = fopen(path, "wb"))) { fwrite(p, 1, n, fp); fclose(fp); }
                 }
             }
-            tex_deswizzle_level(&L, l, p, tmp);
+            tex_deswizzle_level(&L, l, p, direct ? direct : tmp);
             if (decode) {
                 unsigned bad0 = tex_astc_bad_blocks;
                 decode_par(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin, decode == 2 ? tmp + lin + rgba : NULL);      /* 3: tex_encode_bc7 below */
@@ -6136,13 +6140,16 @@ encode:
                 if (decode == 3) { tex_encode_bc7(tmp + lin, L.lvl_w[l], L.lvl_h[l], tmp + lin + rgba); put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin + rgba, bc3, 0, 0); }      /* #54 */
                 else if (decode == 2) put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin + rgba, bc3, 0, 0);      /* [issue 22] BC3 blocks */
                 else put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin, rgba, 1, 0);
-            } else put(t, l, layer, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l], tmp, lin, 0, 0);
+            } else put(t, l, layer, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l], direct ? direct : tmp, lin, 0, 0);
             g_st.tex_bytes += (LONG64)lin;
         }
     }
     if (pj) tp_free(pj);
     free(pack);
     return 1;
+}
+int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
+    return nvn_front_tex_read_into(t, decode, put, NULL);
 }
 int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v, SamplerParams *p) {
     uint32_t tid = (uint32_t)nh & 0xfffff, sid = (uint32_t)(nh >> 20) & 0xfff;
