@@ -60,6 +60,8 @@ No code is copied from these; they are named in comments as the source of number
 | llvm-mingw (LLVM / clang 23.1.2, lld, mingw-w64 headers and runtime), the default toolchain | 20260922 | LLVM: Apache-2.0 with LLVM exception; mingw-w64: ZPL 2.1, public domain and others (`COPYING.MinGW-w64-runtime.txt`) |
 | SDL3 | 3.4.18 | zlib |
 | Vulkan-Headers | vulkan-sdk-1.4.341.0 | Apache-2.0 / MIT |
+| libadrenotools (optional Android custom-loader path; built from source) | `8fae8ce254dfc1344527e05301e43f37dea2df80` | BSD-2-Clause, Billy Laws; `android/third_party/gpu_driver/libadrenotools.LICENSE`, also packaged as an APK asset |
+| liblinkernsbypass (libadrenotools dependency) | `aa3975893d83ef1bc84c321ec60c65fbf1287887` | BSD-2-Clause, Billy Laws; `android/third_party/gpu_driver/liblinkernsbypass.LICENSE`, also packaged as an APK asset |
 | glslang (built into `wt_glslang.dll`) | 16.6.0 | BSD-3-Clause, Apache-2.0 and others (see its LICENSE.txt) |
 | LLVM / clang (optional MSVC build, `--toolchain msvc`) | 9.0.0 | Apache-2.0 with LLVM exception |
 | unicorn-engine (Rust crate, only in `tools/lifter-check`, a developer's check never built for or shipped to players) | 2.1.5 | GPL-2.0 |

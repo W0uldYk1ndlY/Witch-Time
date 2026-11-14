@@ -20,6 +20,42 @@ import java.util.regex.Pattern;
 
 /** SDL owns the native thread and surface lifecycle. No storage permission is needed. */
 public final class WitchTimeActivity extends SDLActivity {
+    private static final int GPU_DRIVER_REQUEST = 0x4750;
+    private final GpuDriverRestartCoordinator driverRestart = new GpuDriverRestartCoordinator(this);
+    private String stagedDriverNonce;
+    native boolean nativePrepareDriverRestart(String nonce);
+    native void nativeCancelDriverRestart(String nonce);
+    native boolean nativeCommitDriverRestart(String nonce);
+    private native void nativeGpuDriverChooserCancelled();
+
+    public void showGpuDriverSettings() {
+        runOnUiThread(() -> {
+            if (!driverRestart.isResumed()) { nativeGpuDriverChooserCancelled(); return; }
+            try { startActivityForResult(new android.content.Intent(this, GpuDriverActivity.class), GPU_DRIVER_REQUEST); }
+            catch (RuntimeException e) { nativeGpuDriverChooserCancelled(); }
+        });
+    }
+    public boolean sealGpuDriverRestart(String nonce) { return driverRestart.seal(nonce); }
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != GPU_DRIVER_REQUEST) return;
+        stagedDriverNonce = result == RESULT_OK && data != null
+                ? data.getStringExtra(GpuDriverActivity.EXTRA_RESTART_NONCE) : null;
+        if (stagedDriverNonce == null) nativeGpuDriverChooserCancelled();
+    }
+    @Override protected void onResume() {
+        super.onResume(); driverRestart.resumed();
+        if (stagedDriverNonce != null) {
+            String nonce = stagedDriverNonce; stagedDriverNonce = null;
+            driverRestart.beginStaged(nonce);
+        }
+    }
+    @Override protected void onPause() { driverRestart.paused(); super.onPause(); }
+
+    public String[] prepareGpuDriver() {
+        return new GpuDriverStore(this).prepare();
+    }
+
     private static final String TAG = "WitchTimeDiag";
     private static final int MAX_REQUEST_SIZE = 65536;
     private static final Pattern RUN_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{1,64}$");

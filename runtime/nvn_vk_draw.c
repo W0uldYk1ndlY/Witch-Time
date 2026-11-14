@@ -5818,6 +5818,7 @@ static void present_flush(void) {
     VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &g_pend.rend; pr.swapchainCount = 1; pr.pSwapchains = &g_pend.sc; pr.pImageIndices = &g_pend.index;
     VkResult r = vkQueuePresentKHR(V.queue, &pr);
+    vk_presented(r);
     diag_hook_present_called(g_cur_frame > 0 ? g_cur_frame - 1 : 0, (int64_t)g_pend.index, (int64_t)r, 0);
     display_present_done(g_pend.fight);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || g_pend.suboptimal) g_pend.recreate = 1;
@@ -6161,6 +6162,7 @@ swap: ;
             r = VK_SUCCESS;
         } else {
         r = vkQueuePresentKHR(V.queue, &pr);
+        vk_presented(r);
         diag_hook_present_called(frame, (int64_t)index, (int64_t)r, (int64_t)progress);
         if (!progress) display_present_done(g_in_fight);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }

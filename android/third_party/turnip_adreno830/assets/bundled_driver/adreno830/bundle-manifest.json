@@ -1,0 +1,17 @@
+{
+  "profileId": "turnip-adreno830-unleashed-mesa26.3-gralloc",
+  "assetPath": "bundled_driver/adreno830/vulkan.mesa26_3_gralloc_a8xx.so",
+  "sha256": "64ad4fbab81e787eb4373bccc4d02604e1b8a87bd2dc7e850bc9f7e91f881221",
+  "sizeBytes": 14495432,
+  "sourceUrl": "https://raw.githubusercontent.com/SansNope/UnleashedRecomp-Android/f65c40ba2788ebd7318361670bcbb82cfdef6ae8/driver/vulkan.mesa26_3_gralloc_a8xx.so",
+  "referenceCommit": "f65c40ba2788ebd7318361670bcbb82cfdef6ae8",
+  "mesaCommit": "6b9cd5ab9cc3bfd0c79d9500a07a5e74351c72d1",
+  "variant": "gralloc",
+  "patch": "turnip-driver-ci/patches-unleashed/0010-gralloc-qcom-ubwc-detect.patch",
+  "supportedProfileMinApi": 35,
+  "minApiMeaning": "Explicit supported-profile floor; not an inferred ELF minimum API",
+  "referenceProfileEnvironment": { "TU_DEBUG": "sysmem,nobin" },
+  "environmentScope": "Bundled profile only; metadata does not apply this environment",
+  "binaryRebuildReproducible": false,
+  "publicRedistributionApproved": false
+}

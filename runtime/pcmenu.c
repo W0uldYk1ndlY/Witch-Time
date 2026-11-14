@@ -80,7 +80,7 @@ int nnpad_bind_set(int ch, const unsigned char *b);
 int options_control_type(int ch);                          /* options_row.c */
 
 /* A_PROMPTS, A_MENU_SWAP, A_LAYOUT: keys of controllers.ini. A_PAGE: a row that opens the Controls page; from A_CHAR on its rows */
-enum { A_LIVE, A_CUT, A_MODEL, A_VSYNC, A_WINDOW, A_SIZE, A_SCALE, A_RESTART, A_HUD, A_PROMPTS, A_MENU_SWAP, A_LAYOUT, A_PAGE, A_CHAR, A_PRESET, A_BIND, A_TOUCH_PAGE, A_TOUCH_ENABLED, A_TOUCH_EDIT };
+enum { A_LIVE, A_CUT, A_MODEL, A_VSYNC, A_WINDOW, A_SIZE, A_SCALE, A_RESTART, A_HUD, A_PROMPTS, A_MENU_SWAP, A_LAYOUT, A_PAGE, A_CHAR, A_PRESET, A_BIND, A_TOUCH_PAGE, A_TOUCH_ENABLED, A_TOUCH_EDIT, A_DRIVER };
 enum { PAGE_SETTINGS, PAGE_CONTROLS, PAGE_TOUCH };
 #define ROW_VALUES 12
 typedef struct {
@@ -142,6 +142,7 @@ static const Row k_rows[] = {
     {"touch_page", "Touch controls", "Configure the on-screen controller.", NULL, "open", A_TOUCH_PAGE, 0, {"open"}, {"Open"}},
     {"touch_enabled", "Enabled", "Show touch controls and SET. When off, reopen with F1 or controller Start + Select.", NULL, "on", A_TOUCH_ENABLED, 0, {"off", "on"}, {"Off", "On"}},
     {"touch_edit", "Edit layout", "Move controls and adjust size and opacity.", NULL, "open", A_TOUCH_EDIT, 0, {"open"}, {"Open"}},
+    {"gpu_driver", "Graphics driver", "Choose System default, the bundled Turnip profile, or an imported driver. A confirmed choice restarts the game.", NULL, "open", A_DRIVER, 0, {"open"}, {"Choose"}},
 #endif
 };
 #define NROW ((int)(sizeof k_rows / sizeof k_rows[0]))
@@ -160,6 +161,14 @@ static int g_swap;                                         /* swap_confirm as th
 static int g_page, g_direct;                               /* 1 = Controls, the rows from A_CHAR on; g_direct: opened there, so back closes */
 #ifdef __ANDROID__
 static int g_touch_error, g_scroll;
+static void (*g_driver_chooser_open)(void);
+static volatile LONG g_driver_chooser_requested, g_driver_chooser_held;
+void pcmenu_android_set_driver_chooser(void (*open_chooser)(void)) { g_driver_chooser_open = open_chooser; }
+int pcmenu_android_driver_chooser_is_held(void) { return InterlockedCompareExchange(&g_driver_chooser_held, 0, 0) != 0; }
+void pcmenu_android_driver_chooser_cancelled(void) {
+    InterlockedExchange(&g_driver_chooser_requested, 0);
+    InterlockedExchange(&g_driver_chooser_held, 0);
+}
 #endif
 static int g_ch, g_cap = -1, g_fam, g_letter;              /* the character shown; the row that waits for a button; the button names */
 static uint8_t g_b[2][16];                                 /* the layouts shown: as saved, else the game's type */
@@ -1126,6 +1135,15 @@ static void change(int i, int dir, int wrap) {             /* wrap 0 (left / rig
 static ULONGLONG g_cap_t;
 static int g_cap_armed;
 static int activate(int i, int dir) {                      /* A or a click on a row; 1 = it took the press and the row's value is not what changes */
+#ifdef __ANDROID__
+    if (k_rows[i].apply == A_DRIVER) {
+        if (g_driver_chooser_open) {
+            InterlockedExchange(&g_driver_chooser_held, 1);
+            InterlockedExchange(&g_driver_chooser_requested, 1);
+        }
+        return 1;
+    }
+#endif
     if (k_rows[i].apply == A_PAGE) { page_go(PAGE_CONTROLS); return 1; }
 #ifdef __ANDROID__
     if (k_rows[i].apply == A_TOUCH_PAGE) { page_go(PAGE_TOUCH); return 1; }
@@ -1187,6 +1205,17 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
     float sens; int inv;
     display_mouse_want(0);                                 /* the cursor back for the menu (the mouse camera lets it go) */
     while (g_open && !g_display_close) {
+#ifdef __ANDROID__
+        if (InterlockedExchange(&g_driver_chooser_requested, 0)) {
+            void (*open_chooser)(void) = g_driver_chooser_open;
+            if (open_chooser) open_chooser(); else pcmenu_android_driver_chooser_cancelled();
+        }
+        if (pcmenu_android_driver_chooser_is_held()) {
+            if (!InterlockedExchange(&g_job, 1) && !nvn_front_post_pcmenu()) InterlockedExchange(&g_job, 0);
+            Sleep(16);
+            continue;
+        }
+#endif
         uint64_t b; int lx, ly, mx, my, md;
         nnhid_menu_read(&b, &lx, &ly, g_swap);
         enum { BA = 1 << 0, BB = 1 << 1, BPLUS = 1 << 10, BMINUS = 1 << 11, BLEFT = 1 << 12, BUP = 1 << 13, BRIGHT = 1 << 14, BDOWN = 1 << 15 };
@@ -1286,7 +1315,18 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
 #endif
         mx0 = mx; my0 = my;
         if (g_sel != was_sel || memcmp(was_cur, g_cur, sizeof g_cur)) g_ver++;
+        int open_driver_chooser = 0;
+#ifdef __ANDROID__
+        open_driver_chooser = InterlockedExchange(&g_driver_chooser_requested, 0);
+#endif
         ReleaseSRWLockExclusive(&g_lock);
+#ifdef __ANDROID__
+        if (open_driver_chooser) {
+            InterlockedExchange(&g_driver_chooser_held, 1);
+            if (g_driver_chooser_open) g_driver_chooser_open();
+            else pcmenu_android_driver_chooser_cancelled();
+        }
+#endif
         if (g_log && (step || (ok && !prev_ok) || (back && !prev_back) || click)) printf("pcmenu: input: %s%s%s%s -> row %d (%s)\n", step ? (dir == 1 ? "up " : dir == 2 ? "down " : dir == 3 ? "left " : "right ") : "", ok && !prev_ok ? "A " : "", back && !prev_back ? "B " : "", click ? "click " : "", g_sel, k_rows[g_sel].key);
         prev_ok = ok; prev_click = md;
         if (back && !prev_back && !g_close_at) {

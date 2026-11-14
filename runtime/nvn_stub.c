@@ -9,6 +9,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "gpu_restart.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -231,24 +232,58 @@ static void nvn_bootstrap(Ctx *c) {                                  /* nvnBoots
     RET(hostfn_address(name, pick(name)));
 }
 
+#ifdef __ANDROID__
+#define SPECIAL_WRAPPER(fn) static void restart_##fn(Ctx *c) { wt_gpu_restart_enter(); fn(c); wt_gpu_restart_leave(); }
+SPECIAL_WRAPPER(builder_defaults)
+SPECIAL_WRAPPER(builder_set_device)
+SPECIAL_WRAPPER(builder_get_device)
+SPECIAL_WRAPPER(pool_builder_get_memory)
+SPECIAL_WRAPPER(pool_builder_get_size)
+SPECIAL_WRAPPER(pool_builder_get_flags)
+SPECIAL_WRAPPER(pool_finalize)
+SPECIAL_WRAPPER(obj_set_label)
+SPECIAL_WRAPPER(obj_flush_range)
+SPECIAL_WRAPPER(buffer_builder_get_pool)
+SPECIAL_WRAPPER(buffer_builder_get_offset)
+SPECIAL_WRAPPER(buffer_builder_get_size)
+SPECIAL_WRAPPER(buffer_get_pool)
+SPECIAL_WRAPPER(buffer_get_offset)
+SPECIAL_WRAPPER(buffer_finalize)
+SPECIAL_WRAPPER(obj_debug_id)
+SPECIAL_WRAPPER(pool_builder_storage)
+SPECIAL_WRAPPER(pool_builder_flags)
+SPECIAL_WRAPPER(pool_initialize)
+SPECIAL_WRAPPER(pool_flags)
+SPECIAL_WRAPPER(pool_map)
+SPECIAL_WRAPPER(pool_size)
+SPECIAL_WRAPPER(buffer_builder_storage)
+SPECIAL_WRAPPER(buffer_initialize)
+SPECIAL_WRAPPER(buffer_map)
+SPECIAL_WRAPPER(buffer_address)
+SPECIAL_WRAPPER(buffer_size)
+#undef SPECIAL_WRAPPER
+#define SPECIAL_FN(fn) restart_##fn
+#else
+#define SPECIAL_FN(fn) fn
+#endif
 static ImportFn pick(const char *name) {
     size_t n = strlen(name);
     if (strcmp(name, "nvnDeviceGetProcAddress") == 0) return nvn_get_proc;
     if (strcmp(name, "nvnDeviceGetInteger") == 0) return nvn_get_integer;
     static const struct { const char *name; ImportFn fn; } special[] = {
-        {"nvnMemoryPoolBuilderSetStorage", pool_builder_storage}, {"nvnMemoryPoolInitialize", pool_initialize},
-        {"nvnMemoryPoolMap", pool_map}, {"nvnMemoryPoolGetSize", pool_size},
-        {"nvnBufferBuilderSetStorage", buffer_builder_storage}, {"nvnBufferInitialize", buffer_initialize},
-        {"nvnBufferMap", buffer_map}, {"nvnBufferGetAddress", buffer_address}, {"nvnBufferGetSize", buffer_size},
-        {"nvnMemoryPoolGetBufferAddress", pool_map},         /* GPU address of the pool: same as its memory for now */
-        {"nvnMemoryPoolBuilderSetFlags", pool_builder_flags}, {"nvnMemoryPoolGetFlags", pool_flags},
-        {"nvnMemoryPoolBuilderSetDefaults", builder_defaults}, {"nvnMemoryPoolBuilderSetDevice", builder_set_device}, {"nvnMemoryPoolBuilderGetDevice", builder_get_device},
-        {"nvnMemoryPoolBuilderGetMemory", pool_builder_get_memory}, {"nvnMemoryPoolBuilderGetSize", pool_builder_get_size}, {"nvnMemoryPoolBuilderGetFlags", pool_builder_get_flags},
-        {"nvnMemoryPoolFinalize", pool_finalize}, {"nvnMemoryPoolSetDebugLabel", obj_set_label}, {"nvnMemoryPoolFlushMappedRange", obj_flush_range},
-        {"nvnBufferBuilderSetDefaults", builder_defaults}, {"nvnBufferBuilderSetDevice", builder_set_device}, {"nvnBufferBuilderGetDevice", builder_get_device},
-        {"nvnBufferBuilderGetMemoryPool", buffer_builder_get_pool}, {"nvnBufferBuilderGetMemoryOffset", buffer_builder_get_offset}, {"nvnBufferBuilderGetSize", buffer_builder_get_size},
-        {"nvnBufferGetMemoryPool", buffer_get_pool}, {"nvnBufferGetMemoryOffset", buffer_get_offset}, {"nvnBufferFinalize", buffer_finalize},
-        {"nvnBufferSetDebugLabel", obj_set_label}, {"nvnBufferFlushMappedRange", obj_flush_range}, {"nvnBufferGetDebugID", obj_debug_id},
+        {"nvnMemoryPoolBuilderSetStorage", SPECIAL_FN(pool_builder_storage)}, {"nvnMemoryPoolInitialize", SPECIAL_FN(pool_initialize)},
+        {"nvnMemoryPoolMap", SPECIAL_FN(pool_map)}, {"nvnMemoryPoolGetSize", SPECIAL_FN(pool_size)},
+        {"nvnBufferBuilderSetStorage", SPECIAL_FN(buffer_builder_storage)}, {"nvnBufferInitialize", SPECIAL_FN(buffer_initialize)},
+        {"nvnBufferMap", SPECIAL_FN(buffer_map)}, {"nvnBufferGetAddress", SPECIAL_FN(buffer_address)}, {"nvnBufferGetSize", SPECIAL_FN(buffer_size)},
+        {"nvnMemoryPoolGetBufferAddress", SPECIAL_FN(pool_map)},         /* GPU address of the pool: same as its memory for now */
+        {"nvnMemoryPoolBuilderSetFlags", SPECIAL_FN(pool_builder_flags)}, {"nvnMemoryPoolGetFlags", SPECIAL_FN(pool_flags)},
+        {"nvnMemoryPoolBuilderSetDefaults", SPECIAL_FN(builder_defaults)}, {"nvnMemoryPoolBuilderSetDevice", SPECIAL_FN(builder_set_device)}, {"nvnMemoryPoolBuilderGetDevice", SPECIAL_FN(builder_get_device)},
+        {"nvnMemoryPoolBuilderGetMemory", SPECIAL_FN(pool_builder_get_memory)}, {"nvnMemoryPoolBuilderGetSize", SPECIAL_FN(pool_builder_get_size)}, {"nvnMemoryPoolBuilderGetFlags", SPECIAL_FN(pool_builder_get_flags)},
+        {"nvnMemoryPoolFinalize", SPECIAL_FN(pool_finalize)}, {"nvnMemoryPoolSetDebugLabel", SPECIAL_FN(obj_set_label)}, {"nvnMemoryPoolFlushMappedRange", SPECIAL_FN(obj_flush_range)},
+        {"nvnBufferBuilderSetDefaults", SPECIAL_FN(builder_defaults)}, {"nvnBufferBuilderSetDevice", SPECIAL_FN(builder_set_device)}, {"nvnBufferBuilderGetDevice", SPECIAL_FN(builder_get_device)},
+        {"nvnBufferBuilderGetMemoryPool", SPECIAL_FN(buffer_builder_get_pool)}, {"nvnBufferBuilderGetMemoryOffset", SPECIAL_FN(buffer_builder_get_offset)}, {"nvnBufferBuilderGetSize", SPECIAL_FN(buffer_builder_get_size)},
+        {"nvnBufferGetMemoryPool", SPECIAL_FN(buffer_get_pool)}, {"nvnBufferGetMemoryOffset", SPECIAL_FN(buffer_get_offset)}, {"nvnBufferFinalize", SPECIAL_FN(buffer_finalize)},
+        {"nvnBufferSetDebugLabel", SPECIAL_FN(obj_set_label)}, {"nvnBufferFlushMappedRange", SPECIAL_FN(obj_flush_range)}, {"nvnBufferGetDebugID", SPECIAL_FN(obj_debug_id)},
     };
     for (size_t i = 0; i < sizeof special / sizeof special[0]; i++)
         if (strcmp(name, special[i].name) == 0) return special[i].fn;

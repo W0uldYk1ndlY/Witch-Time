@@ -34,9 +34,15 @@ def get_compiler():
 MOCK_HEADERS = {
     "SDL3/SDL.h": """#pragma once
 #define SDL_HINT_POLL_SENTINEL "SDL_POLL_SENTINEL"
+#define SDL_HINT_VULKAN_LIBRARY "SDL_VULKAN_LIBRARY"
 #define SDL_LOG_CATEGORY_APPLICATION 0
 #define SDL_MESSAGEBOX_ERROR 0x10
 int SDL_SetHint(const char *name, const char *value);
+void SDL_ResetHint(const char *name);
+void *SDL_GetAndroidJNIEnv(void);
+void *SDL_GetAndroidActivity(void);
+char *SDL_strdup(const char *text);
+void SDL_free(void *ptr);
 const char *SDL_GetAndroidExternalStoragePath(void);
 void SDL_LogError(int category, const char *fmt, ...);
 void SDL_LogWarn(int category, const char *fmt, ...);
@@ -47,6 +53,7 @@ int SDL_ShowSimpleMessageBox(unsigned flags, const char *title, const char *mess
 """,
     "dlfcn.h": """#pragma once
 #define RTLD_NOW 2
+#define RTLD_LOCAL 0
 #define RTLD_GLOBAL 0x100
 #define RTLD_NOLOAD 4
 void *dlopen(const char *filename, int flags);
@@ -59,10 +66,14 @@ char *dlerror(void);
 #define R_OK 4
 int chdir(const char *path);
 int access(const char *path, int mode);
+void _exit(int status);
 int setenv(const char *name, const char *value, int overwrite);
 char *getenv(const char *name);
 """,
     "sys/stat.h": """#pragma once
+struct stat { unsigned st_mode; };
+#define S_ISREG(mode) (((mode) & 0170000) == 0100000)
+int lstat(const char *path, struct stat *buf);
 #if defined(_WIN32)
 #include <direct.h>
 int test_record_mkdir(const char *path);
@@ -70,6 +81,35 @@ int test_record_mkdir(const char *path);
 #else
 int mkdir(const char *path, int mode);
 #endif
+""",
+    "jni.h": """#pragma once
+#define JNIEXPORT
+#define JNICALL
+#define JNI_FALSE 0
+#define JNI_TRUE 1
+typedef void *jobject;
+typedef jobject jclass;
+typedef jobject jobjectArray;
+typedef jobject jstring;
+typedef void *jmethodID;
+typedef int jsize;
+typedef unsigned char jboolean;
+typedef const struct JNINativeInterface_ *JNIEnv;
+struct JNINativeInterface_ {
+    jclass (*GetObjectClass)(JNIEnv *, jobject);
+    jmethodID (*GetMethodID)(JNIEnv *, jclass, const char *, const char *);
+    jobject (*CallObjectMethod)(JNIEnv *, jobject, jmethodID, ...);
+    void (*CallVoidMethod)(JNIEnv *, jobject, jmethodID, ...);
+    jboolean (*CallBooleanMethod)(JNIEnv *, jobject, jmethodID, ...);
+    jstring (*NewStringUTF)(JNIEnv *, const char *);
+    jboolean (*ExceptionCheck)(JNIEnv *);
+    jsize (*GetArrayLength)(JNIEnv *, jobjectArray);
+    jobject (*GetObjectArrayElement)(JNIEnv *, jobjectArray, jsize);
+    const char *(*GetStringUTFChars)(JNIEnv *, jstring, jboolean *);
+    void (*ReleaseStringUTFChars)(JNIEnv *, jstring, const char *);
+    void (*DeleteLocalRef)(JNIEnv *, jobject);
+    void (*ExceptionClear)(JNIEnv *);
+};
 """,
 }
 
@@ -79,6 +119,8 @@ TEST_DRIVER_C = r"""
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <jni.h>
+#include <sys/stat.h>
 
 /* Tracked events */
 typedef enum {
@@ -117,6 +159,30 @@ static void record(EventKind kind, const char *name, const char *val) {
 }
 
 /* Mock implementations */
+static int g_jni_class_calls, g_jni_deletes, g_hint_resets;
+static jclass mock_get_class(JNIEnv *env, jobject activity) {
+    (void)env; (void)activity; ++g_jni_class_calls; return NULL;
+}
+static jboolean mock_exception_check(JNIEnv *env) { (void)env; return 0; }
+static void mock_delete_ref(JNIEnv *env, jobject ref) { (void)env; (void)ref; ++g_jni_deletes; }
+static const struct JNINativeInterface_ mock_jni = {
+    .GetObjectClass = mock_get_class,
+    .ExceptionCheck = mock_exception_check,
+    .DeleteLocalRef = mock_delete_ref
+};
+static JNIEnv mock_env = &mock_jni;
+void *SDL_GetAndroidJNIEnv(void) { return g_test_mode == 5 ? &mock_env : NULL; }
+void *SDL_GetAndroidActivity(void) { return g_test_mode == 5 ? (void *)1 : NULL; }
+void SDL_ResetHint(const char *name) { assert(!strcmp(name, "SDL_VULKAN_LIBRARY")); ++g_hint_resets; }
+char *SDL_strdup(const char *text) {
+    size_t size = strlen(text) + 1;
+    char *copy = malloc(size);
+    if (copy) memcpy(copy, text, size);
+    return copy;
+}
+void SDL_free(void *ptr) { free(ptr); }
+int lstat(const char *path, struct stat *buf) { (void)path; (void)buf; return -1; }
+
 int SDL_SetHint(const char *name, const char *value) {
     record(EV_SET_HINT, name, value);
     return 1;
@@ -233,6 +299,10 @@ int main(int argc, char **argv) {
     if (argc < 2) return 99;
     g_test_mode = atoi(argv[1]);
     int ret = SDL_main(0, NULL);
+    if (g_test_mode == 5) {
+        assert(g_jni_class_calls == 1 && g_jni_deletes == 1 && g_hint_resets == 1);
+    }
+    if (g_test_mode == 2) assert(g_jni_class_calls == 0 && g_hint_resets == 1);
     printf("MAIN_RET=%d\n", ret);
     for (int i = 0; i < g_trace_count; i++) {
         const char *kstr = "UNKNOWN";
@@ -291,7 +361,9 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
         cmd = cls.cc + [
             "-O2",
             "-Wall",
+            "-pthread",
             f"-I{cls.tmppath}",
+            f"-I{MAIN_C.parent}",
             f"-I{ROOT / 'runtime'}",
             str(cls.tmppath / "driver.c"),
             str(cls.tmppath / "diag_bootstrap.c"),
@@ -394,10 +466,18 @@ class AndroidBootstrapOrderTest(unittest.TestCase):
         # No dlopen
         self.assertEqual(len([e for e in events if e["kind"] == "DLOPEN"]), 0)
 
+    def test_jni_class_failure_falls_back_without_custom_library(self):
+        ret, events = self.run_mode(5)
+        self.assertEqual(ret, 0)
+        self.assertEqual([e['name'] for e in events if e['kind'] == 'DLOPEN'], ['libwitchtime.so'])
+        self.assertEqual(len([e for e in events if e['kind'] == 'DISPLAY_RUN']), 1)
+        self.assertFalse(any(e['kind'] == 'SET_HINT' and e['name'] == 'SDL_VULKAN_LIBRARY' for e in events))
+
     def test_export_blocks_game_before_storage_or_runtime(self):
         ret, events = self.run_mode(4)
         self.assertEqual(ret, 1)
         self.assertFalse(any(e['kind'] in ('GET_STORAGE', 'FREOPEN', 'MKDIR', 'SETENV', 'DLOPEN', 'DISPLAY_RUN') for e in events))
+
 
 
 if __name__ == "__main__":
