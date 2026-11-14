@@ -61,11 +61,11 @@ public class JSONObject {
   if(!s.startsWith("{") || !s.endsWith("}")) throw new Exception("JSON");
   s=s.substring(1,s.length()-1).trim();
   if(s.isEmpty()) return;
-   java.util.regex.Matcher fields=java.util.regex.Pattern.compile("\\\"([A-Za-z0-9]+)\\\"\\s*:\\s*(\\\"[^\\\"]*\\\"|-?[0-9]+(?:\\.[0-9]+)?|true|false)").matcher(s);
+    java.util.regex.Matcher fields=java.util.regex.Pattern.compile("\\\"([A-Za-z0-9]+)\\\"\\s*:\\s*(\\\"[^\\\"]*\\\"|-?[0-9]+(?:\\.[0-9]+)?|true|false|null|\\[\\]|\\{\\})").matcher(s);
    while(fields.find()) {
     String key=fields.group(1), v=fields.group(2);
-    if(v.equals("true") || v.equals("false")) continue;
-   Object value=v.startsWith("\"") && v.endsWith("\"") ? v.substring(1,v.length()-1) : Double.valueOf(v);
+    Object value=v.startsWith("\"") && v.endsWith("\"") ? v.substring(1,v.length()-1)
+      : v.matches("-?[0-9]+(?:\\.[0-9]+)?") ? Double.valueOf(v) : new Object();
    values.put(key,value);
   }
  }
@@ -93,12 +93,16 @@ public class Harness {
     }
     if(!before.equals(store.selectedId()) || count!=store.listDrivers().size()) throw new AssertionError("Changed state");
     break;
-   case "prepare":
+    case "prepare":
     String[] p=store.prepare();
      if(p==null || p.length!=5 || !p[4].isEmpty() || !p[1].endsWith(File.separator) || !new File(p[3]).isFile()) throw new AssertionError("Snapshot");
     try { store.select("system"); throw new AssertionError("Not frozen"); } catch(IOException expected) {}
     if(store.prepare()!=null) throw new AssertionError("Second attempt");
-    System.out.print(p[3]); break;
+     System.out.print(p[3]); break;
+    case "version":
+     java.util.List<GpuDriverStore.Driver> drivers=store.listDrivers();
+     if(drivers.size()!=1 || !drivers.get(0).version.equals(args[2])) throw new AssertionError("Listed version");
+     break;
    case "quarantine":
     if(store.recoveryMessage().isEmpty() || store.prepare()!=null) throw new AssertionError("Not quarantined"); break;
    case "retry": store.select(store.selectedId());
@@ -248,18 +252,41 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def archive(self, entries=None, meta=None):
+    def archive(self, entries=None, meta=None, omit=()):
         elf = bytearray(64)
         elf[:7] = b'\x7fELF\x02\x01\x01'
         elf[16:20] = b'\x03\x00\xb7\x00'
         metadata = dict(name='Driver', version='1', libraryName='driver.so', minApi=28)
         metadata.update(meta or {})
+        for key in omit:
+            metadata.pop(key, None)
         path = self.work / 'driver.zip'
         with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as out:
             for name, data in (entries if entries is not None else [
                 ('meta.json', json.dumps(metadata)), ('driver.so', elf)]):
                 out.writestr(name, data)
         return path
+
+    def test_package_version_string_survives_import_list_and_prepare(self):
+        self.run_java('import', self.archive(meta=dict(packageVersion='34'), omit=('version',)))
+        self.run_java('version', '34')
+        self.run_java('prepare')
+
+    def test_version_takes_precedence_over_package_version(self):
+        self.run_java('import', self.archive(meta=dict(version='primary', packageVersion='34')))
+        self.run_java('version', 'primary')
+        self.run_java('prepare')
+
+    def test_invalid_version_is_not_masked_by_package_version(self):
+        for version in ['', '   ', 34, True, None]:
+            with self.subTest(version=version):
+                self.run_java('reject', self.archive(meta=dict(version=version, packageVersion='34')))
+
+    def test_reject_invalid_or_missing_package_version_when_version_absent(self):
+        for version in ['', '   ', 34, True, None, [], {}]:
+            with self.subTest(packageVersion=version):
+                self.run_java('reject', self.archive(meta=dict(packageVersion=version), omit=('version',)))
+        self.run_java('reject', self.archive(omit=('version',)))
 
     def test_import_recovery_retry_unique_markers_and_readonly_bytes(self):
         path = self.archive()

@@ -391,7 +391,7 @@ public final class GpuDriverStore {
     private static Driver readDriver(File dir) throws IOException {
         try {
             JSONObject meta = new JSONObject(new String(readSmall(new File(dir, "meta.json")), StandardCharsets.UTF_8));
-            String name = text(meta, "name"), version = text(meta, "version"), library = text(meta, "libraryName");
+            String name = text(meta, "name"), version = text(meta, meta.has("version") ? "version" : "packageVersion"), library = text(meta, "libraryName");
             if (!library.matches("[A-Za-z0-9_-][A-Za-z0-9_.-]*\\.so")) throw new IOException("Invalid libraryName");
             if (meta.has("minApi")) {
                 Object api = meta.get("minApi");
