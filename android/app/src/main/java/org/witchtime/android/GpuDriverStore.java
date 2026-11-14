@@ -17,9 +17,9 @@ import java.util.zip.*;
 
 /** Internal, user-approved binaries; format validation does not make native code safe. */
 public final class GpuDriverStore {
+    // Upgrade compatibility only: never provision or offer this formerly bundled package.
     public static final String BUNDLED_ID = "turnip-adreno830-unleashed-mesa26.3-gralloc";
-    private static final String BUNDLED_ASSET = "bundled_driver/adreno830/",
-            BUNDLED_LIBRARY = "vulkan.mesa26_3_gralloc_a8xx.so",
+    private static final String BUNDLED_LIBRARY = "vulkan.mesa26_3_gralloc_a8xx.so",
             BUNDLED_HASH = "64ad4fbab81e787eb4373bccc4d02604e1b8a87bd2dc7e850bc9f7e91f881221";
     private static final long BUNDLED_SIZE = 14495432;
     private static final String SESSION = UUID.randomUUID().toString();
@@ -47,7 +47,7 @@ public final class GpuDriverStore {
             List<Driver> result = new ArrayList<>();
             File[] files = root.listFiles();
             if (files != null) for (File file : files) {
-                if (!file.getName().startsWith("pkg-") && !file.getName().equals(BUNDLED_ID)) continue;
+                if (!file.getName().startsWith("pkg-")) continue;
                 try { result.add(readDriver(file)); } catch (IOException ignored) { }
             }
             result.sort((a, b) -> a.id.compareTo(b.id));
@@ -87,40 +87,6 @@ public final class GpuDriverStore {
 
     public boolean hasRecoveryPending() {
         synchronized (GpuDriverStore.class) { return markers(selectedId()).length != 0; }
-    }
-
-    /** Worker-thread I/O. Publishes only a new immutable package, never selects it. */
-    public Driver ensureBundledDriver() throws IOException {
-        if (Build.VERSION.SDK_INT < 35) throw new IOException("Bundled profile requires Android API 35");
-        File destination = new File(root, BUNDLED_ID);
-        if (destination.exists()) return validateBundled(destination);
-        File stage;
-        synchronized (GpuDriverStore.class) {
-            mkdir(root);
-            stage = new File(root, ".stage-" + UUID.randomUUID());
-            mkdir(stage);
-        }
-        try {
-            for (String name : new String[] { "meta.json", "bundle-manifest.json", BUNDLED_LIBRARY }) {
-                try (InputStream in = context.getAssets().open(BUNDLED_ASSET + name);
-                     FileOutputStream out = new FileOutputStream(new File(stage, name))) {
-                    copy(in, out, name.equals(BUNDLED_LIBRARY) ? BUNDLED_SIZE : 16384, null);
-                    out.getFD().sync();
-                }
-            }
-            validateBundled(stage);
-            protectPackage(stage);
-            synchronized (GpuDriverStore.class) {
-                try (RandomAccessFile lock = new RandomAccessFile(new File(root, "state.lock"), "rw");
-                     FileLock held = lock.getChannel().lock()) {
-                    if (!destination.exists()) {
-                        if (!stage.renameTo(destination)) throw new IOException("Cannot publish bundled driver");
-                        syncDirectory(root);
-                    }
-                }
-            }
-            return validateBundled(destination);
-        } finally { removeStage(stage); }
     }
 
     /** Staging while frozen is allowed; selected bytes and quarantine stay unchanged. */

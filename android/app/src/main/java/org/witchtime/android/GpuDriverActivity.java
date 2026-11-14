@@ -50,23 +50,15 @@ public final class GpuDriverActivity extends Activity {
         Button cancel = button("Cancel"); cancel.setOnClickListener(v -> cancelChooser()); content.addView(cancel, gap(4));
         setBusy(true);
         worker.execute(() -> {
-            String error = null;
-            try { store.ensureBundledDriver(); } catch (IOException e) { error = e.getMessage(); }
-            final String message = error;
-            runOnUiThread(() -> { if (isFinishing() || isDestroyed()) return; setBusy(false); renderOptions(); status.setText(message == null ? "" : "Built-in Turnip is unavailable: " + message); });
+            runOnUiThread(() -> { if (isFinishing() || isDestroyed()) return; setBusy(false); renderOptions(); });
         });
     }
 
     private void renderOptions() {
         options.removeAllViews();
         addOption("system", "System default", "Use the graphics driver provided by your device.");
-        GpuDriverStore.Driver bundled = null;
         List<GpuDriverStore.Driver> drivers = store.listDrivers();
-        try { for (GpuDriverStore.Driver d : drivers) if (GpuDriverStore.BUNDLED_ID.equals(d.id)) bundled = d; }
-        catch (RuntimeException ignored) { }
-        if (bundled != null) addOption(bundled.id, "Turnip · Adreno 830", "Experimental compatibility profile · " + bundled.version);
         for (GpuDriverStore.Driver d : drivers) {
-            if (GpuDriverStore.BUNDLED_ID.equals(d.id)) continue;
             addOption(d.id, d.name + " · " + d.version, "Imported driver");
         }
         String selected = newImportId != null ? newImportId : store.selectedId();

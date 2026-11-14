@@ -78,6 +78,9 @@ them.
 
 ## Not included
 
+Android APKs do not bundle or download a Turnip/Mesa driver. Users may import
+their own trusted driver ZIP; existing private legacy packages are retained on upgrade.
+
 No code, data, assets, icons, fonts, firmware or keys of Nintendo, PlatinumGames or SEGA, and nothing generated from
 them. Names of SDK functions and addresses used for interoperability appear in comments and in
 `lifter/sdklift_roots.txt`. `tools/wtbuild/src/setup.rs` holds SHA-256 hashes and sizes of the supported version's files, to

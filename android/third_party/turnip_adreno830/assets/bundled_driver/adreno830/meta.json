@@ -1,6 +1,0 @@
-{
-  "name": "Turnip — Adreno 830",
-  "version": "Mesa 26.3.0-devel (Unleashed)",
-  "libraryName": "vulkan.mesa26_3_gralloc_a8xx.so",
-  "minApi": 35
-}
