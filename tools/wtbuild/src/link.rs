@@ -216,6 +216,13 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
+/// Shared native runtime/table policy. Android's render/translation hot paths
+/// benefit from the normal optimizing pipeline, without fast-math or CPU-specific
+/// instructions. Desktop release policy remains unchanged.
+fn runtime_flags(t: Target) -> Vec<String> {
+    strs(&[if t.android() { "-O2" } else { "-O1" }, "-g", "-Wno-everything", "-fno-strict-aliasing"])
+}
+
 /// clang flags for code compiled on the player's PC: no system headers, runtime/freestanding instead
 pub fn freestanding(repo: &Path) -> Vec<String> {
     vec!["-nostdlibinc".into(), "-isystem".into(), s(&repo.join("runtime").join("freestanding"))]
@@ -223,7 +230,7 @@ pub fn freestanding(repo: &Path) -> Vec<String> {
 
 /// the player's tables' flags after the target's, without the header folders (check-freestanding uses them too)
 pub fn table_flags(t: Target) -> Vec<String> {
-    let mut flags = strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing"]);
+    let mut flags = runtime_flags(t);
     if !t.android() {
         flags.push("-mcx16".into());
     }
@@ -406,7 +413,7 @@ pub fn build_runtime(
     if !t.windows() {
         flags.extend(["-I".to_string(), s(&rt.join("posix"))]);
     }
-    flags.extend(strs(&["-O1", "-g", "-Wno-everything", "-fno-strict-aliasing"]));
+    flags.extend(runtime_flags(t));
     if let Some(deps) = &android_deps {
         flags.extend(["-DWT_VULKAN_ONLY=1".into(), "-I".into(), s(&deps.join("include"))]);
     } else {
@@ -836,6 +843,10 @@ fn prebuilt(repo: &Path, t: Target, log: &mut dyn FnMut(String)) -> Option<(Path
         log(format!("{}: manifest target is not {}", dir.display(), t.name()));
         return None;
     }
+    if t.android() && m.get("runtime_flags") != Some(&json!(runtime_flags(t))) {
+        log(format!("{}: Android runtime build policy changed; rebuilding the runtime", dir.display()));
+        return None;
+    }
     let files: Vec<String> = m.get("files")?.as_array()?.iter().filter_map(|v| v.as_str().map(String::from)).collect();
     // only the files the release had: one an older release left behind (an update unpacks over it) builds nothing (#114)
     let listed: Option<Vec<String>> = m.get("source_files").and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -880,7 +891,8 @@ pub fn make_prebuilt(repo: &Path, clang: &str, t: Target, out: &Path, log: &mut 
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
         .unwrap_or_default();
     let src = source_files(repo);
-    let m = json!({"sources": files_hash(repo, &src), "source_files": src, "clang": ver, "target": t.name(), "files": files});
+    let m = json!({"sources": files_hash(repo, &src), "source_files": src, "clang": ver, "target": t.name(),
+        "runtime_flags": runtime_flags(t), "files": files});
     fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&m).unwrap() + "\n").map_err(|e| e.to_string())?;
     log(format!(
         "{}: {} files, runtime sources {}",
@@ -1080,6 +1092,11 @@ mod tests {
         fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
         assert!(prebuilt(&d, Target::AndroidArm64, &mut |_| {}).is_none());
         let manifest = json!({"target": "android-arm64", "sources": sources_hash(&d), "files": files});
+        fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        // An old source-identical O1 runtime must not bypass the new Android build policy.
+        assert!(prebuilt(&d, Target::AndroidArm64, &mut |_| {}).is_none());
+        let manifest = json!({"target": "android-arm64", "sources": sources_hash(&d), "files": files,
+            "runtime_flags": ["-O2", "-g", "-Wno-everything", "-fno-strict-aliasing"]});
         fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
         assert!(prebuilt(&d, Target::AndroidArm64, &mut |_| {}).is_some());
         fs::remove_dir_all(d).unwrap();
