@@ -22,6 +22,10 @@ with tempfile.TemporaryDirectory(prefix="temporal_source_", dir=TEMP) as directo
     assert window["join"] == "unknown" and window["backend_execution"] == "unavailable"
     assert window["motion_source_qualified"] is False
     assert window["complete"] and window["core_loss_checked"]
+    epoch = json.loads((tmp / "epoch/temporal_source.json").read_text())
+    assert epoch["complete"] and epoch["records"] == 1 and epoch["unavailable"] == 0
+    malformed = json.loads((tmp / "malformed_current/temporal_source.json").read_text())
+    assert not malformed["complete"] and malformed["records"] == 0 and malformed["unavailable"] == 1
     missing = json.loads((tmp / "missing/temporal_source.json").read_text())
     assert missing["unavailable"] == 1 and not missing["guest_bound"]
     budget = json.loads((tmp / "budget/temporal_source.json").read_text())
@@ -51,6 +55,10 @@ with tempfile.TemporaryDirectory(prefix="temporal_source_", dir=TEMP) as directo
     assert boundary["complete"] and boundary["records"] == 1
     racing = json.loads((tmp / "boundary_1/temporal_source.json").read_text())
     assert not racing["complete"] and racing["unavailable"] == 1
+    for malformed in (0, 1):
+        stale = json.loads((tmp / f"stale_new_{malformed}/temporal_source.json").read_text())
+        assert stale["complete"] and stale["records"] == 1 and stale["unavailable"] == 0
+        assert stale["pending_writers"] == 0 and stale["unpublished_slots"] == 0
     finish_arm = json.loads((tmp / "finish_arm/temporal_source.json").read_text())
     assert not finish_arm["complete"] and finish_arm["tracking_busy"] and finish_arm["records"] == 0
     subprocess.run([cc, "-std=c11", "-O2", "-Wall", "-Wextra",
