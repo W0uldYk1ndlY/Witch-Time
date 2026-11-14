@@ -36,6 +36,9 @@
 #include <time.h>
 #include "gfx_options.h"
 #include "rebind.h"
+#ifdef __ANDROID__
+#include "touch_controls.h"
+#endif
 #define STBTT_STATIC
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "third_party/stb_truetype.h"
@@ -77,7 +80,8 @@ int nnpad_bind_set(int ch, const unsigned char *b);
 int options_control_type(int ch);                          /* options_row.c */
 
 /* A_PROMPTS, A_MENU_SWAP, A_LAYOUT: keys of controllers.ini. A_PAGE: a row that opens the Controls page; from A_CHAR on its rows */
-enum { A_LIVE, A_CUT, A_MODEL, A_VSYNC, A_WINDOW, A_SIZE, A_SCALE, A_RESTART, A_HUD, A_PROMPTS, A_MENU_SWAP, A_LAYOUT, A_PAGE, A_CHAR, A_PRESET, A_BIND };
+enum { A_LIVE, A_CUT, A_MODEL, A_VSYNC, A_WINDOW, A_SIZE, A_SCALE, A_RESTART, A_HUD, A_PROMPTS, A_MENU_SWAP, A_LAYOUT, A_PAGE, A_CHAR, A_PRESET, A_BIND, A_TOUCH_PAGE, A_TOUCH_ENABLED, A_TOUCH_EDIT };
+enum { PAGE_SETTINGS, PAGE_CONTROLS, PAGE_TOUCH };
 #define ROW_VALUES 12
 typedef struct {
     const char *key, *label, *help, *env, *dflt;           /* dflt: the reader's value when the key is not in the file */
@@ -134,6 +138,11 @@ static const Row k_rows[] = {
     BIND("bind_stance", "Stance Change", RB_R), BIND("bind_lock", "Camera / Lock On", 5), BIND("bind_way", "Waypoint", 4),
     BIND("bind_d1", "Demon Select, left", 12), BIND("bind_d2", "Demon Select, up", 13), BIND("bind_d3", "Demon Select, right", 14),
     BIND("bind_taunt", "Taunt", RB_DOWN), BIND("bind_sub", "Subscreen", 11), BIND("bind_pause", "Pause", 10),
+#ifdef __ANDROID__
+    {"touch_page", "Touch controls", "Configure the on-screen controller.", NULL, "open", A_TOUCH_PAGE, 0, {"open"}, {"Open"}},
+    {"touch_enabled", "Enabled", "Show touch controls and SET. When off, reopen with F1 or controller Start + Select.", NULL, "on", A_TOUCH_ENABLED, 0, {"off", "on"}, {"Off", "On"}},
+    {"touch_edit", "Edit layout", "Move controls and adjust size and opacity.", NULL, "open", A_TOUCH_EDIT, 0, {"open"}, {"Open"}},
+#endif
 };
 #define NROW ((int)(sizeof k_rows / sizeof k_rows[0]))
 
@@ -149,6 +158,9 @@ static unsigned g_ver;
 static int g_env_cut, g_env_set[NROW];
 static int g_swap;                                         /* swap_confirm as this opening of the panel began: a change must not turn the press that made it into "close" */
 static int g_page, g_direct;                               /* 1 = Controls, the rows from A_CHAR on; g_direct: opened there, so back closes */
+#ifdef __ANDROID__
+static int g_touch_error, g_scroll;
+#endif
 static int g_ch, g_cap = -1, g_fam, g_letter;              /* the character shown; the row that waits for a button; the button names */
 static uint8_t g_b[2][16];                                 /* the layouts shown: as saved, else the game's type */
 static int g_b_on[2];                                      /* saved */
@@ -156,7 +168,11 @@ static int g_b_on[2];                                      /* saved */
 __attribute__((constructor)) static void pcmenu_env(void) {
     for (int i = 0; i < NROW; i++) g_env_set[i] = k_rows[i].env && getenv(k_rows[i].env) != NULL;
 }
-static int row_on(int i) { return g_shown[i] && g_page == (k_rows[i].apply >= A_CHAR) && (strncmp(k_rows[i].key, "hdr_", 4) || nvn_vk_hdr_on()); }      /* HDR's two brightness rows: while the picture goes out as HDR */
+static int row_on(int i) {
+    int a = k_rows[i].apply;
+    int page = a >= A_CHAR && a <= A_BIND ? PAGE_CONTROLS : a == A_TOUCH_ENABLED || a == A_TOUCH_EDIT ? PAGE_TOUCH : PAGE_SETTINGS;
+    return g_shown[i] && g_page == page && (strncmp(k_rows[i].key, "hdr_", 4) || nvn_vk_hdr_on());
+}
 static int row_count(int i) { if (k_rows[i].apply == A_BIND) return 16; int n = 0; while (n < ROW_VALUES && k_rows[i].val[n]) n++; return n; }
 static int find_val(int i, const char *v) {
     for (int k = 0; k < row_count(i); k++) {
@@ -192,6 +208,9 @@ static int bind_assign(int slot, int button) {             /* the button that ha
 }
 static void page_go(int page) {
     g_page = page; g_cap = -1;
+#ifdef __ANDROID__
+    g_scroll = 0;
+#endif
     g_sel = 0;
     while (g_sel < NROW - 1 && !row_on(g_sel)) g_sel++;
 }
@@ -205,6 +224,9 @@ static void menu_init(void) {                              /* the first opening:
         else if (r->apply == A_PROMPTS) snprintf(v, sizeof v, "%s", nnpad_prompts_setting());
         else if (r->apply == A_MENU_SWAP) snprintf(v, sizeof v, "%s", nnpad_menu_swap_setting());
         else if (r->apply == A_LAYOUT) snprintf(v, sizeof v, "%s", nnpad_layout_setting());
+#ifdef __ANDROID__
+        else if (r->apply == A_TOUCH_ENABLED) snprintf(v, sizeof v, "%s", touch_runtime_snapshot().config.enabled ? "on" : "off");
+#endif
         else if (r->apply == A_BIND) { g_shown[i] = 1; continue; }
         else if (!have || r->apply >= A_PAGE) snprintf(v, sizeof v, "%s", r->dflt);
         g_shown[i] = !r->optional || have;
@@ -714,14 +736,22 @@ static void draw_panel(int W, int H) {
 static void draw_panel_words(int W, int H, float s) {
     int nshow = 0;
     for (int i = 0; i < NROW; i++) nshow += row_on(i);
+#ifdef __ANDROID__
+    int selected = 0;
+    for (int i = 0; i < g_sel; i++) selected += row_on(i);
+    if (selected < g_scroll) g_scroll = selected;
+    if (selected >= g_scroll + 7) g_scroll = selected - 6;
+    int skip = g_scroll;
+    if (nshow > 7) nshow = 7;
+#endif
     /* where you are: the title at the top of the segment, by the stripe */
     float edge = 360 * s;                                  /* (panel_wheel's) */
     int ty = (int)(40 * s), tx = (int)(edge + 40 * TAN22 * s + 76 * s);
     float ttl = 32 * s;
-    if (g_page) text(&g_f_ui, tx, ty - (int)(14 * s), "PC Settings  \xE2\x80\xBA  Controls", 14 * s, C_VIOLET, 2 * s);
-    text(&g_f_head, tx, ty + (int)(ttl * 0.78f), g_page ? "Controls" : "PC Settings", ttl, C_INK, 0);
+    if (g_page) text(&g_f_ui, tx, ty - (int)(14 * s), g_page == PAGE_TOUCH ? "PC Settings  \xE2\x80\xBA  Touch controls" : "PC Settings  \xE2\x80\xBA  Controls", 14 * s, C_VIOLET, 2 * s);
+    text(&g_f_head, tx, ty + (int)(ttl * 0.78f), g_page == PAGE_TOUCH ? "Touch controls" : g_page == PAGE_CONTROLS ? "Controls" : "PC Settings", ttl, C_INK, 0);
     hgrad_a(tx, ty + (int)(ttl * 1.05f), (int)(190 * s), 1, C_VIOLET, C_VIOLET, 0.5f, 0.1f);
-    text(&g_f_ui, tx, ty + (int)(ttl * 1.05f + 22 * s), g_page ? "Each character keeps a layout." : "The game waits while this is open.", 15 * s, C_MUTE, 1 * s);
+    text(&g_f_ui, tx, ty + (int)(ttl * 1.05f + 22 * s), g_page == PAGE_CONTROLS ? "Each character keeps a layout." : "The game waits while this is open.", 15 * s, C_MUTE, 1 * s);
     /* the rows: a staircase down the diagonal, both ends stepping as the launcher's rows do; the last ends 50 from the edge */
     float band_y = H - 126 * s, top = nshow > 9 ? 136 * s : 200 * s, rowh = 50 * s;
     if (top + nshow * rowh > band_y - 40 * s) rowh = (band_y - 40 * s - top) / nshow;
@@ -734,6 +764,10 @@ static void draw_panel_words(int W, int H, float s) {
     for (int i = 0; i < NROW; i++) {
         g_row_y[i] = -1;
         if (!row_on(i)) continue;
+#ifdef __ANDROID__
+        if (skip > 0) { skip--; continue; }
+        if (k >= nshow) continue;
+#endif
         g_row_y[i] = y;
         float left = x0 + k * st, width = w0;
         g_val_x0[i] = (int)(left + width - 232 * s); g_val_x1[i] = (int)(left + width - 22 * s); g_row_x0[i] = (int)left; g_row_x1[i] = (int)(left + width);
@@ -758,6 +792,10 @@ static void draw_panel_words(int W, int H, float s) {
     /* the state of the chosen row, under the rows at the right */
     char st_txt[160] = "";
     Rgb sc = C_INK; int dot = 0;
+#ifdef __ANDROID__
+    if (g_touch_error || touch_runtime_snapshot().edit_error) { snprintf(st_txt, sizeof st_txt, "Touch editor or save unavailable"); sc = C_RED; }
+    else
+#endif
     if (g_lock_why[g_sel] == 1) { snprintf(st_txt, sizeof st_txt, "Set by the environment variable %s", k_rows[g_sel].env); sc = C_MUTE; }
     else if (g_lock_why[g_sel] == 2) { snprintf(st_txt, sizeof st_txt, "Set by profile = low in graphics.ini"); sc = C_MUTE; }
     else if (row_restart(g_sel)) { snprintf(st_txt, sizeof st_txt, "Saved; applies %s", k_rows[g_sel].apply == A_SCALE ? "when this panel closes" : "at the next start"); dot = 1; }
@@ -1028,6 +1066,14 @@ static void set_value(int i, int k) {                    /* value k of row i: wr
     else if (r->apply == A_PROMPTS) { ok = nnpad_prompts_set(r->val[k]); g_fam = nnpad_button_prompts(); g_letter = nnpad_prompts_by_letter(); }      /* the hints and the bind names follow */
     else if (r->apply == A_MENU_SWAP) ok = nnpad_menu_swap_set(r->val[k]);
     else if (r->apply == A_LAYOUT) { ok = nnpad_layout_set(r->val[k]); g_letter = nnpad_prompts_by_letter(); }
+#ifdef __ANDROID__
+    else if (r->apply == A_TOUCH_ENABLED) {
+        TouchConfig config = touch_runtime_snapshot().config;
+        config.enabled = k;
+        ok = touch_runtime_save(&config);
+        g_touch_error = !ok;
+    }
+#endif
     else if (r->apply == A_CHAR) { g_ch = k; binds_show(); return; }
     else if (r->apply == A_BIND) { if (bind_assign(r->slot, k)) printf("pcmenu: %s = %s (%s)\n", r->key, pad_name(k), g_ch ? "Viola" : "Bayonetta"); binds_show(); return; }
     else if (r->apply == A_PRESET) {
@@ -1080,7 +1126,11 @@ static void change(int i, int dir, int wrap) {             /* wrap 0 (left / rig
 static ULONGLONG g_cap_t;
 static int g_cap_armed;
 static int activate(int i, int dir) {                      /* A or a click on a row; 1 = it took the press and the row's value is not what changes */
-    if (k_rows[i].apply == A_PAGE) { page_go(1); return 1; }
+    if (k_rows[i].apply == A_PAGE) { page_go(PAGE_CONTROLS); return 1; }
+#ifdef __ANDROID__
+    if (k_rows[i].apply == A_TOUCH_PAGE) { page_go(PAGE_TOUCH); return 1; }
+    if (k_rows[i].apply == A_TOUCH_EDIT) { g_touch_error = !touch_runtime_editor_begin(); return 1; }
+#endif
     if (k_rows[i].apply == A_BIND) { g_cap = i; g_cap_t = GetTickCount64(); g_cap_armed = 0; return 1; }
     change(i, dir, 1);
     return 0;
@@ -1130,6 +1180,10 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
     (void)arg;
     int prev_dir = 0, prev_ok = 1, prev_back = 1, prev_click = 1, rep_at = 0, mx0 = -2, my0 = -2;
     ULONGLONG t_dir = 0;
+#ifdef __ANDROID__
+    float touch_x = -1, touch_y = -1;
+    unsigned touch_presentation_generation = 0;
+#endif
     float sens; int inv;
     display_mouse_want(0);                                 /* the cursor back for the menu (the mouse camera lets it go) */
     while (g_open && !g_display_close) {
@@ -1158,6 +1212,10 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
         if (dir != prev_dir) { t_dir = now; rep_at = 380; } else if (step) { t_dir = now; rep_at = 90; }
         prev_dir = dir;
         mouse_at(&mx, &my, &md);
+#ifdef __ANDROID__
+        int editing = touch_runtime_editing();
+        if (editing) { step = 0; ok = 0; }
+#endif
         AcquireSRWLockExclusive(&g_lock);
         int was_sel = g_sel, was_cur[NROW];
         memcpy(was_cur, g_cur, sizeof g_cur);
@@ -1165,7 +1223,11 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
         if (step && (dir == 3 || dir == 4)) change(g_sel, dir == 3 ? -1 : 1, 0);
         if (ok && !prev_ok) { activate(g_sel, 1); g_ver++; }
         int px = mx - g_rect[0], py = my - g_rect[1], click = md && !prev_click;
-        if (mx >= 0 && (mx != mx0 || my != my0 || click) && px >= 0 && px < g_pw && py >= 0 && py < g_ph) {      /* the mouse: hover chooses, a click changes */
+        if (
+#ifdef __ANDROID__
+            !editing &&
+#endif
+            mx >= 0 && (mx != mx0 || my != my0 || click) && px >= 0 && px < g_pw && py >= 0 && py < g_ph) {      /* the mouse: hover chooses, a click changes */
             for (int i = 0; i < NROW; i++)                 /* a row's own span: the panel covers the window, its rows step down the diagonal */
                 if (g_row_y[i] >= 0 && py >= g_row_y[i] && py < g_row_y[i] + g_row_h && px >= g_row_x0[i] && px < g_row_x1[i] && g_cap < 0) {
                     g_sel = i;
@@ -1173,6 +1235,55 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
                 }
             if (click && px >= g_close_r[0] && px < g_close_r[0] + g_close_r[2] && py >= g_close_r[1] && py < g_close_r[1] + g_close_r[3]) back = 1, prev_back = 0;
         }
+#ifdef __ANDROID__
+        TouchPointer pointer;
+        while (touch_runtime_pointer(&pointer)) {
+            if (editing) {
+                int action = touch_runtime_editor_event(pointer);
+                if (action == 1) { if (!touch_runtime_editor_save()) g_touch_error = 1; else g_touch_error = 0; }
+                else if (action == 2) touch_runtime_editor_cancel();
+                g_ver++;
+                continue;
+            }
+            TouchSnapshot presentation = touch_runtime_snapshot();
+            if (touch_presentation_generation != presentation.presentation.generation) {
+                touch_x = touch_y = -1;
+                touch_presentation_generation = presentation.presentation.generation;
+            }
+            if (!presentation.presentation.valid || !isfinite(pointer.x) || !isfinite(pointer.y) ||
+                pointer.x < 0 || pointer.y < 0 || pointer.x >= presentation.width || pointer.y >= presentation.height) {
+                touch_x = touch_y = -1;
+                continue;
+            }
+            if (pointer.type == 0) { touch_x = pointer.x; touch_y = pointer.y; }
+            else if (pointer.type == 3) { touch_x = touch_y = -1; }
+            else if (pointer.type == 2 && touch_x >= 0) {
+                int x = (int)pointer.x - g_rect[0], y = (int)pointer.y - g_rect[1];
+                int sx = (int)touch_x - g_rect[0], sy = (int)touch_y - g_rect[1];
+                if (fabsf(pointer.y - touch_y) > g_row_h && g_row_h > 0) {
+                    int direction = pointer.y < touch_y ? 1 : -1;
+                    for (int j = 0; j < 5; j++) {
+                        int next = g_sel;
+                        do next += direction; while (next >= 0 && next < NROW && !row_on(next));
+                        if (next >= 0 && next < NROW) g_sel = next;
+                    }
+                    g_ver++;
+                } else {
+                    for (int i = 0; i < NROW; i++) {
+                        if (g_row_y[i] < 0 || g_cap >= 0) continue;
+                        if (y >= g_row_y[i] && y < g_row_y[i] + g_row_h && sy >= g_row_y[i] && sy < g_row_y[i] + g_row_h &&
+                            x >= g_row_x0[i] && x < g_row_x1[i] && sx >= g_row_x0[i] && sx < g_row_x1[i]) {
+                            g_sel = i; activate(i, x < g_val_x0[i] + g_row_h ? -1 : 1); g_ver++; break;
+                        }
+                    }
+                    if (x >= g_close_r[0] && x < g_close_r[0] + g_close_r[2] && y >= g_close_r[1] && y < g_close_r[1] + g_close_r[3] &&
+                        sx >= g_close_r[0] && sx < g_close_r[0] + g_close_r[2] && sy >= g_close_r[1] && sy < g_close_r[1] + g_close_r[3]) back = 1, prev_back = 0;
+                }
+                touch_x = touch_y = -1;
+            }
+        }
+        if (editing && back && !prev_back) { touch_runtime_editor_cancel(); prev_back = 1; g_ver++; }
+#endif
         mx0 = mx; my0 = my;
         if (g_sel != was_sel || memcmp(was_cur, g_cur, sizeof g_cur)) g_ver++;
         ReleaseSRWLockExclusive(&g_lock);
@@ -1192,6 +1303,9 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
         Sleep(16);
     }
     InterlockedExchange(&g_release, 0xff);                 /* each player reads an idle pad until it has let go of everything */
+#ifdef __ANDROID__
+    touch_runtime_menu(0);
+#endif
     AcquireSRWLockExclusive(&g_lock);
     for (int i = 0; i < NROW; i++) if (k_rows[i].apply == A_SCALE) g_start[i] = g_cur[i];
     InterlockedExchange(&g_open, 0);
@@ -1205,11 +1319,21 @@ static DWORD WINAPI menu_thread(LPVOID arg) {
 }
 static void menu_open(const char *why, int controls, int ch) {
     if (InterlockedExchange(&g_open, 1)) return;
+#ifdef __ANDROID__
+    touch_runtime_menu(1);
+#endif
     g_hint_until = 0;
     if (g_log < 0) g_log = getenv("WT_PCMENU_LOG") && atoi(getenv("WT_PCMENU_LOG"));
     AcquireSRWLockExclusive(&g_lock);
-    if (!g_f_ui.data && !fonts_init()) { ReleaseSRWLockExclusive(&g_lock); InterlockedExchange(&g_open, 0); printf("pcmenu: the font cannot be read\n"); return; }
+    if (!g_f_ui.data && !fonts_init()) { ReleaseSRWLockExclusive(&g_lock); InterlockedExchange(&g_open, 0);
+#ifdef __ANDROID__
+        touch_runtime_menu(0);
+#endif
+        printf("pcmenu: the font cannot be read\n"); return; }
     if (!g_inited) menu_init();
+#ifdef __ANDROID__
+    { int i = row_of("touch_enabled"); if (i >= 0) g_start[i] = g_cur[i] = touch_runtime_snapshot().config.enabled; }
+#endif
     g_swap = nnpad_menu_swapped();
     g_fam = nnpad_button_prompts();
     g_letter = nnpad_prompts_by_letter();
@@ -1223,10 +1347,17 @@ static void menu_open(const char *why, int controls, int ch) {
     printf("pcmenu: opened (%s); the game is held\n", why);
     fflush(stdout);
     HANDLE th = CreateThread(NULL, 0, menu_thread, NULL, 0, NULL);
-    if (th) CloseHandle(th); else { InterlockedExchange(&g_guest_frozen, 0); InterlockedExchange(&g_open, 0); }
+    if (th) CloseHandle(th); else { InterlockedExchange(&g_guest_frozen, 0); InterlockedExchange(&g_open, 0);
+#ifdef __ANDROID__
+        touch_runtime_menu(0);
+#endif
+    }
 }
 void pcmenu_open_game(void) { menu_open("the game's Options: PC Settings", 0, 0); }     /* options_row.c, the game's main thread */
 void pcmenu_open_controls(int ch) { menu_open("the game's Options: Controls", 1, ch); }
+#ifdef __ANDROID__
+void pcmenu_open_touch(void) { menu_open("touch Settings", 0, 0); }
+#endif
 /* nnhid.c, at every pad state the game reads: opens the menu, and says when the game gets an idle pad */
 int pcmenu_gate(uint32_t id, uint64_t buttons) {
     static int prev = 1, test = -1;
@@ -1234,6 +1365,9 @@ int pcmenu_gate(uint32_t id, uint64_t buttons) {
     LONG bit = id < 8 ? 1L << id : 0, o;
     if (g_open) return 1;
     if (id == 0) {
+#ifdef __ANDROID__
+        if (touch_runtime_take_settings()) { menu_open("touch Settings", 0, 0); return 1; }
+#endif
         int f1 = nnhid_menu_key(VK_F1), combo = (buttons & 0xc00) == 0xc00;      /* Start + Select (the game uses L3 and R3) */
         if (test < 0) { const char *e = getenv("WT_PCMENU_OPEN"); test = e ? atoi(e) : 0; t0 = GetTickCount64(); }
         if (test > 0 && GetTickCount64() - t0 >= (ULONGLONG)test * 1000) { test = 0; menu_open("WT_PCMENU_OPEN", 0, 0); return 1; }

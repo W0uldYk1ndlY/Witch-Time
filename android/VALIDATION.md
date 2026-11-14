@@ -1,5 +1,275 @@
 # Android validation record
 
+## Touch task closed by user — 2026-11-14
+
+The user requested closing the touch task and committing its changes. This is
+administrative closure, not full hardware acceptance. After the polish APK was
+installed, the user reported missing startup text and no pad/touch response,
+then reported the screen appeared using a build from another APK. No causal
+fix or complete gameplay/editor/persistence/fold/multitouch acceptance was
+established. Read-only logs and the exact previous APK were preserved; no
+rollback, data clear, cache wipe or config-permission change followed that
+report. Windows remains explicitly excluded. The touch guide and OpenSpec task
+record retain the unverified scenarios rather than marking them passed.
+
+Commit-isolation checks ran on an exported Git index, excluding unrelated dirty
+rendering/power/driver work: touch/config, desktop+Android menu, routing,
+diagnostics, HID/prompts/replay, orientation/CPU fallback, overlay structure,
+headless format blits and surface checks passed. An isolated ARM64 build
+compiled the selected touch paths but failed in unchanged HEAD
+`temporal_source_capture.c`: its four-argument `WtTscBind` calls conflict with
+the five-argument typedef already in HEAD `temporal_source_capture.h`. Neither
+file is part of this commit. This pre-existing baseline mismatch remains
+unresolved; earlier successful whole-working-tree builds are not proof that
+the isolated commit builds completely.
+
+## Complete OFF overlay and touch visual polish — 2026-11-14
+
+- User superseded the original always-available SET requirement: OFF now hides
+  all gameplay overlay, including SET, and ignores its old hit region. Saving
+  OFF releases held input and clears pending Settings requests. Already-open
+  menu/editor routing remains usable. Re-enable before closing, or reopen with
+  existing F1 / player-one Start + Select; no hidden recovery gesture was added.
+  OpenSpec artifacts, tooltip and touch guide were updated accordingly.
+- Touch textures use dark ink, warm edges and ivory glyphs, with a garnet SET
+  face. Geometry, safe area, hit targets and saved layout format are unchanged.
+  Independent review found an RGB/BGRA mismatch; corrected premultiplied BGRA
+  writes now have an extracted-production asymmetric pixel regression. A
+  six-character CANCEL label was also corrected to fit its texture, with bounds
+  assertions for every existing label.
+- Final parent checks passed (exit 0): touch/config, menu desktop+Android guards,
+  routing, diagnostics, HID, replay, orientation/CPU fallback, overlay structure
+  and surface tests. The menu fixture originally expected SET to work while OFF;
+  it now verifies rejection and recovery through the controller chord. Headless
+  BGRA/RGBA UNORM/sRGB blits passed, but do not establish Android WSI appearance.
+- Isolated ARM64 build compiled 54 units, zero failures; both links exited 0.
+  Runtime source identity `f07784c0e6212ab5`. Candidate APK SHA-256:
+  `eb3ea65d37fc2fdf7173d100f4076a6bac8ef79217d2966e40315f11e4d0d7c7`.
+  ZIP/import/signer checks passed; only `lib/arm64-v8a/libwitchtime.so` changed
+  versus the preserved touch APK, excluding signing metadata. Private artifact:
+  `C:/Users/HomePC/AppData/Local/Temp/opencode/touch-polish-off-20261114/touch-diagnostic.apk`.
+  With explicit user approval, this candidate was subsequently installed using
+  `adb install -r` (Success); the device APK hash matches the candidate. Phone
+  PKH110 / serial 3B1F5GEARBRJLXX2 was rediscovered at a user-supplied Wi-Fi
+  endpoint after mDNS discovery returned empty. The first attempt found PID
+  23018 still running and made no installation changes; the user stopped the
+  game manually. Actual launcher foreground and absence of an app PID were
+  checked before and after installation; no automated launch/input followed.
+  Previous installed APK was backed up and hash-verified as
+  `a081835e3ef673490050b1aa569e9d2b109809c6e2fb53acc045a73b69240cfc`.
+  No data-clear/uninstall or config/save changes were used. Install evidence is
+  in the private candidate directory's `install/`. Appearance and OFF behavior
+  still await the user's manual acceptance.
+
+## Upright ordinary touch menu — 2026-11-13
+
+- Ordinary menu layout and hit testing now use SDL pixels. Final GPU composition
+  applies the presentation transform with attached UVs; local bitmap rotation and
+  a nearest transfer blit provide a shader-independent CPU fallback. Guest and
+  temporal targets and global swapchain transform policy were not changed.
+  Independent source review accepted mapping, synchronization, resources and
+  fallback; its filtering finding was corrected with nearest canvas/scratch
+  samplers while artwork retains linear filtering.
+- Focused orientation/CPU-fallback, menu, touch/config/routing/diagnostic,
+  HID/replay, surface and overlay-structure host checks passed (exit 0).
+  Both changed GLSL stages compiled with `glslc --target-env=vulkan1.3`.
+  Isolated ARM64 runtime compilation passed: 54 units, zero failures, both links
+  exit 0, source identity `bb7479f75b5fa027`. Runtime-only candidate APK SHA-256:
+  `a081835e3ef673490050b1aa569e9d2b109809c6e2fb53acc045a73b69240cfc`.
+- Isolated run `run_20261113_oppo_n5_menu_upright_c697` sent one SET tap.
+  `session.log:542-549` records an accepted request, opening via touch Settings,
+  and GPU panel composition. `screen-30.png` shows upright PC Settings.
+  Independent offline artifact review supports upright menu visibility, not
+  gameplay, editor operation or restart persistence. Private evidence is under
+  `C:/Users/HomePC/AppData/Local/Temp/opencode/menu-upright-c697/device`.
+- Recorded thermal samples range from 32.5 C to 34.7 C, status 0. PID 20112's
+  exit record reports USER REQUESTED / FORCE STOP; commands record stay-on
+  restoration to 15. A subsequent read-only live check found no package PID,
+  launcher foreground, stay-on 15 and battery 35.3 C. No posture override was set.
+- Safety limitation: this historical probe used source-string script rewriting
+  and package-wide force-stop, which the current bounded-runner contract forbids.
+  Do not replay it. This evidence does not establish runner safety/calibration,
+  clean application completion or complete diagnostic stream acceptance.
+  Further device work must use a path satisfying the current safety contract.
+  Windows remains explicitly skipped; OpenSpec remains 14/16, with device/editor
+  acceptance and final scenario evidence open.
+
+## Touch acceptance scope update — 2026-11-13
+
+The user excluded the Windows build from this change's acceptance. It remains
+skipped, not passed; task 5.1 now records the completed host/Android checks with
+that explicit exclusion. Touch device/editor/persistence/lifecycle checks and
+the final scenario evidence remain open. Physical multitouch, fold and pad
+usability will be presented as user-operated checks, not inferred from ADB taps.
+
+## Touch presentation correction — SET opens, 2026-11-13
+
+- Implemented normalized SDL-to-image mapping for identity/90/180/270 degrees,
+  retaining original UVs. Shared hit/editor geometry stays in SDL pixels;
+  ordinary-menu pointer conversion occurs after the editor branch. Unsupported
+  transforms fail closed. Presentation destruction releases held input, and
+  authoritative SDL dimensions are reconciled under the metadata lock to avoid
+  either geometry/recreation ordering leaving stale dimensions. Independent
+  scoped review accepted the fixes. Ordinary-menu visuals remain unchanged and
+  can be sideways; they were not redesigned or globally counterrotated.
+- Focused touch/config, menu (desktop and Android guards), HID/replay, surface,
+  routing, diagnostic and overlay-structure checks passed. Headless Vulkan
+  BGRA/RGBA UNORM/sRGB round trips also passed, but do not prove WSI placement.
+  Final isolated ARM64 build compiled 54 units with no failures and linked both
+  runtime libraries, identity `db7856db58dd74a8`. Candidate SHA-256
+  `24bcc24add56ac5115248a48cea749747fcfc66ce2188f366aa69b9d8f86cfdf`
+  changed only the runtime library versus the earlier touch APK, apart from
+  signing metadata; matching signer, ZIP/content and game import checks passed.
+- Non-destructive installation and device APK hash passed. Run
+  `run_20261113_oppo_n5_touch_aligned_b696` sent one tap at (1124,224).
+  `session.log` records SDL forwarding at (1124.500,224.090), SET hit=1,
+  request raised/consumed accepted=1, then `pcmenu: opened (touch Settings)`.
+  Later screenshots show PC Settings. This confirms the tested SET alignment
+  and opening path, not full touch gameplay or physical-panel multitouch.
+- The initial admission attempt observed no app focus and made no installation
+  or settings changes. A read-only recheck found NotificationShade over the
+  launcher; only that system shade was collapsed before rerunning admission.
+  The approximately 55-second run peaked at battery 36.4 C with thermal status 0.
+  Owned PID 9535 was stopped and stay-on restored to 15; an additional check
+  found no app PID and confirmed stay-on and installed APK hash. No posture
+  override was set. Private artifacts: `touch-transform-final-b696/device`.
+  Candidate remains installed; exact original APK rollback remains preserved.
+  Gameplay, editor, restart persistence, physical pad/fold/multitouch and full
+  diagnostic stream/EOF acceptance remain open; OpenSpec tasks stay 13/16.
+  Independent offline artifact review confirmed the narrow SET route and cleanup
+  evidence without promoting it to gameplay, performance or complete acceptance.
+
+## Touch presentation transform observed — 2026-11-13
+
+- Added one diagnostic line per successful swapchain creation; Android surface
+  mock checks passed (five tests). Isolated ARM64 runtime compiled 54 units and
+  linked successfully, identity `0626bacf0ede436a`. Runtime-only APK SHA-256
+  `c8a6a6e444c91693cf5d40e0d5174ee87c4455911124b65fd18f7dbcd011c853`
+  passed the same content/signer/import checks and was installed non-destructively.
+- Bounded approximately 12-second run
+  `run_20261113_oppo_n5_touch_surface_b694` sent no taps. Actual surface log:
+  currentTransform=8, preTransform=8 (ROTATE_270), supportedTransforms=511,
+  current/image extent 2248x2480, SDL pixels 2248x2480,
+  SDL safe rectangle (97,146,2054,2289). Combined with the preceding SET trace,
+  the required SDL-to-image rotation for this surface is normalized (v,1-u),
+  not an identity mapping or swapped-extent assumption. Oracle source/evidence
+  review accepted this convention; implementation and device revalidation are
+  still pending. Ordinary menu hit coordinates need the same mapping separately
+  from touch/editor sprites.
+- Peak battery temperature 32.2 C, global thermal status 0; owned PID 23594
+  stopped and stay-on restored. APK remains installed. Private artifacts are in
+  `touch-diag-isolated-b694/device`. No new hardware acceptance gate is closed.
+
+## Touch SET trace — delivery observed, alignment failed, 2026-11-13
+
+- After renewed idle-phone confirmation, candidate `3877bc1a` was installed
+  non-destructively and hash-checked. Run
+  `run_20261113_oppo_n5_touch_trace_b693` performed one touchscreen tap at the
+  observed SET position. SDL logged DOWN/UP with timestamp newer than cutoff,
+  replay off, matching generation, valid/visible geometry and ready lifecycle.
+  Touch runtime received pixel coordinates (2048.911,1240.500), but its SET
+  rectangle was (1046,146,156,156), hit=0. The failed visible SET interaction
+  therefore has a directly observed draw/hit-coordinate mismatch; stale-event
+  filtering did not reject this event. Actual Vulkan surface transform still
+  needs logging before selecting the correction. Menu/editor alignment must be
+  considered alongside sprites, not assumed fixed by rotating SET alone.
+- Owned PID 20482 was stopped after the bounded approximately 55-second trace;
+  stay-on was restored to 15. Fifteen admission/monitor samples peaked at
+  battery 35.3 C and global Android thermal status 0. Candidate remains installed.
+  Private trace/captures are in `touch-diag-isolated-b693/device`. No gameplay,
+  editor, persistence or physical multitouch acceptance follows from this trace.
+
+## Touch input tracing follow-up — offline candidate, 2026-11-13
+
+- Old touch runtime `dcf69e3d92c790a4` was inspected with NDK `llvm-objdump`:
+  `poll_devices` calls `SDL_FlushEvents` with first=0 and last=65535. This can
+  discard finger events; it is a confirmed old-binary defect, not yet causal
+  proof for the observed SET failure. Current Android source flushes only the
+  joystick/gamepad ranges. The blanket flush in its non-Android `#else` is not
+  the current Android behavior.
+- Added bounded Android diagnostic-session-only touch dequeue/runtime/SET
+  request traces, with explicit advisory dispositions and no routing changes.
+  Independent source review accepted the scoped one-tap diagnostic plan.
+  Host touch/config, routing, diagnostic caps, HID, replay, menu (desktop and
+  Android guards), and Android pad discovery tests all passed; scoped diff
+  whitespace check passed. These are mocked host checks.
+- Shared build staging was busy (`os error 1224`); no competing process was
+  stopped. An isolated source copy compiled 54 units and linked both runtime
+  libraries successfully, source identity `1cdeb2404e09ba5b`. Private candidate
+  APK SHA-256 `3877bc1a126d0595e67022e53db38aa92c3f6cb91a5af08872a032a38523651c`
+  is at `touch-diag-isolated-b693/touch-diagnostic.apk` in approved temporary
+  storage. It changes only `lib/arm64-v8a/libwitchtime.so` versus the previous
+  signed touch APK (apart from signing metadata). ZIP integrity, package-content
+  equality, retained build metadata, existing signing certificate and game
+  import compatibility were checked. New SDL imports resolve in packaged SDL;
+  `pthread_detach` is an Android libc API. This was runtime-only repackaging,
+  not a fresh game/bootstrap build.
+- This candidate has NOT been installed or run. Admission found another app
+  foreground; no new device writes were made. The earlier touch APK remains
+  installed. Live SDL delivery, SET opening, gameplay and the full hardware
+  acceptance matrix remain unresolved.
+
+## Touch phone smoke — partial, 2026-11-13
+
+- Non-destructive `adb install -r` succeeded for signed touch APK SHA-256
+  `866fea1fb4443e415837ed0dc511297c6554107ac0c0787ea60d7a6ea3756b7d`.
+  Its signer matches the installed certificate; the exact previous APK
+  (`f81da711e92dbb9452ebe5611fb173b2117467b85fa0f5f824a628e7d280d57f`)
+  was pulled and hash-checked against the device for rollback. Game library
+  bytes match the previous APK. No uninstall or data clear was performed.
+- Run `run_20261113_oppo_n5_touch_b691b53b` used copied userdata/config in
+  its own diagnostic directory, without replay. Logs confirm isolated config,
+  scale 1.2, 16x anisotropy and LOD -1. Actual game window was 816x900, so
+  nominal 1920x1080 request metadata does not prove an actual 1080p render.
+- An approximately 80-second bounded observation captured visible touch controls
+  over a black background. Labels/shapes require investigation. No touch input
+  was injected; gameplay, multitouch, settings/editor and persistence are NOT
+  accepted. Last status was active/healthy with zero reported drops, not a
+  clean stopped EOF or complete stream validation.
+- Twenty admission/monitor samples observed battery temperature at most 39.2 C
+  and global Android thermal status 0. Owned PID 15710 was force-stopped;
+  subsequent check found no app PID and stay-on was restored to 15. No posture
+  override was set. The touch APK remains installed; rollback has not been
+  executed. Private artifacts are in the approved temporary directory
+  `touch-phone-rollback-b691b53b52f84fa4b6c90dcd0261583a`.
+- Follow-up `run_20261113_oppo_n5_touch_set_b692` performed one ADB touchscreen
+  tap at (2048,1240), the observed SET location in the unrotated 2248x2480
+  capture. Active input viewport reported orientation 0 and matching logical/
+  physical bounds. Later captures did not show the menu, and no menu-open log
+  was found. Event routing/coordinate alignment remain unresolved, not accepted.
+  Peak observed battery temperature was 41.3 C, global thermal status remained 0;
+  the run was force-stopped and stay-on restored. The preceding staging-only
+  attempt `touch_set_b691` never launched: copying prior run-owned shader cache
+  failed with permission denied. No permissions on that old cache were changed;
+  b692 used a fresh cold cache. The earlier label-corruption hypothesis was
+  withdrawn after reviewing a rotated capture and the glyph source. Cold shader
+  preparation was unfinished in the first run; black backgrounds alone establish
+  neither a render defect nor successful gameplay. Source snapshot `probe.py`
+  was subsequently amended to restore stay-on even if stopping the app fails.
+
+## Android touch controls — offline evidence, 2026-11-13
+
+- Host touch/config, production-HID-with-mocks, prompt, SDL-filter-with-mocks,
+  desktop/Android-guard menu, replay, bootstrap, surface and overlay-structure
+  checks passed. A headless NVIDIA Vulkan check passed BGRA/RGBA, UNORM/sRGB,
+  light/dark and direct/intermediate blit round trips; it did not use Android,
+  WSI, the full overlay pipeline or a Vulkan validation layer.
+- ARM64 runtime: 54 source units compiled and both runtime libraries linked;
+  source identity `dcf69e3d92c790a4`. Debug and unsigned diagnostic APKs
+  assembled offline in an isolated temporary copy. Runtime, shader-library and
+  existing game-library allocated sections match the packaged copies. Neither
+  APK was installed; the debug signing key is temporary and the diagnostic APK
+  is unsigned. The existing game library was reused, not rebuilt for this test.
+- Independent review identified and rechecked fixes for stale touch/Settings
+  races, compact-editor mismatch and RGBA/sRGB format handling. Details and
+  commands are in `docs/ANDROID_TOUCH_CONTROLS.md`.
+- **All touch hardware scenarios remain not checked:** touch-only menus and
+  gameplay, multi-touch, editor, persistence, interruptions, pad coexistence,
+  resolution/upscaler alignment and both fold/safe-area postures. No ADB or
+  phone action was performed. No previous physical acceptance gate is changed.
+  A Windows desktop runtime build is also open because the available compiler
+  lacks `#embed` and desktop SDL/Vulkan/FFmpeg headers are absent.
+
 Build host: Linux x86-64. Android NDK r28c, clang 19.0.1, ARM64 API 29. Dependencies: SDL 3.4.18, FFmpeg 7.1.3, glslang 15.1.0, Vulkan headers 1.4.304. No phone, emulator or game dump was used.
 
 ## Verified on this branch

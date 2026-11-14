@@ -15,6 +15,9 @@
 #include <SDL3/SDL.h>
 #include "nnpad.h"
 #include "rebind.h"
+#ifdef __ANDROID__
+#include "touch_controls.h"
+#endif
 
 #define MAXDEV 16
 #define MAXCFG 64
@@ -546,7 +549,12 @@ static void reassign_all(void) {                  /* [players] changed in the fi
 static void poll_devices(void) {                  /* lock held */
     int n = 0;
     SDL_UpdateJoysticks();
+#ifdef __ANDROID__
+    SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_JOYSTICK_UPDATE_COMPLETE);
+    SDL_FlushEvents(SDL_EVENT_GAMEPAD_AXIS_MOTION, SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED);
+#else
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#endif
     SDL_JoystickID *ids = SDL_GetJoysticks(&n);
     for (int i = 0; i < MAXDEV; i++) {
         int alive = 0;
@@ -871,9 +879,9 @@ int nnpad_bind_set(int ch, const unsigned char *b) {
     unlock();
     return ok;
 }
-static volatile int g_prompts_kb;                    /* the last device player 1 used was the keyboard */
+static volatile int g_prompts_kb;                    /* 0 pad, 1 keyboard, 2 touch */
 void nnpad_prompts_used(int keyboard) { g_prompts_kb = keyboard; }
-int nnpad_bind_live(void) { return !g_prompts_kb; }  /* the layouts are the pads'; the keyboard has [keyboard] */
+int nnpad_bind_live(void) { return g_prompts_kb != 1; }  /* the layouts are the pads'; the keyboard has [keyboard] */
 /* swap_confirm in force: only for a pad, or Enter would go back and the keyboard's prompts (its keys, on the A and B pictures) would lie */
 int nnpad_menu_swapped(void) {
     lock(); if (!g_cfg.path[0]) cfg_load(1); int on = g_cfg.menu_swap; unlock();
@@ -882,7 +890,8 @@ int nnpad_menu_swapped(void) {
 int nnpad_button_prompts(void) {
     lock(); if (!g_cfg.path[0]) cfg_load(1); int p = g_cfg.prompts, kb_only = g_cfg.input == 1; unlock();
     if (p) return p;
-    if (kb_only || g_prompts_kb) return 4;
+    if (g_prompts_kb == 2) return 1;
+    if (kb_only || g_prompts_kb == 1) return 4;
     const char *seq = getenv("WT_SEQ"), *backend = getenv("WT_PAD_BACKEND");
     if ((seq && seq[0]) || (backend && !_stricmp(backend, "xinput")) || !nnpad_init()) return 1;
     lock();
@@ -907,6 +916,7 @@ int nnpad_button_prompts(void) {
  * (def_map): the bottom button = by letter, the right one = by position. Without a pad (scripted runs, XInput) [general]
  * layout. At the moment of the call (nnfs.c, the first file access). */
 int nnpad_prompts_by_letter(void) {
+    if (g_prompts_kb == 2) return 0;                      /* touch labels are logical Switch buttons */
     lock(); if (!g_cfg.path[0]) cfg_load(1); int def = g_cfg.def.layout == 1; unlock();
     const char *seq = getenv("WT_SEQ"), *backend = getenv("WT_PAD_BACKEND");
     if ((seq && seq[0]) || (backend && !_stricmp(backend, "xinput")) || !nnpad_init()) return def;
@@ -1150,6 +1160,20 @@ int nnpad_selftest(const NnHidHooks *h) {
     check(file_mtime(path) != 0, "controllers.ini written with defaults on first run");
     { size_t n = 0; char *t = read_file(path, &n); check(t && strstr(t, "[keyboard]") && strstr(t, "layout = auto") && strstr(t, "--pad-map"), "default file is documented (sections, layout, tool hints)"); free(t); }
     check(h->style(0) == 0, "no device: style set 0");
+#ifdef __ANDROID__
+    touch_runtime_init(NULL);
+    touch_runtime_focus(1, 1);
+    touch_runtime_geometry((TouchRect){0, 0, 1920, 1080}, 1, 1920, 1080);
+    touch_runtime_set_ready(1);
+    {
+        TouchSnapshot t = touch_runtime_snapshot(); TouchRect a = t.geometry.control[TOUCH_A];
+        touch_runtime_event(0, 1, 1, a.x + a.w / 2, a.y + a.h / 2);
+        h->state(0, &btn, st, &attr);
+        check(h->style(0) == 1 && (btn & 1) && (attr & 1) && h->style(1) == 0, "touch only: player 1 connected and A delivered; player 2 unchanged");
+        touch_runtime_event(2, 1, 1, 0, 0);
+    }
+    touch_runtime_set_ready(0);
+#endif
 
     /* ---- detection and slot of one pad */
     id[0] = vj_make(0, 0x100, 1, 1);
@@ -1162,6 +1186,26 @@ int nnpad_selftest(const NnHidHooks *h) {
     check(attr == 3 && btn == 0 && st[0] == 0 && st[1] == 0, "connected state: attribute 3 (connected, wired), all zero");
     check(g_vj[0].pidx == 0 && g_vj[0].led_b == 255, "player index and LED colour set on the pad (player 1)");
     check(h->led(0) == 1, "player LED pattern for player 1 reported");
+#ifdef __ANDROID__
+    {
+        touch_runtime_set_ready(1);
+        TouchSnapshot t = touch_runtime_snapshot();
+        TouchRect left = t.geometry.control[TOUCH_LEFT_STICK], a = t.geometry.control[TOUCH_A];
+        SDL_SetJoystickVirtualAxis(js[0], SDL_GAMEPAD_AXIS_LEFTX, 32767);
+        SDL_SetJoystickVirtualAxis(js[0], SDL_GAMEPAD_AXIS_RIGHTX, 32767);
+        SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_SOUTH, true);
+        settle();
+        touch_runtime_event(0, 1, 2, left.x + left.w / 2, left.y + left.h / 2);
+        touch_runtime_event(0, 1, 3, a.x + a.w / 2, a.y + a.h / 2);
+        h->state(0, &btn, st, &attr);
+        int ok = (btn & 3) == 3 && st[0] == 0 && st[1] == 0 && st[2] > 0;
+        touch_runtime_event(2, 1, 2, 0, 0);
+        h->state(0, &btn, st, &attr);
+        check(ok && st[0] > 0 && st[2] > 0, "touch and pad coexist: centered captured axis wins; physical axis returns on release");
+        touch_runtime_set_ready(0);
+        vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6); settle();
+    }
+#endif
     SDL_GUIDToString(SDL_GetJoystickGUIDForID(id[0]), guid0, sizeof guid0);
 
     /* ---- hot-plug out and in */

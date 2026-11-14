@@ -12,11 +12,15 @@ end = source.index("    } else {", start)
 branch = source[start:end] + "    }\n"
 write_buttons = "    wr64(out + 8, buttons);\n"
 assert write_buttons in source[end:]
+assert start < end < source.index("touch_pad_merge(") < source.index(write_buttons, end)
 harness = r'''
 #include "diag_replay.h"
+#include "touch_controls.h"
+#include "diag.h"
 #include <assert.h>
 #include <setjmp.h>
 #include <string.h>
+bool diag_is_enabled(void) { return false; }
 static long long g_rec_poll, g_anchor_poll;
 static int g_anchor = -1, completed;
 static jmp_buf exit_jump;
@@ -35,7 +39,16 @@ harness += branch + write_buttons
 harness += r'''
     (void)lx; (void)ly; (void)rx; (void)ry; (void)wired; (void)prompts_used;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    touch_runtime_init(argv[1]);
+    touch_runtime_focus(1, 1);
+    touch_runtime_geometry((TouchRect){0, 0, 1920, 1080}, 1, 1920, 1080);
+    touch_runtime_set_ready(1);
+    TouchSnapshot before = touch_runtime_snapshot();
+    TouchRect a = before.geometry.control[TOUCH_A];
+    touch_runtime_event(0, 1, 10, a.x + a.w / 2, a.y + a.h / 2);
+    assert(touch_runtime_snapshot().pad.buttons & 1);
     diag_replay_record_t r = {.poll = 1, .anchor = -1, .buttons = DIAG_REPLAY_BTN_A,
                               .attributes = DIAG_REPLAY_ATTR_CONNECTED};
     diag_replay_session_t s = {0};
@@ -46,6 +59,9 @@ int main(void) {
     uint64_t output[5] = {0};
     sample((uint64_t)(uintptr_t)output);
     assert(output[1] == 0 && s.next_global_poll == 1 && !completed);
+    assert(!touch_runtime_snapshot().pad.buttons);
+    touch_runtime_event(0, 1, 11, before.settings.x + 1, before.settings.y + 1);
+    assert(!touch_runtime_take_settings());
     g_anchor = 9; g_anchor_poll = g_rec_poll; /* no replay-global reset */
     sample((uint64_t)(uintptr_t)output);
     assert(output[1] == DIAG_REPLAY_BTN_A && s.next_global_poll == 2 && !completed);
@@ -64,6 +80,12 @@ int main(void) {
     assert(output[1] == DIAG_REPLAY_BTN_A && s.next_global_poll == UINT64_MAX);
     if (!setjmp(exit_jump)) { sample((uint64_t)(uintptr_t)output); assert(0); }
     assert(completed == 2 && s.next_global_poll == UINT64_MAX);
+    diag_input_set_active_replay(NULL);
+    diag_input_enable_synthetic_player1(false);
+    touch_runtime_event(1, 1, 10, a.x + a.w / 2, a.y + a.h / 2);
+    assert(!touch_runtime_snapshot().pad.buttons && !touch_runtime_take_settings());
+    touch_runtime_event(0, 1, 10, a.x + a.w / 2, a.y + a.h / 2);
+    assert(touch_runtime_snapshot().pad.buttons & 1);
     return 0;
 }
 '''
@@ -73,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix="diag-replay-hid-") as temp:
     path = Path(temp)
     (path / "probe.c").write_text(harness, encoding="utf-8")
     exe = path / ("probe.exe" if os.name == "nt" else "probe")
-    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-I", str(ROOT / "runtime"),
-                    str(path / "probe.c"), str(ROOT / "runtime/diag_replay.c"), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    subprocess.run([cc, "-std=gnu11", "-D__ANDROID__", "-Wall", "-Wextra", "-I", str(ROOT / "runtime"),
+                    str(path / "probe.c"), str(ROOT / "runtime/diag_replay.c"), str(ROOT / "runtime/touch_controls.c"), "-lm", "-o", str(exe)], check=True)
+    subprocess.run([str(exe), str(path / "controllers.ini")], check=True)
 print("Production synthetic HID final-sample/EOF ordering passed (mocked guest memory and exit)")

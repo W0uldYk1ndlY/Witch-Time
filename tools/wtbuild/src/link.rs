@@ -70,6 +70,7 @@ const HOST_SOURCES: &[&str] = &[
     "pkz_dump.c",
     "gamedll.c",
     "pcmenu.c",
+    "touch_controls.c",
     "options_row.c",
     "prompts.c",
     "presence.c",

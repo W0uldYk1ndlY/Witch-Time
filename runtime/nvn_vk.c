@@ -24,6 +24,9 @@
 #include <string.h>
 #include <windows.h>
 #include "diag.h"
+#ifdef __ANDROID__
+#include "touch_controls.h"
+#endif
 /* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -270,6 +273,10 @@ static int hdr_mode_want(void);                          /* nvn_vk_draw.c, findi
 static void hdr_views(int make);                         /* nvn_vk_draw.c: the swapchain images' views (1) / they and the 8-bit picture go (0) */
 static int64_t g_diag_surface_gen = 0;
 static void swapchain_destroy(void) {
+#ifdef __ANDROID__
+    TouchSnapshot touch = touch_runtime_snapshot();
+    touch_runtime_presentation((TouchPresentation){0, 0, 0, touch.width, touch.height, 0, 0});
+#endif
     if (!V.swapchain) return;
     diag_hook_surface_gen(g_diag_surface_gen, 0, 0, 0);
     wait_last_submit();                                  /* also resets the fence for the next submit */
@@ -331,10 +338,30 @@ static int swapchain_create(void) {
     r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.images);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetSwapchainImagesKHR", r);
     V.extent = ext;
+#ifdef __ANDROID__
+    {
+        TouchSnapshot touch = touch_runtime_snapshot();
+        unsigned t = (unsigned)caps.currentTransform;
+        int valid = t == 1 || t == 2 || t == 4 || t == 8;
+        if (!valid) fprintf(stderr, "touch: unsupported or mirrored Vulkan surface transform %u; touch presentation disabled\n", t);
+        touch_runtime_presentation((TouchPresentation){(int)t, (int)ext.width, (int)ext.height,
+            touch.width, touch.height, valid, 0});
+    }
+#endif
     V.hdr = hdr;
     if (hdr) hdr_views(1);
     g_diag_surface_gen++;
     diag_hook_surface_gen(g_diag_surface_gen, (int64_t)ext.width, (int64_t)ext.height, (int64_t)sf.format);
+#ifdef __ANDROID__
+    if (diag_is_enabled()) {
+        TouchSnapshot touch = touch_runtime_snapshot();
+        fprintf(stderr, "touch-diag surface generation=%u currentTransform=%u preTransform=%u supportedTransforms=%u currentExtent=%ux%u imageExtent=%ux%u sdlPixels=%dx%d safe=%.3f,%.3f,%.3f,%.3f valid=%d\n",
+                (unsigned)g_diag_surface_gen, (unsigned)caps.currentTransform, (unsigned)ci.preTransform,
+                (unsigned)caps.supportedTransforms, caps.currentExtent.width, caps.currentExtent.height,
+                ext.width, ext.height, touch.width, touch.height,
+                touch.safe.x, touch.safe.y, touch.safe.w, touch.safe.h, touch.valid);
+    }
+#endif
     return 1;
 }
 
