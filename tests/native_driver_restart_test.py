@@ -102,10 +102,14 @@ int main(void) {
             "dlfcn.h": '#define RTLD_NOW 1\n#define RTLD_LOCAL 0\nvoid *dlsym(void *, const char *);\n',
         }
         program = r'''
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 static char environment[128];
