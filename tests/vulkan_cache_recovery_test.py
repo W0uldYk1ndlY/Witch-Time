@@ -100,10 +100,15 @@ static size_t injected_write(const void *p, size_t size, size_t count, FILE *fp)
 static int injected_rename(const char *from, const char *to) {
     return fail_rename ? -1 : rename(from, to);
 }
+static uint64_t oversized_stream;
+static int64_t injected_tell(FILE *f) {
+    return oversized_stream ? (int64_t)oversized_stream : (int64_t)ftello(f);
+}
 #define fclose injected_close
 #define malloc injected_malloc
 #define fwrite injected_write
 #define rename injected_rename
+#define ftello injected_tell
 #define _fseeki64 fseeko
 #define _ftelli64 ftello
 #if __has_include("vk_cache.h")
@@ -184,8 +189,8 @@ int main(int argc, char **argv) {
         write_bytes("pipelines_0001_0002_00000000.bin", bytes, !strcmp(mode, "pipeline-corrupt") ? 8 : 32);
         fail_alloc = !strcmp(mode, "pipeline-oom");
         if (!strcmp(mode, "pipeline-oversized")) {
-            FILE *f = fopen("pipelines_0001_0002_00000000.bin", "wb"); assert(f);
-            assert(!fseek(f, (1L << 30), SEEK_SET)); assert(fputc(0, f) == 0); fclose(f);
+            /* Keep the compatible header; reject the reported size before allocating payload. */
+            oversized_stream = (uint64_t)VKC_PIPELINE_LIMIT + 1;
         }
         load_driver_cache(); assert(bad_driver_input == 0);
         assert(g_pcache_valid == !strcmp(mode, "pipeline-valid"));
@@ -225,8 +230,7 @@ int main(int argc, char **argv) {
         PipeRec rec[2] = {0}; rec[0].magic = PIPEREC_MAGIC; rec[0].compute = 1;
         write_bytes("pipes.bin", rec, sizeof(PipeRec) + (!strcmp(mode, "records-partial") ? 1 : 0));
         if (!strcmp(mode, "records-oversized")) {
-            FILE *f = fopen("pipes.bin", "wb"); assert(f);
-            assert(!fseek(f, (64L << 20) + sizeof(PipeRec) - 1, SEEK_SET)); assert(fputc(0, f) == 0); fclose(f);
+            oversized_stream = (uint64_t)WT_VK_RECORD_CACHE_LIMIT + sizeof(PipeRec);
         }
         fail_alloc = !strcmp(mode, "records-oom"); load_records();
         assert(g_pw_n == 0 && !g_pw_rec);

@@ -122,7 +122,7 @@ int main(void) {
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_image_barriers_keep_dependencies_with_narrow_known_stages(self):
-        code = section("static VkFlags layout_access(", "static void vt_layout(")
+        code = "typedef struct VTex VTex;\n" + section("static VkFlags layout_access(", "static void vt_layout(")
         result = run_c(PRELUDE + code + r'''
 int main(void) {
     VkImage image = (VkImage)(uintptr_t)9;

@@ -59,6 +59,9 @@ typedef struct {
     struct { uint32_t binding; } smp[32];
     VkDescriptorSetLayout cdl[2]; VkPipelineLayout cl; VkPipeline cp;
 } VStage;
+static int g_dump_on;
+static VStage *g_dump_prepared[6];
+static void dump_storage_post(const char *label, int draw) { (void)label; (void)draw; }
 typedef struct { uint64_t off, size; int zero; VkBuffer buf; } BufRef;
 typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
 typedef struct { uint64_t serial; int pending; } Slot;
