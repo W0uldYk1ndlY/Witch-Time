@@ -1,5 +1,34 @@
 # Android validation record
 
+## Vulkan recording, uploads and cache efficiency — 2026-11-15
+
+Based on clean `android/oppo-find-n5` commit `579ab5d307ed2bf5f6dd500d0a125521eae1591b`.
+Eligible indirect dispatch stays on the GPU, native tiled textures deswizzle
+directly into the coherent upload ring, exact descriptor sets and unchanged
+draw state are reused, image stage scopes are refined, and spare empty memory
+blocks are reclaimed. Compiler-aware caches use complete reads and atomic
+publication with failed-save retry. Native ASTC support was already present;
+this work preserves its bytes and removes an intermediate upload copy.
+
+The old temporal-source bind mismatch recorded below is repaired against the
+existing v2 epoch ABI, including a deterministic stale-callback/rebind test.
+The POSIX platform header now includes its signal declarations. These are
+build-compatibility repairs, not a redesign of temporal diagnostics.
+
+NDK r28c built all 54 runtime source files with zero failures; both Android
+shared-library links exited 0. Source identity `de619a01d7f49199`; AArch64 ELF
+LOAD segments have at least 16 KiB alignment. All 145 wtbuild tests passed.
+The 77-script host corpus has 67 passes, 5 failures reproduced on the base,
+5 whole-script skips and no timeouts. Independent Vulkan and diagnostic ABI
+review found no remaining material regression. Details, exact artifact hashes,
+failure/skip explanations and comparison controls are in
+[`docs/VULKAN_OPPO_OPTIMIZATION.md`](../docs/VULKAN_OPPO_OPTIMIZATION.md).
+
+No physical GPU, phone or game was run; no APK was installed. FPS improvement,
+image equivalence and actual-device synchronization validation remain open.
+Four GPU-oriented checks ran in compile-only mode. Existing saves, app data,
+graphics configuration and the separate dirty worktree were not changed.
+
 ## Touch task closed by user — 2026-11-14
 
 The user requested closing the touch task and committing its changes. This is

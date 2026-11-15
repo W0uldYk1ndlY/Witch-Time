@@ -1,4 +1,7 @@
 #include "runtime.h"
+#if !defined(_WIN32) && !defined(__declspec)
+#define __declspec(x)
+#endif
 #include "temporal_source_guest.h"
 #include <assert.h>
 #include <stdio.h>
@@ -12,7 +15,7 @@
 #endif
 
 static unsigned observations;
-static void count_record(const WtTscRecord *r) { assert(r->site == 123); observations++; }
+static void count_record(uint64_t epoch, const WtTscRecord *r) { assert(epoch == 1 && r->site == 123); observations++; }
 static void path_for(char *out, size_t size, const char *root, const char *name) {
     assert(snprintf(out, size, "%s/%s", root, name) < (int)size);
     assert(make_dir(out) == 0);
@@ -26,14 +29,14 @@ int main(int argc, char **argv) {
     Ctx c, before;
     memset(&c, 0xa5, sizeof c); before = c;
     uint32_t gate = 0;
-    assert(game_temporal_source_bind(999, sizeof(WtTscRecord), &gate, count_record) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, 1, &gate, count_record) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), &gate, NULL) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), &gate, count_record) == 0);
+    assert(game_temporal_source_bind(999, sizeof(WtTscRecord), 1, &gate, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, 1, 1, &gate, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 1, &gate, NULL) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 1, &gate, count_record) == 0);
     wt_temporal_guest_site(&c, 123); assert(!observations);
     gate = 1; wt_temporal_guest_site(&c, 123); assert(observations == 1);
     assert(!memcmp(&c, &before, sizeof c));
-    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), NULL, NULL) == 0);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 0, NULL, NULL) == 0);
     wt_temporal_guest_site(&c, 123); assert(observations == 1);
     assert(wt_tsc_start(NULL, 0, NULL) == 0);
 
@@ -69,7 +72,7 @@ int main(int argc, char **argv) {
     FILE *f = open_records(dir); WtTscRecord r;
     unsigned n = 0, ranges = 0, begins = 0;
     while (fread(&r, sizeof r, 1, f)) {
-        assert(r.version == 1 && r.size == sizeof r && r.sequence == ++n);
+        assert(r.version == WT_TSC_VERSION && r.size == sizeof r && r.sequence == ++n);
         if (r.kind == WT_TSC_GUEST) { assert(r.site == 101); assert(r.word[0] == c.x[0]); }
         if (r.kind == WT_TSC_BEGIN) { assert(r.word[1] == ++begins); }
         if (r.kind == WT_TSC_RANGE) {

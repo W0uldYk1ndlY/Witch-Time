@@ -55,8 +55,9 @@ static int export_stat(int fd, struct stat *st) {
 #undef fchmod
 #undef fstat
 
-static int bind_capture(uint32_t v, uint32_t size, const uint32_t *gate, WtTscEmit emit) {
+static int bind_capture(uint32_t v, uint32_t size, uint64_t epoch, const uint32_t *gate, WtTscEmit emit) {
     assert(v == WT_TSC_VERSION && size == sizeof(WtTscRecord));
+    assert(!!gate == !!epoch && !!emit == !!epoch);
     if (gate && emit) bind_calls++;
     return 0;
 }

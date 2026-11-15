@@ -30,8 +30,8 @@ static int requested, missing_start, missing_finish, missing_bind, init_error, f
 static int starts, finishes, runs, lookups, rejected;
 static int diag_bootstrap_temporal_source_requested(void) { return requested; }
 static int finish_mock(void) { finishes++; return finish_error; }
-static int bind_mock(uint32_t v, uint32_t s, const uint32_t *a, WtTscEmit e) {
-    (void)v; (void)s; (void)a; (void)e; return 0;
+static int bind_mock(uint32_t v, uint32_t s, uint64_t epoch, const uint32_t *a, WtTscEmit e) {
+    (void)v; (void)s; (void)epoch; (void)a; (void)e; return 0;
 }
 static int start_mock(const char *dir, int on, WtTscBind bind) {
     starts++; assert(on == 1 && !strcmp(dir, "diagnostics/validated_run"));

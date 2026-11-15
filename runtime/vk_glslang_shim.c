@@ -12,8 +12,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <glslang/build_info.h>
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
+
+/* Shared by the compiler invocation and its disk-cache identity. Increment the
+ * policy revision when changing generation/options outside these inputs. */
+#define WT_GLSLANG_POLICY_REVISION 1
+#define WT_GLSLANG_CLIENT_VERSION GLSLANG_TARGET_VULKAN_1_3
+#define WT_GLSLANG_SPIRV_VERSION GLSLANG_TARGET_SPV_1_6
+#define WT_GLSLANG_DEFAULT_VERSION 460
+#define WT_GLSLANG_MESSAGES (GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT)
+
+__declspec(dllexport) uint64_t wt_glsl_cache_identity(void) {
+    const uint32_t profile[] = { WT_GLSLANG_POLICY_REVISION, GLSLANG_VERSION_MAJOR, GLSLANG_VERSION_MINOR,
+        GLSLANG_VERSION_PATCH, GLSLANG_SOURCE_GLSL, GLSLANG_CLIENT_VULKAN, WT_GLSLANG_CLIENT_VERSION,
+        GLSLANG_TARGET_SPV, WT_GLSLANG_SPIRV_VERSION, WT_GLSLANG_DEFAULT_VERSION, GLSLANG_NO_PROFILE, WT_GLSLANG_MESSAGES };
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    /* Explicit byte order keeps the cache identity independent of host ABI. */
+    for (size_t i = 0; i < sizeof profile / sizeof *profile; ++i)
+        for (unsigned shift = 0; shift < 32; shift += 8) h = (h ^ ((profile[i] >> shift) & 255u)) * UINT64_C(0x100000001b3);
+    const char *flavor = GLSLANG_VERSION_FLAVOR;
+    while (*flavor) h = (h ^ (uint8_t)*flavor++) * UINT64_C(0x100000001b3);
+    return h;
+}
 
 #ifdef _WIN32
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
@@ -41,13 +63,13 @@ __declspec(dllexport) int wt_glsl_to_spirv(int stage, const char *src, uint32_t 
     in.stage = stage == 0 ? GLSLANG_STAGE_VERTEX : stage == 1 ? GLSLANG_STAGE_FRAGMENT : stage == 3 ? GLSLANG_STAGE_TESSCONTROL : stage == 4 ? GLSLANG_STAGE_TESSEVALUATION : stage == 5 ? GLSLANG_STAGE_COMPUTE : GLSLANG_STAGE_COUNT;
     if (in.stage == GLSLANG_STAGE_COUNT) { if (log) snprintf(log, log_size, "stage %d is not vertex (0), fragment (1), tessellation control (3) / evaluation (4) or compute (5)", stage); return 0; }
     in.client = GLSLANG_CLIENT_VULKAN;
-    in.client_version = GLSLANG_TARGET_VULKAN_1_3;
+    in.client_version = WT_GLSLANG_CLIENT_VERSION;
     in.target_language = GLSLANG_TARGET_SPV;
-    in.target_language_version = GLSLANG_TARGET_SPV_1_6;
+    in.target_language_version = WT_GLSLANG_SPIRV_VERSION;
     in.code = src;
-    in.default_version = 460;
+    in.default_version = WT_GLSLANG_DEFAULT_VERSION;
     in.default_profile = GLSLANG_NO_PROFILE;
-    in.messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT;
+    in.messages = WT_GLSLANG_MESSAGES;
     in.resource = glslang_default_resource();
     glslang_shader_t *sh = glslang_shader_create(&in);
     glslang_program_t *pr = NULL;

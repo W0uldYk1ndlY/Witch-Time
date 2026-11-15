@@ -67,7 +67,7 @@ static struct {
     TargetRef col[8], depth;
 } R;
 static struct { int has_iu8; struct { struct { int multiDrawIndirect; } features; } f2; } D;
-static struct { struct { struct { unsigned maxTessellationPatchSize; } limits; } props; } V;
+static struct { struct { struct { unsigned maxTessellationPatchSize, maxDrawIndirectCount; } limits; } props; } V;
 static TargetRef g_sf_col[8], g_sf_dep;
 static int g_sf_ncol, g_sf_have, g_sf_oq, g_sf_on = -1;
 static LONG64 g_sf_draws, g_tm[9];
@@ -112,6 +112,7 @@ static int topology_valid(unsigned prim) {
 #define drawlog_on() 0
 #define nvn_front_frame_next() 0LL
 static int gpu_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 0; }
+static int gpucount_on(void) { return 0; }
 static int index_extent(uint64_t addr, uint64_t *extent) { (void)addr; *extent = 0; return 0; }
 static int cb_overlap(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 0; }
 static int recs_bounded(uint64_t addr, uint32_t n, uint32_t stride, uint32_t sz, int elements, uint64_t idx, unsigned type) {
@@ -205,6 +206,7 @@ static void reset(void) {
     prepares = draws = refs = ends = markers = query_samples = buffer_writes = 0;
     fail_prepare = wrap = bound_buf = bad_target = bad_ring = missing = 0;
     V.props.limits.maxTessellationPatchSize = 32;
+    V.props.limits.maxDrawIndirectCount = 16;
 }
 static void restored(void) {
     assert(R.ncol == 8 && R.have_targets && R.col[0].texture == 11 && R.col[0].view == 12);

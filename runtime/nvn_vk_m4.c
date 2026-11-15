@@ -13,6 +13,11 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#ifndef _WIN32
+#define VKC_NORMALIZE_PATH(path, buffer, size) plat_path(path, buffer, size)
+#endif
+#include "nvn_vk_cache.h"
+#undef VKC_NORMALIZE_PATH
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -27,9 +32,9 @@ typedef struct VStage {
     uint16_t img_fmt[8]; uint8_t img_type[8];      /* [witchtime] storage image k: the shader's typed format (GL internal format, 0 = the texture's own) and its type (MxOut) */
 } VStage;
 #define MX_VK_VERSION 21u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
-typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; uint16_t img_fmt[8]; uint8_t img_type[8]; } StageRec;
+typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb, compiler; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; uint16_t img_fmt[8]; uint8_t img_type[8]; uint64_t checksum; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
-#define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
+#define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION + (VKC_STAGE_REC_VERSION << 16))
 typedef struct { int stage, code_len, serial, rs, nograin; uint32_t hdr; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem, tess[4]; } SSrc;      /* tess: the evaluation stage's mode (Stage.tess); rs: a fragment stage translated for a scale other than 1.0, kept here because a worker may build it after the scale changed */
 static CRITICAL_SECTION g_sh_lock;
 static CONDITION_VARIABLE g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
@@ -56,6 +61,7 @@ static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
 static uint32_t g_vstage_ids;
 static int (*g_glsl_to_spirv)(int, const char *, uint32_t **, size_t *, char *, size_t);
 static void (*g_spirv_free)(uint32_t *);
+static uint64_t g_glsl_cache_id;                    /* shim/compiler/target identity, fixed before workers start; 0 = legacy shim */
 enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
 static LONG64 g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
 static LONG64 g_w_progs, g_w_stages, g_w_pipes, g_pred_made, g_pred_used, g_set_held, g_set_held_tk;
@@ -90,7 +96,7 @@ static const char *vkc_dir(void) {
     if (!d[0]) { const char *e = getenv("WT_VK_CACHE"); snprintf(d, sizeof d, "%s", e && e[0] ? e : "../cache/vk"); }
     return d;
 }
-static const char *vkc_file(const char *name) { static char p[4][260]; static LONG i; char *b = p[InterlockedIncrement(&i) & 3]; snprintf(b, 260, "%s/%s", vkc_dir(), name); return b; }
+static const char *vkc_file(const char *name) { static _Thread_local char p[4][VKC_PATH_CAP]; static _Thread_local unsigned i; char *b = p[++i & 3]; snprintf(b, VKC_PATH_CAP, "%s/%s", vkc_dir(), name); return b; }
 static void compute_pipe_make(VStage *v);
 static uint64_t g_spv_unused;
 static int g_offline;                              /* --prepare-shaders: stages are translated and written to ..\cache\vk, no Vulkan device exists */
@@ -150,37 +156,38 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->hdr) { h = fnv(h, "hdr3", 4); h = fnv(h, &o->hdr, 4); }      /* [witchtime] HDR: another translation per peak / white; without it the hash is the one it always was */
     if (o->nograin) h = fnv(h, "ng1", 3);      /* issue 86: another translation; with the grain on the hash is the one it always was */
     if (o->rs) h = fnv(h, "rs3", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
-    return fnv(h, &ver, 4);
+    h = fnv(h, &ver, 4);
+    return g_glsl_cache_id ? fnv(h, &g_glsl_cache_id, sizeof g_glsl_cache_id) : h;
 }
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
-    char path[128];
+    char path[VKC_PATH_CAP];
     VkShaderModule mod = NULL;
     snprintf(path, sizeof path, "%s/spv/%016llx.spv", vkc_dir(), (unsigned long long)h);
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    if (g_offline) { fclose(fp); return (VkShaderModule)(uintptr_t)1; }      /* --prepare-shaders: no device; the file being there is all that is asked */
-    fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-    uint32_t *words = n > 20 && n % 4 == 0 ? malloc((size_t)n) : NULL;
-    if (words && fread(words, 1, (size_t)n, fp) == (size_t)n && words[0] == 0x07230203) {
-        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = (size_t)n; ci.pCode = words;
-        if (vkCreateShaderModule(V.device, &ci, NULL, &mod) != VK_SUCCESS) mod = NULL;
+    size_t n = 0;
+    uint32_t *words = vkc_read_file(path, VKC_SPV_LIMIT, &n);
+    if (vkc_spirv_valid(words, n)) {
+        if (g_offline) mod = (VkShaderModule)(uintptr_t)1;
+        else {
+            VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = n; ci.pCode = words;
+            if (vkCreateShaderModule(V.device, &ci, NULL, &mod) != VK_SUCCESS) mod = NULL;
+        }
     }
-    free(words); fclose(fp);
+    free(words);
     return mod;
 }
 static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash) {      /* any thread */
-    char path[128], log[2000];
+    char path[VKC_PATH_CAP], log[2000];
     uint32_t *words = NULL;
     size_t count = 0;
     VkShaderModule mod = NULL;
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)stage ^ 0x5601, glsl, strlen(glsl));
+    if (g_glsl_cache_id) h = fnv(h, &g_glsl_cache_id, sizeof g_glsl_cache_id);
     *spv_hash = h;
     if ((mod = module_from_spv(h)) != NULL) { InterlockedIncrement64(&R.modules); return mod; }
     if (!g_glsl_to_spirv(stage, glsl, &words, &count, log, sizeof log)) { printf("nvn_vk: %s: glslang rejected the translated text: %s\n", what, log); fflush(stdout); return NULL; }
     snprintf(path, sizeof path, "%s/spv/%016llx.spv", vkc_dir(), (unsigned long long)h);
-    FILE *fp = fopen(path, "wb");
-    if (fp) { fwrite(words, 4, count, fp); fclose(fp); }
+    vkc_write_file(path, words, count * sizeof *words);
     if (g_offline) { g_spirv_free(words); InterlockedIncrement64(&R.modules); return (VkShaderModule)(uintptr_t)1; }
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = count * 4; ci.pCode = words;
@@ -190,13 +197,16 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
     return mod;
 }
 static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
-    char path[128];
+    char path[VKC_PATH_CAP];
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.st", vkc_dir(), s, (unsigned long long)vh);
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
     size_t got = fread(r, 1, sizeof *r, fp);
+    int complete = got == sizeof *r && fgetc(fp) == EOF && !ferror(fp);
     fclose(fp);
-    return got == sizeof *r && r->magic == STAGEREC_MAGIC && r->stage == s && r->nsmp >= 0 && r->nsmp <= 64
+    return complete && r->magic == STAGEREC_MAGIC && r->stage == s && r->code_len > 0 && r->compiler == g_glsl_cache_id
+        && r->checksum == fnv(0xcbf29ce484222325ULL, r, offsetof(StageRec, checksum))
+        && fnv(fnv(r->hb, r->key, 16), &r->fo, 4) == vh && r->nsmp >= 0 && r->nsmp <= 64
         && !(s != 5 && (r->cbufs & 1));      /* finding 124: a graphics stage that reads c0 was translated before the fix: made again (only those records change) */
 }
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
@@ -252,7 +262,7 @@ static LONG64 g_rs_pre_made, g_rs_pre_had, g_rs_pre_queued;
 static void vstage_build(VStage *v, const SSrc *src);
 static int rs_pre_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("WT_VK_RS_PREP"); on = !(e && !atoi(e)) && !g_offline; } return on; }
 static int rs_pre_have(const SSrc *src, uint64_t hb, const uint32_t *key, uint32_t fo) {      /* a scaled variant serving key is on disk */
-    char path[128]; VarRec e; StageRec r; int have = 0;
+    char path[VKC_PATH_CAP]; VarRec e; StageRec r; int have = 0;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), src->stage, (unsigned long long)hb);
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
@@ -359,7 +369,7 @@ static void hdr_stage_text(char **glsl, uint32_t var) {
 }
 static void vstage_build(VStage *v, const SSrc *src) {
     int s = v->stage, done = 0;
-    char path[128];
+    char path[VKC_PATH_CAP];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
     FILE *fp = fopen(path, "rb");
@@ -368,7 +378,8 @@ static void vstage_build(VStage *v, const SSrc *src) {
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
             VkShaderModule mod;
             if (e.magic != STAGEREC_MAGIC || e.fo != v->fo || !key_fits(s, v->key, e.key, e.dep, e.tex)) continue;
-            if (stage_rec_read(s, e.vh, &r) && (mod = module_from_spv(r.spv)) != NULL) { module_name(mod, src); vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; InterlockedIncrement64(&R.modules); done = 1; }
+            if (stage_rec_read(s, e.vh, &r) && r.hb == v->hb && r.fo == v->fo && r.code_len == v->code_len && key_fits(s, v->key, r.key, r.dep, r.tex_units)
+                && (mod = module_from_spv(r.spv)) != NULL) { module_name(mod, src); vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; InterlockedIncrement64(&R.modules); done = 1; }
         }
         fclose(fp);
     }
@@ -416,16 +427,17 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 v->key[0] &= v->dep; v->key[1] &= v->dep; v->key[2] &= v->tex_units; v->key[3] &= v->tex_units;
                 v->h = fnv(fnv(v->hb, v->key, 16), &v->fo, 4);
                 memset(&r, 0, sizeof r);
-                r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
+                r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb; r.compiler = g_glsl_cache_id;
                 r.cbufs = v->cbufs; r.ssbos = v->ssbos; r.ssbo_w = v->ssbo_w; r.images = v->images; r.dep = v->dep; r.tex_units = v->tex_units; r.in_attr = v->in_attr; r.out_attr = v->out_attr;
                 r.uses_alpha = v->uses_alpha; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp);
                 memcpy(r.img_fmt, v->img_fmt, sizeof r.img_fmt); memcpy(r.img_type, v->img_type, sizeof r.img_type);
+                r.checksum = fnv(0xcbf29ce484222325ULL, &r, offsetof(StageRec, checksum));
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.st", vkc_dir(), s, (unsigned long long)v->h);
-                if ((fp = fopen(path, "wb")) != NULL) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
+                int recorded = vkc_write_file(path, &r, sizeof r);
                 memset(&e, 0, sizeof e);
                 e.magic = STAGEREC_MAGIC; memcpy(e.key, v->key, 16); e.fo = v->fo; e.dep = v->dep; e.tex = v->tex_units; e.vh = v->h;
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-                if ((fp = fopen(path, "ab")) != NULL) { fwrite(&e, 1, sizeof e, fp); fclose(fp); }
+                if (recorded && (fp = fopen(path, "ab")) != NULL) { fwrite(&e, 1, sizeof e, fp); fclose(fp); }
             }
         }
     }
@@ -653,7 +665,7 @@ static volatile LONG g_in_fight;
  * "nvn_vk_feedback:" at exit; with WT_VK_HOLDLOG=1 one line "nvn_vk_first:" per creation at a draw in a fight frame. */
 typedef struct { uint32_t flags; uint64_t duration; } FbRec;
 typedef struct { VkStructureType sType; const void *pNext; FbRec *pPipelineCreationFeedback; uint32_t pipelineStageCreationFeedbackCount; FbRec *pPipelineStageCreationFeedbacks; } FbInfo;
-static volatile LONG64 g_pc_dirty, g_pc_dirty_saved;      /* session 14: creations the driver's cache did not answer (stage libraries by feedback; whole pipelines by their time, over 3 ms), and the count at the last read-out */
+static volatile LONG64 g_pc_dirty, g_pc_dirty_saved;      /* creations not answered by the driver's cache, and the snapshot successfully published on disk */
 static void pc_dirty_time(LONG64 t0) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); if ((tk() - t0) * 1000 > 3 * fq.QuadPart) InterlockedIncrement64(&g_pc_dirty); }
 static LONG64 g_fb_hit[2], g_fb_miss[2], g_fb_none[2], g_fb_fhit[2], g_fb_fmiss[2], g_fb_fmiss_tk[2], g_fb_fhit_tk[2], g_fb_miss_ns[2];
 static DWORD g_render_tid;
@@ -1400,7 +1412,8 @@ typedef struct { uint32_t magic, compute; uint64_t vs_h, fs_h; PKey k; } PipeRec
 static PipeRec *g_pw_rec;
 static volatile LONG g_pw_next, g_pw_left;
 static LONG64 g_pw_t0, g_pw_t1;
-static char g_pcache_path[160];
+static char g_pcache_path[VKC_PATH_CAP];
+static volatile LONG g_pcache_file_valid;
 static VStage *pw_stage(int s, uint64_t vh) {      /* g_sh_lock held: a variant named by pipes.bin, from its record */
     StageRec r;
     VkShaderModule mod;
@@ -1922,17 +1935,20 @@ static void prewarm_start(void) {
     {   HMODULE m = LoadLibraryA("wt_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "wt_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "wt_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("wt_glslang.dll cannot be loaded (the build puts it beside the program)");
+        uint64_t (*identity)(void) = (void *)GetProcAddress(m, "wt_glsl_cache_identity");
+        g_glsl_cache_id = identity ? identity() : 0; /* old shims keep the stable legacy key */
     }
-    {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
+    {   /* the driver's pipeline cache, ours on disk: check UUID as well as GPU/driver filename before giving bytes to the driver */
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
         LONG64 tp0 = tk(), tp1;
         LARGE_INTEGER pfq; QueryPerformanceFrequency(&pfq);
-        FILE *fp = fopen(g_pcache_path, "rb");
-        if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
+        data = vkc_read_pipeline(g_pcache_path, V.props.vendorID, V.props.deviceID, V.props.pipelineCacheUUID, &ci.initialDataSize);
+        ci.pInitialData = data;
         tp1 = tk();
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
+        g_pcache_file_valid = ci.initialDataSize != 0;
         /* session 11: what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
@@ -1949,12 +1965,10 @@ static void prewarm_start(void) {
     if (getenv("WT_VK_CSCAN_REACH") && atoi(getenv("WT_VK_CSCAN_REACH")) > 0) g_cscan_reach = (uint64_t)atoi(getenv("WT_VK_CSCAN_REACH"));
     if (!D.has_vids) vlay_load();                  /* finding 116: the layout numbers pipes.bin's keys hold */
     int ahead = !(getenv("WT_VK_PREWARM") && !atoi(getenv("WT_VK_PREWARM")));
-    FILE *fp = ahead ? fopen(vkc_file("pipes.bin"), "rb") : NULL;
-    if (fp) {
-        fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-        g_pw_rec = malloc((size_t)n + 1);
-        g_pw_n = (int)(fread(g_pw_rec, sizeof(PipeRec), (size_t)n / sizeof(PipeRec), fp));
-        fclose(fp);
+    size_t pipe_bytes = 0;
+    g_pw_rec = ahead ? vkc_read_file(vkc_file("pipes.bin"), VKC_RECORD_LIMIT, &pipe_bytes) : NULL;
+    g_pw_n = (int)(pipe_bytes / sizeof(PipeRec));
+    if (g_pw_rec) {
         int kept = 0;
         qsort(g_pw_rec, (size_t)g_pw_n, sizeof(PipeRec), piperec_cmp);
         /* finding 116: a key with a vertex layout only on a GPU without dynamic vertex input (and one it knows), a key without one only with it */
@@ -2180,20 +2194,18 @@ static void m4_stop(void) {
  * a run that dies before either leaves no marker and the next start prepares again (record reads and cache hits).
  * One call with a buffer sized from the file on disk instead of two (the size query serialises too); the two-call form is
  * the fallback. WT_VK_PCSAVE=prep = the old behaviour (the preparation thread saves at once): for the comparison only. */
-static char g_prep_marker[240];
+static char g_prep_marker[VKC_PATH_CAP];
 static volatile LONG g_pcsave_want;                /* the preparation finished: cache + marker to be written at the next safe point */
 static volatile LONG64 g_gap_prev, g_gap_max;      /* nvn_vk_draw.c vk_present2: the longest time between two frames that reached the window since g_gap_max was cleared */
 static int g_prep_limited;                         /* WT_VK_PREP_LIMIT (test): not the whole game: no marker */
 static HANDLE g_pcw_thread;
-typedef struct { void *data; size_t n; int marker, where, one_call, prio; LONG64 t_get, t_q; } PcWrite;
+typedef struct { void *data; size_t n; int marker, where, one_call, prio; LONG64 t_get, t_q, dirty; } PcWrite;
 static void pcache_write(PcWrite *w) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-    char tmp[176];
     LONG64 t0 = tk();
-    int ok = 0;
-    snprintf(tmp, sizeof tmp, "%s.tmp", g_pcache_path);
-    FILE *fp = fopen(tmp, "wb");
-    if (fp) { ok = fwrite(w->data, 1, w->n, fp) == w->n; fclose(fp); if (ok) ok = MoveFileExA(tmp, g_pcache_path, MOVEFILE_REPLACE_EXISTING) != 0; }
+    int ok = vkc_write_file(g_pcache_path, w->data, w->n);
+    if (ok) { InterlockedExchange64(&g_pc_dirty_saved, w->dirty); InterlockedExchange(&g_pcache_file_valid, 1); }
+    else if (w->marker) InterlockedExchange(&g_pcsave_want, 1);
     LONG64 t1 = tk();
     if (w->where == 2) Sleep(300);                 /* the frame that was held behind the driver's lock has been presented by now */
     printf("nvn_vk: pipeline cache %s: %llu KB, %s; vkGetPipelineCacheData %.0f ms (%s), on a thread of priority %d; file written in %.0f ms%s; longest time between two presented frames while the cache was read out: %.0f ms (frame %lld, %s)\n",
@@ -2202,8 +2214,11 @@ static void pcache_write(PcWrite *w) {
            (double)w->t_get * 1000.0 / (double)fq.QuadPart, w->one_call ? "one call" : "two calls: size, then data", w->prio, (double)(t1 - t0) * 1000.0 / (double)fq.QuadPart, w->where == 1 ? " by a thread of its own" : "",
            (double)g_gap_max * 1000.0 / (double)fq.QuadPart, (long long)nvn_front_frame_next(), g_in_fight ? "IN A FIGHT" : "no fight");
     if (ok && w->marker && !g_prep_limited && g_prep_marker[0]) {
-        FILE *mf = fopen(g_prep_marker, "wb");
-        if (mf) { fprintf(mf, "%d containers, %lld variations\n", g_prep_nfiles, (long long)g_prep_vars); fclose(mf); printf("nvn_vk_prep: marker %s written with the pipeline cache: the next start skips the preparation\n", g_prep_marker); }
+        char marker[128];
+        int n = snprintf(marker, sizeof marker, "%d containers, %lld variations\n", g_prep_nfiles, (long long)g_prep_vars);
+        if (n > 0 && (size_t)n < sizeof marker && vkc_write_file(g_prep_marker, marker, (size_t)n))
+            printf("nvn_vk_prep: marker %s written with the pipeline cache: the next start skips the preparation\n", g_prep_marker);
+        else InterlockedExchange(&g_pcsave_want, 1);
     }
     fflush(stdout);
     free(w->data);
@@ -2242,11 +2257,20 @@ static void pcache_save_at(int where, int marker) {
     void *data = NULL;
     int one = 0;
     if (!g_pcache) return;
+    /* Finish a prior writer before deciding that exit has nothing left to save.
+     * A busy writer or a failed read/write must not acknowledge newer entries. */
+    if (g_pcw_thread) {
+        if (WaitForSingleObject(g_pcw_thread, where ? 0 : 60000) != WAIT_OBJECT_0) {
+            if (marker) InterlockedExchange(&g_pcsave_want, 1);
+            return;
+        }
+        CloseHandle(g_pcw_thread); g_pcw_thread = NULL;
+    }
     if (where == 0) {       /* session 14: the exit path rewrote the whole file (0.9 GB: 5-11 s with the window still there) even when nothing was added */
         const char *e = getenv("WT_VK_PCSAVE");
         WIN32_FILE_ATTRIBUTE_DATA fa0;
-        LONG64 added = g_pc_dirty - g_pc_dirty_saved;
-        int have_file = GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa0) && (fa0.nFileSizeLow || fa0.nFileSizeHigh);
+        LONG64 added = InterlockedCompareExchange64(&g_pc_dirty, 0, 0) - InterlockedCompareExchange64(&g_pc_dirty_saved, 0, 0);
+        int have_file = g_pcache_file_valid && GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa0) && (fa0.nFileSizeLow || fa0.nFileSizeHigh);
         if (have_file && !marker && added < 8 && !(e && !strcmp(e, "always"))) {      /* under 8 new entries: not worth 0.9 GB of writing (run s14prep1: 1 entry = 11 s of exit); they are made again next time, a few ms */
             printf("nvn_vk: pipeline cache NOT rewritten at exit: %lld creations were added since %s (under 8: not worth rewriting the file; WT_VK_PCSAVE=always writes it anyway)\n", (long long)added, g_pc_dirty_saved ? "the last save of this run" : "it was read at start");
             fflush(stdout);
@@ -2254,8 +2278,7 @@ static void pcache_save_at(int where, int marker) {
         }
         printf("nvn_vk: pipeline cache: %lld creations since %s were not in it%s: written at exit\n", (long long)added, g_pc_dirty_saved ? "the last save" : "the start", marker ? " and the preparation's marker is due" : !have_file ? " and there is no file yet" : "");
     }
-    g_pc_dirty_saved = g_pc_dirty;
-    if (g_pcw_thread) { WaitForSingleObject(g_pcw_thread, where ? 0 : 60000); if (where && WaitForSingleObject(g_pcw_thread, 0) != WAIT_OBJECT_0) return; CloseHandle(g_pcw_thread); g_pcw_thread = NULL; }
+    LONG64 dirty = InterlockedCompareExchange64(&g_pc_dirty, 0, 0);
     HANDLE probe = NULL, ready = NULL;
     if (where == 2) { ready = CreateEventA(NULL, TRUE, FALSE, NULL); g_pcprobe_stop = 0; probe = CreateThread(NULL, 0, pcprobe_main, ready, 0, NULL); WaitForSingleObject(ready, 3000); }
     g_gap_max = 0;
@@ -2263,27 +2286,39 @@ static void pcache_save_at(int where, int marker) {
     if (where != 2) {                             /* one call: the buffer is sized from the file of the last save */
         WIN32_FILE_ATTRIBUTE_DATA fa;
         if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh)) {
-            n = (size_t)(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
-            n += n / 8 + (64u << 20);
-            if ((data = malloc(n)) != NULL) { r = vkGetPipelineCacheData(V.device, g_pcache, &n, data); if (r == VK_SUCCESS) one = 1; else { free(data); data = NULL; } }
+            uint64_t previous = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            if (previous <= VKC_PIPELINE_LIMIT) {
+                n = (size_t)previous;
+                n += n / 8 + (64u << 20);
+                if (n > VKC_PIPELINE_LIMIT) n = VKC_PIPELINE_LIMIT;
+                if ((data = malloc(n)) != NULL) { r = vkGetPipelineCacheData(V.device, g_pcache, &n, data); if (r == VK_SUCCESS) one = 1; else { free(data); data = NULL; } }
+            }
         }
     }
     if (!data) {
         n = 0;
-        if (vkGetPipelineCacheData(V.device, g_pcache, &n, NULL) != VK_SUCCESS || !n) return;
-        if (!(data = malloc(n))) return;
-        if (vkGetPipelineCacheData(V.device, g_pcache, &n, data) != VK_SUCCESS) { free(data); return; }
+        if (vkGetPipelineCacheData(V.device, g_pcache, &n, NULL) != VK_SUCCESS || !n || n > VKC_PIPELINE_LIMIT) goto save_failed;
+        if (!(data = malloc(n))) goto save_failed;
+        if (vkGetPipelineCacheData(V.device, g_pcache, &n, data) != VK_SUCCESS) goto save_failed;
     }
     if (probe) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         g_pcprobe_stop = 1; WaitForSingleObject(probe, 30000); CloseHandle(probe); CloseHandle(ready);
+        probe = ready = NULL;
         printf("nvn_vk: TEST probe: a stage library made again from the same cache by another thread (normal priority): longest call %.1f ms in the 20 calls BEFORE the read-out, %.1f ms in the %lld calls DURING it (read-out %.0f ms)\n",
                (double)g_pcprobe_before * 1000.0 / (double)fq.QuadPart, (double)g_pcprobe_max * 1000.0 / (double)fq.QuadPart, (long long)g_pcprobe_n, (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
     }
+    if (!n || n > VKC_PIPELINE_LIMIT || !vkc_pipeline_header_valid(data, n, V.props.vendorID, V.props.deviceID, V.props.pipelineCacheUUID)) goto save_failed;
     PcWrite *w = calloc(1, sizeof *w);
-    w->data = data; w->n = n; w->marker = marker; w->where = where; w->one_call = one; w->prio = GetThreadPriority(GetCurrentThread()); w->t_get = tk() - t0;
+    if (!w) goto save_failed;
+    w->data = data; w->n = n; w->marker = marker; w->where = where; w->one_call = one; w->prio = GetThreadPriority(GetCurrentThread()); w->t_get = tk() - t0; w->dirty = dirty;
     if (where == 1 && (g_pcw_thread = CreateThread(NULL, 0, pcw_main, w, 0, NULL)) != NULL) return;
     pcache_write(w); free(w);
+    return;
+save_failed:
+    if (probe) { g_pcprobe_stop = 1; WaitForSingleObject(probe, 30000); CloseHandle(probe); CloseHandle(ready); }
+    free(data);
+    if (marker) InterlockedExchange(&g_pcsave_want, 1);
 }
 static void pcache_save(void) { pcache_save_at(0, InterlockedExchange(&g_pcsave_want, 0)); }      /* the exit path (vkd_shutdown) */
 
@@ -2625,7 +2660,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
 static int g_prep_nfiles, g_prep_read, g_prep_bad;
 static LONG64 g_prep_t0, g_prep_t1, g_prep_vars, g_prep_fight_frames;
 static HANDLE g_prep_thread;
-static char g_prep_marker[240];
+static char g_prep_marker[VKC_PATH_CAP];
 static int g_prep_marked;
 static void pcache_save(void);
 static volatile int g_store_pct;
@@ -2928,8 +2963,10 @@ static void prep_start(void) {
 #define VK_KEYS_VERSION 1
     char kv[16] = "";
     if (VK_KEYS_VERSION > 1) snprintf(kv, sizeof kv, "_k%d", VK_KEYS_VERSION);
-    snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u_int2%s_s%d_%s_%04x_%04x_%08x.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 4 : 0 /* s4: issue 126, "rs3" (the dither's fetch in mx_tf); s1: v0.5.1 and v0.5.2 prepared the unscaled fragment stages; s2: their scaled stages were "rs1", these are "rs2" (mx_fcs_y): those players prepare once more */, D.has_gpl && gpl_sep() ? "lib" : "nolib" /* a pass without libraries (WT_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
-    if (on && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
+    uint64_t environment = fnv(0xcbf29ce484222325ULL, &g_glsl_cache_id, sizeof g_glsl_cache_id);
+    environment = fnv(environment, V.props.pipelineCacheUUID, sizeof V.props.pipelineCacheUUID);
+    snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u_int2%s_s%d_%s_%04x_%04x_%08x_r%u_c%016llx.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 4 : 0 /* s4: issue 126, "rs3" (the dither's fetch in mx_tf); s1: v0.5.1 and v0.5.2 prepared the unscaled fragment stages; s2: their scaled stages were "rs1", these are "rs2" (mx_fcs_y): those players prepare once more */, D.has_gpl && gpl_sep() ? "lib" : "nolib" /* a pass without libraries (WT_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion, VKC_STAGE_REC_VERSION, (unsigned long long)environment);
+    if (on && g_pcache_file_valid && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
         printf("nvn_vk_prep: every container of the game's data was prepared for this GPU and driver by an earlier run (%s): only the %d container(s) kept in memory are made again, from their records (WT_VK_PREP=2 does everything again)\n", g_prep_marker, g_prep_keep > 0 ? g_prep_keep : 0);
         g_prep_marked = 1;
         /* session 11: the thread still runs: it makes the INDEX (hashing, under a second), so that a container is announced
@@ -2958,6 +2995,8 @@ int nvn_vk_prepare_shaders(const char *dir) {
     {   HMODULE m = LoadLibraryA("wt_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "wt_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "wt_spirv_free") : NULL;
         if (!g_glsl_to_spirv || !g_spirv_free) { printf("prepare-shaders: wt_glslang.dll cannot be loaded (the build puts it beside the program)\n"); return 2; }
+        uint64_t (*identity)(void) = (void *)GetProcAddress(m, "wt_glsl_cache_identity");
+        g_glsl_cache_id = identity ? identity() : 0;
     }
     SYSTEM_INFO si;
     GetSystemInfo(&si);
