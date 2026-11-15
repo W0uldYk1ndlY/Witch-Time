@@ -159,8 +159,8 @@ static int draw_prepare(unsigned prim) {
     if (wrap && prepares == 1) { R.cmd++; R.ring++; }
     return 1;
 }
-static void vkCmdBindIndexBuffer(int cmd, int buf, uint64_t off, int type) {
-    assert(cmd == R.cmd && off == (uint64_t)refs * 16 && type == 1);
+static void draw_index_state(int buf, uint64_t off, int type) {
+    assert(off == (uint64_t)refs * 16 && type == 1);
     bound_buf = buf;
 }
 static void store_draw(int indexed, uint32_t count, uint32_t instances) {

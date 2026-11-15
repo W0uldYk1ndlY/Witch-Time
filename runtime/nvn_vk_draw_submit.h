@@ -17,6 +17,7 @@ static struct {
 static VkDescriptorBufferInfo g_draw_bset_values[DRAW_BSET_VALUES];
 static uint32_t g_draw_bset_bindings[DRAW_BSET_VALUES];
 static uint32_t g_draw_bset_epoch, g_draw_bset_values_used;
+static unsigned g_draw_bset_last = DRAW_BSET_SLOTS;
 static int g_draw_bset_on = -1;
 static LONG64 g_draw_bset_hits, g_draw_bset_misses, g_draw_bset_uncached;
 
@@ -30,6 +31,7 @@ static void draw_buffer_sets_forget(void) {
         g_draw_bset_epoch = 1;
     }
     g_draw_bset_values_used = 0;
+    g_draw_bset_last = DRAW_BSET_SLOTS;
 }
 static int draw_buffer_infos_equal(uint32_t count, const uint32_t *ab, const VkDescriptorBufferInfo *a,
                                    const uint32_t *bb, const VkDescriptorBufferInfo *b) {
@@ -42,6 +44,14 @@ static VkDescriptorSet draw_buffer_set_find(VkDescriptorSetLayout layout, uint32
     *slot = DRAW_BSET_SLOTS;
     *key = 0;
     if (!draw_buffer_sets_on()) return VK_NULL_HANDLE;
+    unsigned last = g_draw_bset_last;
+    if (last < DRAW_BSET_SLOTS && g_draw_bsets[last].epoch == g_draw_bset_epoch &&
+        g_draw_bsets[last].layout == layout && g_draw_bsets[last].count == count &&
+        draw_buffer_infos_equal(count, bindings, values, &g_draw_bset_bindings[g_draw_bsets[last].off],
+                                &g_draw_bset_values[g_draw_bsets[last].off])) {
+        g_draw_bset_hits++;
+        return g_draw_bsets[last].set;
+    }
     uint64_t h = (UINT64_C(0xcbf29ce484222325) ^ (uint64_t)(uintptr_t)layout) * UINT64_C(0x100000001b3);
     h = (h ^ count) * UINT64_C(0x100000001b3);
     for (uint32_t i = 0; i < count; i++) {
@@ -59,6 +69,7 @@ static VkDescriptorSet draw_buffer_set_find(VkDescriptorSetLayout layout, uint32
         if (g_draw_bsets[pos].key == h && g_draw_bsets[pos].layout == layout && g_draw_bsets[pos].count == count &&
             draw_buffer_infos_equal(count, bindings, values, &g_draw_bset_bindings[g_draw_bsets[pos].off], &g_draw_bset_values[g_draw_bsets[pos].off])) {
             g_draw_bset_hits++;
+            g_draw_bset_last = pos;
             return g_draw_bsets[pos].set;
         }
     }
@@ -76,6 +87,7 @@ static void draw_buffer_set_save(unsigned slot, uint64_t key, VkDescriptorSetLay
         memcpy(&g_draw_bset_values[off], values, count * sizeof values[0]);
     }
     g_draw_bset_values_used += count;
+    g_draw_bset_last = slot;
 }
 static void draw_buffer_writes(VkDescriptorSet set, uint32_t count, const uint32_t *bindings,
                                const VkDescriptorBufferInfo *values, VkWriteDescriptorSet *writes) {
@@ -88,8 +100,13 @@ static void draw_buffer_writes(VkDescriptorSet set, uint32_t count, const uint32
  * also cover the renderer's own stencil, motion-vector, menu and upscale passes.
  * Layout identity is deliberately stricter than Vulkan layout compatibility. */
 static struct {
-    int vertex_ok, buffers_ok, push_ok, pc_ok;
-    uint32_t nb, na, buffer_count, push_count;
+    int vertex_ok, push_ok, pc_ok;
+    uint32_t nb, na, push_count;
+    uint32_t buffer_valid;
+    int index_ok;
+    VkBuffer index_buffer;
+    VkDeviceSize index_offset;
+    VkIndexType index_type;
     VkVertexInputBindingDescription2EXT bd[17];
     VkVertexInputAttributeDescription2EXT ad[16];
     VkBuffer buffers[17];
@@ -106,7 +123,8 @@ static int draw_shadow_on(void) {
     return g_draw_shadow_on;
 }
 static void draw_state_forget(void) {
-    g_draw_shadow.vertex_ok = g_draw_shadow.buffers_ok = g_draw_shadow.push_ok = g_draw_shadow.pc_ok = 0;
+    g_draw_shadow.vertex_ok = g_draw_shadow.push_ok = g_draw_shadow.pc_ok = 0;
+    g_draw_shadow.buffer_valid = 0; g_draw_shadow.index_ok = 0;
     g_draw_shadow.descriptor_layout = VK_NULL_HANDLE;
     g_draw_shadow.sets[0] = g_draw_shadow.sets[1] = VK_NULL_HANDLE;
 }
@@ -138,14 +156,29 @@ static void draw_vertex_state(uint32_t nb, const VkVertexInputBindingDescription
         } else g_draw_shadow_kept[0]++;
     }
     if (nb) {
-        if (!shadow || !g_draw_shadow.buffers_ok || g_draw_shadow.buffer_count != nb ||
-            memcmp(g_draw_shadow.buffers, buffers, nb * sizeof buffers[0]) || memcmp(g_draw_shadow.offsets, offsets, nb * sizeof offsets[0])) {
-            vkCmdBindVertexBuffers(R.cmd, 0, nb, buffers, offsets);
-            memcpy(g_draw_shadow.buffers, buffers, nb * sizeof buffers[0]);
-            memcpy(g_draw_shadow.offsets, offsets, nb * sizeof offsets[0]);
-            g_draw_shadow.buffer_count = nb; g_draw_shadow.buffers_ok = 1;
-        } else g_draw_shadow_kept[1]++;
+        uint32_t dirty = 0;
+        for (uint32_t i = 0; i < nb; i++)
+            if (!shadow || !(g_draw_shadow.buffer_valid >> i & 1u) ||
+                g_draw_shadow.buffers[i] != buffers[i] || g_draw_shadow.offsets[i] != offsets[i]) dirty |= 1u << i;
+        if (!dirty) g_draw_shadow_kept[1]++;
+        for (uint32_t first = 0; first < nb;) {
+            if (!(dirty >> first & 1u)) { first++; continue; }
+            uint32_t end = first + 1;
+            while (end < nb && (dirty >> end & 1u)) end++;
+            vkCmdBindVertexBuffers(R.cmd, first, end - first, buffers + first, offsets + first);
+            memcpy(g_draw_shadow.buffers + first, buffers + first, (end - first) * sizeof buffers[0]);
+            memcpy(g_draw_shadow.offsets + first, offsets + first, (end - first) * sizeof offsets[0]);
+            first = end;
+        }
+        g_draw_shadow.buffer_valid |= (1u << nb) - 1u;
     }
+}
+static void draw_index_state(VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
+    if (draw_shadow_on() && g_draw_shadow.index_ok && g_draw_shadow.index_buffer == buffer &&
+        g_draw_shadow.index_offset == offset && g_draw_shadow.index_type == type) return;
+    vkCmdBindIndexBuffer(R.cmd, buffer, offset, type);
+    g_draw_shadow.index_buffer = buffer; g_draw_shadow.index_offset = offset;
+    g_draw_shadow.index_type = type; g_draw_shadow.index_ok = 1;
 }
 static void draw_descriptor_layout(VkPipelineLayout layout) {
     if (g_draw_shadow.descriptor_layout != layout) {

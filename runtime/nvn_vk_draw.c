@@ -1707,13 +1707,29 @@ static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) {
 /* ---------------------------------------------------------------- samplers (shared by value, never deleted before shutdown) */
 static struct { SamplerParams p; VkSampler s; } g_smp[2048];
 static int g_nsmp;
+/* Index into g_smp (entry + 1, zero means empty). At most half full: the existing
+ * 2048-sampler limit guarantees an empty slot. Hash collisions still compare all
+ * parameter bytes, including float representations, just as the old scan did. */
+#define SMP_INDEX_N 4096u
+static uint16_t g_smp_index[SMP_INDEX_N];
 static VkSampler g_smp_old[4096];                 /* [witchtime] samplers of an earlier anisotropic filtering (the PC menu flushed the table), kept to shutdown */
 static int g_nsmp_old;
 static VkSampler g_smp_default;
 static VkSampler sampler_get(const SamplerParams *p) {
     static const VkSamplerAddressMode wrap[8] = {VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
                                                  VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
-    for (int i = 0; i < g_nsmp; i++) if (!memcmp(&g_smp[i].p, p, sizeof *p)) return g_smp[i].s;
+    /* The PC menu retains old handles, then resets g_nsmp. Clear before the next
+     * lookup so a settings change cannot reuse an entry from the previous table. */
+    if (!g_nsmp) memset(g_smp_index, 0, sizeof g_smp_index);
+    uint32_t hash = 2166136261u;
+    const uint8_t *bytes = (const uint8_t *)p;
+    for (size_t i = 0; i < sizeof *p; i++) hash = (hash ^ bytes[i]) * 16777619u;
+    uint32_t slot = hash & (SMP_INDEX_N - 1);
+    for (uint32_t probe = 0; probe < SMP_INDEX_N; probe++, slot = (slot + 1) & (SMP_INDEX_N - 1)) {
+        unsigned entry = g_smp_index[slot];
+        if (!entry) break;
+        if (!memcmp(&g_smp[entry - 1].p, p, sizeof *p)) return g_smp[entry - 1].s;
+    }
     VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
@@ -1764,6 +1780,7 @@ static VkSampler sampler_get(const SamplerParams *p) {
     VKC(vkCreateSampler(V.device, &ci, NULL, &s));
     if (g_nsmp == 2048) vkd_fail("more than 2048 distinct samplers");
     g_smp[g_nsmp].p = *p; g_smp[g_nsmp++].s = s;
+    g_smp_index[slot] = (uint16_t)g_nsmp;
     return s;
 }
 
@@ -5108,7 +5125,7 @@ static void exec(const Cmd *m, int depth) {
         BufRef ib;
         buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } shlog_draw(ok, m, 1); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
-        vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        draw_index_state(ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
         if (a[6]) fsr_evidence_draw();
         fsr_mv_commit(1, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
@@ -5118,7 +5135,7 @@ static void exec(const Cmd *m, int depth) {
         if (rs_store_low()) {                      /* [witchtime] issue 147; the indices again: the draw's preparation may have wrapped the ring */
             buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);
             int ok = draw_prepare((unsigned)a[0]);
-            if (ok) { vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32); pt_begin(PT_FULL_STORE, R.pass_w, R.pass_h); vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]); g_pt_internal_draws++; }
+            if (ok) { draw_index_state(ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32); pt_begin(PT_FULL_STORE, R.pass_w, R.pass_h); vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]); g_pt_internal_draws++; }
             rs_store_done(ok);
         }
         break;
@@ -5185,7 +5202,7 @@ static void exec(const Cmd *m, int depth) {
         LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0;
         g_dp_potential = 0;
         if (!ok) { if (rec_owned) free(rec_owned); R.frame_skipped += n; nvn_front_count(1, n); break; }
-        if (elements) vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        if (elements) draw_index_state(ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         CB *pc = gcount && g_cb_live ? cb_inside(param, 4) : NULL, *rc = grecs && g_cb_live ? cb_inside(a[3], span) : NULL;      /* still live: draw_prepare may have landed them (cb_sync); then guest memory has the bytes */
         if ((!gcount || pc) && (!grecs || rc) && (gcount || grecs)) {
             VkBuffer rb = grecs ? rc->buf : R.ring;

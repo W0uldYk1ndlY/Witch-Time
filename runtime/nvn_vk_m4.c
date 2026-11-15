@@ -1320,11 +1320,18 @@ static Pipe *tess_pipe_get(const PKey *k, VStage *vs, VStage *tcs, VStage *tes, 
     return p;
 }
 static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
-    /* [Recomps#1] finding 93: the pipeline of the draw before, when the key is the same and it is made and used: what the
-     * lookup below returns then, without the byte-wise hash of the key and the lock (render thread only; pipelines live
-     * until shutdown) */
-    static Pipe *last;
-    if (last && last->state == 2 && last->used && !memcmp(&last->k, k, sizeof *k)) return last;
+    /* The four most recently used pipelines avoid hashing and locking when a small set of draws alternates. Every hit
+     * still compares the complete key and requires a made, used pipeline; first use always takes the path below.
+     * Render thread only; pipelines live until shutdown. */
+    static Pipe *recent[4];
+    for (int i = 0; i < 4; i++) {
+        Pipe *p = recent[i];
+        if (p && p->state == 2 && p->used && !memcmp(&p->k, k, sizeof *k)) {
+            if (i) memmove(recent + 1, recent, (size_t)i * sizeof recent[0]);
+            recent[0] = p;
+            return p;
+        }
+    }
     uint64_t h = fnv(0xcbf29ce484222325ULL, k, sizeof *k);
     int mine = 0, waited = 0;
     LONG64 t0 = 0;
@@ -1378,7 +1385,8 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
         if (p->predicted && !mine) g_pred_used++;
         if (!p->recorded) { piperec_append(k, vs, fs, 0); p->recorded = 1; }
     }
-    last = p;
+    memmove(recent + 1, recent, 3 * sizeof recent[0]);
+    recent[0] = p;
     return p;
 }
 /* Any thread: the compute pipeline of a stage. Returns 1 when this call made it, 2 when it waited for another thread, 0 when it was there. */

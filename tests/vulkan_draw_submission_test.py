@@ -48,7 +48,7 @@ static struct { VkCommandBuffer cmd; LONG64 sets_reused; } R;
 static struct { VkDevice device; } V;
 static struct { int has_vids; } D;
 static unsigned allocs, updates, template_updates, desc_binds, push_buffers, vi_calls, vb_calls, pc_calls;
-static unsigned last_first_set, last_set_count, last_buffer_count;
+static unsigned last_first_set, last_set_count, last_buffer_count, index_calls;
 static VkDescriptorSet last_sets[2];
 static VkWriteDescriptorSet last_writes[160];
 static VkDescriptorBufferInfo last_infos[160];
@@ -95,7 +95,10 @@ static void vkCmdSetVertexInputEXT(VkCommandBuffer command, uint32_t nb, const V
     (void)command; assert(nb <= 17 && na <= 16); assert((!nb || bd) && (!na || ad)); ++vi_calls;
 }
 static void vkCmdBindVertexBuffers(VkCommandBuffer command, uint32_t first, uint32_t n, const VkBuffer *buffers, const VkDeviceSize *offsets) {
-    (void)command; assert(first == 0 && n <= 17 && buffers && offsets); ++vb_calls;
+    (void)command; assert(first + n <= 17 && buffers && offsets); ++vb_calls;
+}
+static void vkCmdBindIndexBuffer(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
+    (void)command; (void)buffer; (void)offset; (void)type; ++index_calls;
 }
 static void vkCmdPushConstants(VkCommandBuffer command, VkPipelineLayout layout, VkShaderStageFlags stages,
                                uint32_t offset, uint32_t size, const void *values) {
@@ -252,9 +255,12 @@ int main(void) {
     ad[1].offset++; draw_vertex_state(2, bd, 2, ad, vbuf, voff); assert(vi_calls == 3 && vb_calls == 1);
     voff[1]++; draw_vertex_state(2, bd, 2, ad, vbuf, voff); assert(vi_calls == 3 && vb_calls == 2);
     vbuf[1] = buffer(40); draw_vertex_state(2, bd, 2, ad, vbuf, voff); assert(vb_calls == 3);
-    draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 4 && vb_calls == 4);
-    draw_state_forget(); draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 5 && vb_calls == 5);
-    D.has_vids = 0; draw_state_forget(); draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 5 && vb_calls == 6); D.has_vids = 1;
+    draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 4 && vb_calls == 3);
+    draw_state_forget(); draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 5 && vb_calls == 4);
+    D.has_vids = 0; draw_state_forget(); draw_vertex_state(1, bd, 1, ad, vbuf, voff); assert(vi_calls == 5 && vb_calls == 5); D.has_vids = 1;
+    draw_index_state(buffer(41), 0, VK_INDEX_TYPE_UINT16);
+    draw_index_state(buffer(41), 0, VK_INDEX_TYPE_UINT16); assert(index_calls == 1);
+    draw_state_forget(); draw_index_state(buffer(41), 0, VK_INDEX_TYPE_UINT16); assert(index_calls == 2);
 
     /* Push constants match raw bit patterns, layout, and invalidation boundaries. */
     draw_state_forget(); clear_calls(); uint32_t pc[5] = {1, 0x7fc00001, 0x80000000, 4, 5};
