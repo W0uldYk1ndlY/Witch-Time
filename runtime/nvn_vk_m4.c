@@ -1,3 +1,4 @@
+#include "vk_cache.h"
 /* Track V, session 4 (M4, design section 5): stages, pipelines and the worker threads that make them AHEAD of the draw.
  * Included by nvn_vk_draw.c (not a build unit of its own); replaces that file's "stages" and "pipelines" sections and its
  * start-up workers of session 3.
@@ -56,6 +57,7 @@ static int wd_enter(const char *fn, int line) {
 static void wd_leave(int i) { if (i >= 0) g_wd_wait[i].tid = 0; }
 #define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); SleepConditionVariableCS(cv, lock, ms); wd_leave(wd_i_); } while (0)
 static VkPipelineCache g_pcache;
+static volatile LONG g_pcache_valid;             /* loaded or successfully persisted compatible driver cache */
 static LONG64 g_pw_stages, g_pw_pipes, g_pw_failed, g_pipe_miss;
 static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
 static uint32_t g_vstage_ids;
@@ -1413,7 +1415,6 @@ static PipeRec *g_pw_rec;
 static volatile LONG g_pw_next, g_pw_left;
 static LONG64 g_pw_t0, g_pw_t1;
 static char g_pcache_path[VKC_PATH_CAP];
-static volatile LONG g_pcache_file_valid;
 static VStage *pw_stage(int s, uint64_t vh) {      /* g_sh_lock held: a variant named by pipes.bin, from its record */
     StageRec r;
     VkShaderModule mod;
@@ -1948,7 +1949,7 @@ static void prewarm_start(void) {
         ci.pInitialData = data;
         tp1 = tk();
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
-        g_pcache_file_valid = ci.initialDataSize != 0;
+        g_pcache_valid = ci.initialDataSize != 0;
         /* session 11: what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
@@ -1965,14 +1966,17 @@ static void prewarm_start(void) {
     if (getenv("WT_VK_CSCAN_REACH") && atoi(getenv("WT_VK_CSCAN_REACH")) > 0) g_cscan_reach = (uint64_t)atoi(getenv("WT_VK_CSCAN_REACH"));
     if (!D.has_vids) vlay_load();                  /* finding 116: the layout numbers pipes.bin's keys hold */
     int ahead = !(getenv("WT_VK_PREWARM") && !atoi(getenv("WT_VK_PREWARM")));
-    size_t pipe_bytes = 0;
-    g_pw_rec = ahead ? vkc_read_file(vkc_file("pipes.bin"), VKC_RECORD_LIMIT, &pipe_bytes) : NULL;
-    g_pw_n = (int)(pipe_bytes / sizeof(PipeRec));
-    if (g_pw_rec) {
+    FILE *fp = ahead ? fopen(vkc_file("pipes.bin"), "rb") : NULL;
+    g_pw_n = 0; g_pw_rec = NULL;
+    if (fp) {
+        size_t n = 0;
+        g_pw_rec = wt_vk_cache_read(fp, WT_VK_RECORD_CACHE_LIMIT, sizeof(PipeRec), &n);
+        g_pw_n = (int)(n / sizeof(PipeRec));
+        fclose(fp);
         int kept = 0;
-        qsort(g_pw_rec, (size_t)g_pw_n, sizeof(PipeRec), piperec_cmp);
+        if (g_pw_n) qsort(g_pw_rec, (size_t)g_pw_n, sizeof(PipeRec), piperec_cmp);
         /* finding 116: a key with a vertex layout only on a GPU without dynamic vertex input (and one it knows), a key without one only with it */
-        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))
+        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && g_pw_rec[i].compute <= 1 && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))
                                             && (g_pw_rec[i].compute || (D.has_vids ? !pkey_vlay(&g_pw_rec[i].k) : vlay_of(pkey_vlay(&g_pw_rec[i].k)) != NULL))) g_pw_rec[kept++] = g_pw_rec[i];
         g_pw_n = kept;
     } else printf(ahead ? "nvn_vk: no ../cache/vk/pipes.bin: a first run on this PC; stages and pipelines are made when the game hands its programs over\n" : "nvn_vk: WT_VK_PREWARM=0: the pipeline list of earlier runs is not read\n");
@@ -2198,13 +2202,18 @@ static char g_prep_marker[VKC_PATH_CAP];
 static volatile LONG g_pcsave_want;                /* the preparation finished: cache + marker to be written at the next safe point */
 static volatile LONG64 g_gap_prev, g_gap_max;      /* nvn_vk_draw.c vk_present2: the longest time between two frames that reached the window since g_gap_max was cleared */
 static int g_prep_limited;                         /* WT_VK_PREP_LIMIT (test): not the whole game: no marker */
+static volatile LONG g_prep_marker_stale;          /* old completion marker could not be removed */
 static HANDLE g_pcw_thread;
 typedef struct { void *data; size_t n; int marker, where, one_call, prio; LONG64 t_get, t_q, dirty; } PcWrite;
 static void pcache_write(PcWrite *w) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     LONG64 t0 = tk();
     int ok = vkc_write_file(g_pcache_path, w->data, w->n);
-    if (ok) { InterlockedExchange64(&g_pc_dirty_saved, w->dirty); InterlockedExchange(&g_pcache_file_valid, 1); }
+    if (ok) {
+        InterlockedExchange64(&g_pc_dirty_saved, w->dirty);
+        InterlockedExchange(&g_pcache_valid, 1);
+        if (w->marker && !g_prep_limited) InterlockedExchange(&g_prep_marker_stale, 0);
+    }
     else if (w->marker) InterlockedExchange(&g_pcsave_want, 1);
     LONG64 t1 = tk();
     if (w->where == 2) Sleep(300);                 /* the frame that was held behind the driver's lock has been presented by now */
@@ -2257,20 +2266,29 @@ static void pcache_save_at(int where, int marker) {
     void *data = NULL;
     int one = 0;
     if (!g_pcache) return;
-    /* Finish a prior writer before deciding that exit has nothing left to save.
-     * A busy writer or a failed read/write must not acknowledge newer entries. */
+    /* One writer owns the temporary path. Join before inspecting its checkpoint;
+     * a loading-screen request must remain pending if a writer is still busy. */
     if (g_pcw_thread) {
-        if (WaitForSingleObject(g_pcw_thread, where ? 0 : 60000) != WAIT_OBJECT_0) {
+        if (WaitForSingleObject(g_pcw_thread, where ? 0 : INFINITE) != WAIT_OBJECT_0) {
             if (marker) InterlockedExchange(&g_pcsave_want, 1);
             return;
         }
         CloseHandle(g_pcw_thread); g_pcw_thread = NULL;
     }
+    if (!where) marker |= InterlockedExchange(&g_pcsave_want, 0);
+    /* If an obsolete marker cannot be removed, publishing a partial compatible
+     * cache would make that marker authoritative on the next startup. A complete
+     * preparation can safely replace it; a limited/interrupted run cannot. */
+    if (InterlockedCompareExchange(&g_prep_marker_stale, 0, 0) && (!marker || g_prep_limited)) {
+        printf("nvn_vk: partial cache not saved: obsolete preparation marker could not be removed\n");
+        return;
+    }
+    LONG64 dirty = InterlockedCompareExchange64(&g_pc_dirty, 0, 0);
     if (where == 0) {       /* session 14: the exit path rewrote the whole file (0.9 GB: 5-11 s with the window still there) even when nothing was added */
         const char *e = getenv("WT_VK_PCSAVE");
         WIN32_FILE_ATTRIBUTE_DATA fa0;
-        LONG64 added = InterlockedCompareExchange64(&g_pc_dirty, 0, 0) - InterlockedCompareExchange64(&g_pc_dirty_saved, 0, 0);
-        int have_file = g_pcache_file_valid && GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa0) && (fa0.nFileSizeLow || fa0.nFileSizeHigh);
+        LONG64 added = dirty - InterlockedCompareExchange64(&g_pc_dirty_saved, 0, 0);
+        int have_file = InterlockedCompareExchange(&g_pcache_valid, 0, 0) && GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa0) && (fa0.nFileSizeLow || fa0.nFileSizeHigh);
         if (have_file && !marker && added < 8 && !(e && !strcmp(e, "always"))) {      /* under 8 new entries: not worth 0.9 GB of writing (run s14prep1: 1 entry = 11 s of exit); they are made again next time, a few ms */
             printf("nvn_vk: pipeline cache NOT rewritten at exit: %lld creations were added since %s (under 8: not worth rewriting the file; WT_VK_PCSAVE=always writes it anyway)\n", (long long)added, g_pc_dirty_saved ? "the last save of this run" : "it was read at start");
             fflush(stdout);
@@ -2966,7 +2984,12 @@ static void prep_start(void) {
     uint64_t environment = fnv(0xcbf29ce484222325ULL, &g_glsl_cache_id, sizeof g_glsl_cache_id);
     environment = fnv(environment, V.props.pipelineCacheUUID, sizeof V.props.pipelineCacheUUID);
     snprintf(g_prep_marker, sizeof g_prep_marker, "%s/prepared_v%u_int2%s_s%d_%s_%04x_%04x_%08x_r%u_c%016llx.txt", vkc_dir(), MX_VK_VERSION, kv, RS_ON ? 4 : 0 /* s4: issue 126, "rs3" (the dither's fetch in mx_tf); s1: v0.5.1 and v0.5.2 prepared the unscaled fragment stages; s2: their scaled stages were "rs1", these are "rs2" (mx_fcs_y): those players prepare once more */, D.has_gpl && gpl_sep() ? "lib" : "nolib" /* a pass without libraries (WT_VK_PREP=1, run s10n0) must not make a later run with libraries skip theirs */, (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion, VKC_STAGE_REC_VERSION, (unsigned long long)environment);
-    if (on && g_pcache_file_valid && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
+    /* A marker cannot qualify an absent, corrupt or incompatible driver cache.
+     * Remove it before a partial run can replace that cache with fresh data. */
+    if (!InterlockedCompareExchange(&g_pcache_valid, 0, 0))
+        InterlockedExchange(&g_prep_marker_stale,
+            !DeleteFileA(g_prep_marker) && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES);
+    if (on && InterlockedCompareExchange(&g_pcache_valid, 0, 0) && GetFileAttributesA(g_prep_marker) != INVALID_FILE_ATTRIBUTES && !(e && atoi(e) == 2)) {
         printf("nvn_vk_prep: every container of the game's data was prepared for this GPU and driver by an earlier run (%s): only the %d container(s) kept in memory are made again, from their records (WT_VK_PREP=2 does everything again)\n", g_prep_marker, g_prep_keep > 0 ? g_prep_keep : 0);
         g_prep_marked = 1;
         /* session 11: the thread still runs: it makes the INDEX (hashing, under a second), so that a container is announced

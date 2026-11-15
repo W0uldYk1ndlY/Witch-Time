@@ -210,7 +210,7 @@ tools/wtbuild/target/release/wtbuild link --target android-arm64
 Objects and native output are isolated in `build/android-arm64/` (`--program 1` uses
 `build/program1/android-arm64/`). The game library is `libgame.so`, with the same Android SONAME, so it can be
 packaged as an APK native library. Android prebuilt manifests live in `prebuilt/android-arm64/` and must match
-the target and runtime sources. The desktop `setup` and launcher workflows do not yet support Android; they
+the target, runtime sources and Android runtime optimization flags. The desktop `setup` and launcher workflows do not yet support Android; they
 must not be used with an assumed `setup --target android-arm64` option. Package and test using `android/` and
 `scripts/android-package.sh` after building your own game library. Do not share dump-derived files or APKs.
 
@@ -275,6 +275,8 @@ cargo run --release --manifest-path tools/lifter-check/Cargo.toml -- [--main <ma
 `--main` (default `targets/exefs/main.elf`) takes every word of your main in the forms B2recomp and Witch Time added to
 the lifter (those `lifter/test_ext.py` and `test_b3.py` checked), `--synthetic N` random words of those forms with no
 dump (CI: `--synthetic 2000 --seed 1`, in `wtbuild.yml`). It needs clang, cmake and libclang, and runs on Linux.
-**Open**: on B3's main it exits 1. `sqrdmulh` / `sqdmulh` by element is wrong when both 32-bit lanes are INT32_MIN:
-`v_ielem` in `runtime/rt_ext.h` overflows its 64-bit product. Not fixed yet: any change to `rt_ext.h`
-recompiles every player's game. `--synthetic 2000` passes.
+The previously observed `sqrdmulh` / `sqdmulh` by-element failure for two INT32_MIN lanes
+is fixed: `v_ielem` in `runtime/rt_ext.h` now uses a wide intermediate before saturation.
+The exact host and NDK machine-code regressions are described in
+[`docs/ANDROID_TOP10.md`](../../docs/ANDROID_TOP10.md). Recompile game objects after this
+header change. The real-game `--main` run has not been repeated as part of that dump-free validation.

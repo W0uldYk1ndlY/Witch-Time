@@ -41,6 +41,7 @@ typedef struct { uint32_t nFileSizeLow, nFileSizeHigh; } WIN32_FILE_ATTRIBUTE_DA
 #define MOVEFILE_REPLACE_EXISTING 1
 #define GetFileExInfoStandard 0
 #define WAIT_OBJECT_0 0
+#define INFINITE 0xffffffffu
 #define TRUE 1
 #define FALSE 0
 #define VKC(x) assert((x) == VK_SUCCESS)
@@ -51,7 +52,7 @@ static struct { void *device; struct { uint32_t vendorID, deviceID, driverVersio
 static char cache_dir[100], g_prep_marker[VKC_PATH_CAP];
 static HANDLE g_pcache, g_pcw_thread;
 static LONG64 g_pc_dirty, g_pc_dirty_saved, g_gap_max, g_pcprobe_before, g_pcprobe_n, g_pcprobe_max, g_prep_vars;
-static int g_prep_limited, g_prep_nfiles, g_in_fight, g_pcprobe_stop, g_pcsave_want, g_pcache_file_valid;
+static int g_prep_limited, g_prep_nfiles, g_in_fight, g_pcprobe_stop, g_pcsave_want, g_pcache_valid, g_prep_marker_stale;
 static int save_error, driver_gets, wait_busy;
 static size_t driver_initial_size;
 static unsigned char driver_data[64] = {32, 0, 0, 0, 1, 0, 0, 0, 100, 0, 0, 0, 200, 0, 0, 0};
@@ -73,6 +74,7 @@ static HANDLE CreateEventA(void *a, int b, int c, void *d) { (void)a; (void)b; (
 static DWORD pcprobe_main(void *arg) { (void)arg; return 0; }
 static HANDLE CreateThread(void *a, int b, DWORD (*f)(void *), void *d, int e, void *g) { (void)a; (void)b; (void)f; (void)d; (void)e; (void)g; return NULL; }
 static LONG InterlockedExchange(LONG *p, LONG value) { LONG old = *p; *p = value; return old; }
+static LONG InterlockedCompareExchange(LONG *p, LONG value, LONG compare) { LONG old = *p; if (old == compare) *p = value; return old; }
 static LONG64 InterlockedExchange64(LONG64 *p, LONG64 value) { LONG64 old = *p; *p = value; return old; }
 static LONG64 InterlockedCompareExchange64(LONG64 *p, LONG64 value, LONG64 compare) { LONG64 old = *p; if (old == compare) *p = value; return old; }
 static VkResult vkCreatePipelineCache(void *device, const VkPipelineCacheCreateInfo *ci, void *allocator, HANDLE *cache) {

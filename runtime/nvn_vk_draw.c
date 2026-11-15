@@ -174,11 +174,37 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
 
 /* ---------------------------------------------------------------- memory: 64 MB blocks per memory type and class, first fit */
 typedef struct { int block; uint64_t off, size; void *map; VkDeviceMemory mem; } VMem;
-typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; int cls, nfree, used, sys; struct { uint64_t off, size; } fr[512]; } VBlock;
+typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; int cls, nfree, used, sys; size_t capacity; struct { uint64_t off, size; } fr[]; } VBlock;
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak, g_mem_sys, g_mem_used;      /* allocated in blocks; lost to full free lists; of the total in system memory; handed out */
-static uint32_t g_vram_full;      /* [issue 22] bit per memory type: a new block of it failed with VK_ERROR_OUT_OF_DEVICE_MEMORY; cleared when a block is freed */
+static uint32_t g_vram_full;      /* [issue 22] bit per memory type: prefer fallback after OOM or estimated pressure; cleared when a block is freed */
+/* Reserve before handing memory out: capacity >= nfree + used means every live allocation can be returned as a separate
+ * free range without allocating host memory. A split can add one free range and one live allocation, hence the two extra
+ * entries at allocation. Metadata OOM leaves the old block untouched and makes allocation try another block. */
+static int vmem_reserve(int block, size_t need) {
+    VBlock *k = g_blk[block];
+    if (need <= k->capacity) return 1;
+    size_t limit = (SIZE_MAX - sizeof *k) / sizeof k->fr[0], capacity = k->capacity;
+    if (need > limit) return 0;
+    while (capacity < need) capacity = capacity > limit / 2 ? limit : capacity * 2;
+    VBlock *grown = realloc(k, sizeof *k + capacity * sizeof k->fr[0]);
+    if (!grown) return 0;
+    grown->capacity = capacity;
+    g_blk[block] = grown;
+    return 1;
+}
+static uint64_t vmem_block_free(int block) {
+    VBlock *k = g_blk[block];
+    if (!k || k->used) return 0;
+    uint64_t size = k->size;
+    vkFreeMemory(V.device, k->mem, NULL);
+    g_mem_total -= (LONG64)size;
+    if (k->sys) g_mem_sys -= (LONG64)size;
+    g_vram_full = 0;
+    free(k); g_blk[block] = NULL;
+    return size;
+}
 /* [issue 153] a new block of `size` would pass the driver's budget for this type's heap (VK_EXT_memory_budget). Windows
  * drivers refuse nothing there: a 4 GB card went on to 3810 MB without one failed call, and Windows moved memory by itself.
  * WT_VK_BUDGET=0: not looked at; WT_VK_BUDGET=N, TEST: a budget of N MB. */
@@ -191,7 +217,55 @@ static int vmem_over_budget(uint32_t type, uint64_t size) {
     vkGetPhysicalDeviceMemoryProperties2(V.gpu, &m2);
     uint32_t h = D.mp.memoryTypes[type].heapIndex;
     uint64_t budget = test > 1 ? (uint64_t)test : bu.heapBudget[h];
-    return budget && bu.heapUsage[h] + size > budget;      /* (a driver that reports no budget: 0) */
+    return budget && (bu.heapUsage[h] > budget || size > budget - bu.heapUsage[h]);      /* (a driver that reports no budget: 0) */
+}
+static uint64_t vmem_trim_empty(uint32_t type) {
+    uint64_t freed = 0;
+    uint32_t heap = D.mp.memoryTypes[type].heapIndex;
+    for (int b = 0; b < g_nblk; b++) {
+        VBlock *k = g_blk[b];
+        if (k && !k->used && D.mp.memoryTypes[k->type].heapIndex == heap) freed += vmem_block_free(b);
+    }
+    return freed;
+}
+/* UMA has no alternate heap: both estimated pressure and actual OOM must try reclaiming empty blocks, then a smaller
+ * adequate allocation. Budgets are advisory; even when the required bytes exceed the estimate, ask the driver once.
+ * The same recovery applies to a discrete GPU's selected primary or fallback memory type. */
+static VkResult vmem_new_memory(VkMemoryAllocateInfo *ai, uint64_t required, VkDeviceMemory *memory) {
+    uint32_t type = ai->memoryTypeIndex;
+    if (vmem_over_budget(type, ai->allocationSize)) {
+        vmem_trim_empty(type);
+        while (ai->allocationSize > required && vmem_over_budget(type, ai->allocationSize)) {
+            uint64_t smaller = ai->allocationSize / 2;
+            ai->allocationSize = smaller < required ? required : smaller;
+        }
+    }
+    VkResult r = vkAllocateMemory(V.device, ai, NULL, memory);
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && vmem_trim_empty(type)) r = vkAllocateMemory(V.device, ai, NULL, memory);
+    while (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && ai->allocationSize > required) {
+        uint64_t smaller = ai->allocationSize / 2;
+        ai->allocationSize = smaller < required ? required : smaller;
+        r = vkAllocateMemory(V.device, ai, NULL, memory);
+    }
+    return r;
+}
+static VMem vmem_take(int block, uint64_t size, uint64_t al) {
+    VMem m = {-1, 0, 0, NULL, NULL};
+    VBlock *k = g_blk[block];
+    for (int i = 0; i < k->nfree; i++) {
+        uint64_t start = (k->fr[i].off + al - 1) / al * al, end = k->fr[i].off + k->fr[i].size;
+        if (start + size > end) continue;
+        if (!vmem_reserve(block, (size_t)k->nfree + (size_t)k->used + 2)) break;
+        k = g_blk[block];
+        uint64_t head = start - k->fr[i].off, tail = end - (start + size);
+        if (head && tail) { memmove(&k->fr[i + 2], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree++; k->fr[i].size = head; k->fr[i + 1].off = start + size; k->fr[i + 1].size = tail; }
+        else if (head) k->fr[i].size = head;
+        else if (tail) { k->fr[i].off = start + size; k->fr[i].size = tail; }
+        else { memmove(&k->fr[i], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree--; }
+        m.block = block; m.off = start; m.size = size; m.mem = k->mem; m.map = k->map ? (uint8_t *)k->map + start : NULL; k->used++; g_mem_used += (LONG64)size;
+        return m;
+    }
+    return m;
 }
 static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
@@ -205,55 +279,64 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
             (D.mp.memoryTypes[i].propertyFlags & want & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == (want & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) alt = i;
     t0 = type;
     uint64_t al = rq.alignment < 256 ? 256 : rq.alignment;
-    for (int pass = 0; pass < 2; pass++) {
-        for (int b = 0; b < g_nblk; b++) {
-            VBlock *k = g_blk[b];
-            if (!k || (k->type != t0 && !(g_vram_full >> t0 & 1 && k->type == alt)) || k->cls != cls) continue;
-            for (int i = 0; i < k->nfree; i++) {
-                uint64_t start = (k->fr[i].off + al - 1) / al * al, end = k->fr[i].off + k->fr[i].size;
-                if (start + rq.size > end) continue;
-                uint64_t head = start - k->fr[i].off, tail = end - (start + rq.size);
-                if (head && tail) { if (k->nfree == 512) continue; memmove(&k->fr[i + 2], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree++; k->fr[i].size = head; k->fr[i + 1].off = start + rq.size; k->fr[i + 1].size = tail; }
-                else if (head) k->fr[i].size = head;
-                else if (tail) { k->fr[i].off = start + rq.size; k->fr[i].size = tail; }
-                else { memmove(&k->fr[i], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree--; }
-                m.block = b; m.off = start; m.size = rq.size; m.mem = k->mem; m.map = k->map ? (uint8_t *)k->map + start : NULL; k->used++; g_mem_used += (LONG64)rq.size;
-                return m;
-            }
-        }
-        if (pass) break;
-        int b = 0;
-        while (b < g_nblk && g_blk[b]) b++;
-        if (b == 2048) vkd_fail("out of memory blocks");
-        VBlock *k = calloc(1, sizeof *k);
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
-        ai.allocationSize = k->size; ai.memoryTypeIndex = type;
-        static LONG64 cap = -1;      /* WT_VK_VRAM_MB=N, TEST: video memory as full past N MB (a smaller card) */
-        if (cap < 0) { const char *e = getenv("WT_VK_VRAM_MB"); cap = e ? (LONG64)atoi(e) << 20 : 0; }
-        int over = alt != 32 && !(g_vram_full >> type & 1) && vmem_over_budget(type, k->size);      /* [issue 153] */
-        VkResult r = alt != 32 && (over || g_vram_full >> type & 1 || (cap && g_mem_total - g_mem_sys + (LONG64)k->size > cap)) ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkAllocateMemory(V.device, &ai, NULL, &k->mem);
-        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && alt != 32) {
-            static int said;      /* (a freed block clears the state: not a line for every turn) */
-            if (!(g_vram_full >> type & 1) && said++ < 20)
-                printf("nvn_vk: video memory full (a %llu MB block of memory type %u %s; %lld MB allocated, %lld MB of it in system memory): new blocks go to memory type %u in system memory until a block is freed\n",
-                       (unsigned long long)(k->size >> 20), type, over ? "would pass the driver's budget (WT_VK_BUDGET=0: not looked at)" : "failed", (long long)(g_mem_total >> 20), (long long)(g_mem_sys >> 20), alt);
-            g_vram_full |= 1u << type;
-            type = k->type = ai.memoryTypeIndex = alt;
-            r = vkAllocateMemory(V.device, &ai, NULL, &k->mem);
-            if (r == VK_SUCCESS) { k->sys = 1; g_mem_sys += (LONG64)k->size; }
-        }
-        if (r != VK_SUCCESS) vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(k->size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20));
-        /* Optimal images (class 0) are never accessed through a host pointer.
-         * UMA heaps are often HOST_VISIBLE even for images: mapping every
-         * image block needlessly consumes CPU virtual mappings. Buffers keep
-         * their persistent maps and their existing coherence requirements. */
-        if (cls != 0 && (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) VKC(vkMapMemory(V.device, k->mem, 0, VK_WHOLE_SIZE, 0, &k->map));
-        k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
-        g_blk[b] = k; if (b == g_nblk) g_nblk++;
-        g_mem_total += (LONG64)k->size;
-        cls = k->cls;
+    for (int b = 0; b < g_nblk; b++) {
+        VBlock *k = g_blk[b];
+        if (!k || (k->type != t0 && !(g_vram_full >> t0 & 1 && k->type == alt)) || k->cls != cls) continue;
+        m = vmem_take(b, rq.size, al);
+        if (m.block >= 0) return m;
     }
+    int b = 0;
+    while (b < g_nblk && g_blk[b]) b++;
+    if (b == 2048) vkd_fail("out of memory blocks");
+    VBlock *k = calloc(1, sizeof *k + 512 * sizeof k->fr[0]);
+    if (!k) vkd_fail("out of host memory for Vulkan allocation metadata");
+    k->capacity = 512;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
+    ai.allocationSize = k->size; ai.memoryTypeIndex = type;
+    static LONG64 cap = -1;      /* WT_VK_VRAM_MB=N, TEST: video memory as full past N MB (a smaller card) */
+    if (cap < 0) { const char *e = getenv("WT_VK_VRAM_MB"); cap = e ? (LONG64)atoi(e) << 20 : 0; }
+    int over = alt != 32 && !(g_vram_full >> type & 1) && vmem_over_budget(type, k->size);      /* [issue 153] */
+    if (over && vmem_trim_empty(type)) over = vmem_over_budget(type, k->size);
+    int capped = cap && g_mem_total - g_mem_sys + (LONG64)k->size > cap;
+    int skipped_primary = alt != 32 && (over || g_vram_full >> type & 1 || capped);
+    VkResult r = skipped_primary ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vmem_new_memory(&ai, rq.size, &k->mem);
+    k->size = ai.allocationSize;
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && alt != 32) {
+        static int said;      /* (a freed block clears the state: not a line for every turn) */
+        if (!(g_vram_full >> type & 1) && said++ < 20)
+            printf("nvn_vk: video memory full (a %llu MB block of memory type %u %s; %lld MB allocated, %lld MB of it in system memory): new blocks go to memory type %u in system memory until a block is freed\n",
+                   (unsigned long long)(k->size >> 20), type, over ? "would pass the driver's budget (WT_VK_BUDGET=0: not looked at)" : "failed", (long long)(g_mem_total >> 20), (long long)(g_mem_sys >> 20), alt);
+        g_vram_full |= 1u << t0;
+        /* The primary may only now have failed, making old fallback ranges eligible. Reuse them before allocating
+         * another block; otherwise the old second search could leave freshly created backing entirely unused. */
+        for (int old = 0; old < g_nblk; old++) if (g_blk[old] && g_blk[old]->type == alt && g_blk[old]->cls == cls) {
+            m = vmem_take(old, rq.size, al);
+            if (m.block >= 0) { free(k); return m; }
+        }
+        type = k->type = ai.memoryTypeIndex = alt;
+        ai.allocationSize = rq.size > (16u << 20) ? rq.size : (64u << 20);
+        r = vmem_new_memory(&ai, rq.size, &k->mem);
+        k->size = ai.allocationSize;
+        g_vram_full |= 1u << t0;              /* trimming the fallback heap may have cleared the remembered failure */
+        if (r == VK_SUCCESS) { k->sys = 1; g_mem_sys += (LONG64)k->size; }
+    }
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && skipped_primary && !capped) {
+        /* Estimated pressure or a remembered fallback preference skipped the primary driver this time. If fallback
+         * fails, try the required primary allocation once. A synthetic WT_VK_VRAM_MB limit still forces fallback. */
+        type = k->type = ai.memoryTypeIndex = t0;
+        ai.allocationSize = rq.size;
+        r = vmem_new_memory(&ai, rq.size, &k->mem);
+        k->size = ai.allocationSize;
+        if (r == VK_SUCCESS) g_vram_full &= ~(1u << t0);
+    }
+    if (r != VK_SUCCESS) { uint64_t size = k->size; free(k); vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20)); }
+    if (cls != 0 && (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) VKC(vkMapMemory(V.device, k->mem, 0, VK_WHOLE_SIZE, 0, &k->map));
+    k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
+    g_blk[b] = k; if (b == g_nblk) g_nblk++;
+    g_mem_total += (LONG64)k->size;
+    m = vmem_take(b, rq.size, al);          /* every new block immediately acquires the owner it was created for */
+    if (m.block >= 0) return m;
     vkd_fail("allocation of %llu bytes failed in a fresh block", (unsigned long long)rq.size);
     return m;
 }
@@ -262,28 +345,23 @@ static void vmem_free(VMem m) {
     VBlock *k = g_blk[m.block];
     g_mem_used -= (LONG64)m.size;
     if (--k->used == 0) {
-        int release = k->cls >= 100;
-        /* Keep one empty normal block per memory type/class for reuse. A
-         * level transition must not pin every old 64 MB block indefinitely.
-         * vmem_free is reached only after the resource's GPU lifetime ends. */
-        for (int b = 0; !release && b < g_nblk; b++) {
+        /* Callers retire GPU users and destroy their resource before returning memory. Keep one empty ordinary block
+         * per type/class for reuse; further empty blocks and dedicated allocations can now return to the driver. */
+        if (k->cls >= 100) { vmem_block_free(m.block); return; }
+        for (int b = 0; b < g_nblk; b++) {
             VBlock *other = g_blk[b];
-            if (other && other != k && !other->used && other->type == k->type && other->cls == k->cls) release = 1;
+            if (b != m.block && other && !other->used && other->type == k->type && other->cls == k->cls) {
+                vmem_block_free(m.block); return;
+            }
         }
-        if (release) {
-            vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (LONG64)k->size;
-            g_vram_full = 0; if (k->sys) g_mem_sys -= (LONG64)k->size;
-            free(k); g_blk[m.block] = NULL;
-        } else {
-            k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
-        }
+        k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
         return;
     }
     int i = 0;
     while (i < k->nfree && k->fr[i].off < m.off) i++;
     if (i > 0 && k->fr[i - 1].off + k->fr[i - 1].size == m.off) { k->fr[i - 1].size += m.size; if (i < k->nfree && k->fr[i].off == m.off + m.size) { k->fr[i - 1].size += k->fr[i].size; memmove(&k->fr[i], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree--; } return; }
     if (i < k->nfree && k->fr[i].off == m.off + m.size) { k->fr[i].off = m.off; k->fr[i].size += m.size; return; }
-    if (k->nfree == 512) { g_mem_leak += (LONG64)m.size; return; }
+    if ((size_t)k->nfree == k->capacity) vkd_fail("Vulkan allocation metadata reservation was lost");
     memmove(&k->fr[i + 1], &k->fr[i], sizeof k->fr[0] * (size_t)(k->nfree - i)); k->nfree++;
     k->fr[i].off = m.off; k->fr[i].size = m.size;
 }

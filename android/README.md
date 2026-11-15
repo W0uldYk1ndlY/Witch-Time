@@ -2,6 +2,11 @@
 
 Target for first device validation: Oppo Find N5 / ColorOS 17. This branch is a native NDK/SDL3/Vulkan port, not a Switch emulator. **No device compatibility or playable APK is claimed until the build and game-specific tests listed below pass.**
 
+The `improve/android-top10-20261115` branch's ten runtime/build changes, source
+references and host/NDK verification are documented in
+[`docs/ANDROID_TOP10.md`](../docs/ANDROID_TOP10.md). Rebuild the generated game
+objects as well as the native runtime to pick up the integer helper changes.
+
 ## What remains private
 
 Use your own legally obtained, decrypted Bayonetta 3 dump, of the exact version required by `wtbuild setup`. This repository's setup validates that game's NSO hashes and layouts. A free/homebrew Switch game cannot stand in for it. The checked-in synthetic NSOs and lifter tests exercise conversion and translation without copyrighted game data.

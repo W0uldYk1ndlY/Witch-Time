@@ -23,7 +23,7 @@ static int artifact_readable(FILE *file) {
 
 uint32_t wt_tsc_active = WT_TSC_CLOSED;
 #define admission wt_tsc_active
-#define WT_TSC_COUNT_MASK 0x3ffffffeu
+#define WT_TSC_COUNT_MASK (~(WT_TSC_OPEN | WT_TSC_WAITING | WT_TSC_CLOSED | WT_TSC_TERMINAL))
 static uint32_t lock;
 static FILE *output, *summary;
 static WtTscBind game_bind;
@@ -42,7 +42,7 @@ static void stop(void) {
     __atomic_fetch_or(&admission, WT_TSC_CLOSED, __ATOMIC_ACQ_REL);
 }
 static void lost(void) { __atomic_fetch_add(&unavailable, 1, __ATOMIC_RELAXED); }
-static void append_epoch(WtTscRecord *r, uint64_t epoch) {
+static void append(const WtTscRecord *in, uint64_t epoch) {
     if (!wt_tsc_enabled()) return;
     if (epoch && epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE)) return;
     uint64_t frame_snapshot = __atomic_load_n(&frame_now, __ATOMIC_ACQUIRE);
@@ -55,12 +55,12 @@ static void append_epoch(WtTscRecord *r, uint64_t epoch) {
 #ifdef WT_TSC_TEST_AFTER_ADMIT
     WT_TSC_TEST_AFTER_ADMIT();
 #endif
-    /* An old callback may resume after CLOSED -> OPEN in a new run. Once admitted,
-       its writer count prevents reset until this second epoch check completes. */
+    /* A callback can pause before admission and resume after a new run opens. */
     if (epoch && epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE)) {
         __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
     }
-    if (epoch && (!r || r->version != WT_TSC_VERSION || r->size != sizeof *r || r->kind != WT_TSC_GUEST)) {
+    /* Validate only while counted: malformed stale input cannot stop a later run. */
+    if (epoch && (!in || in->version != WT_TSC_VERSION || in->size != sizeof *in || in->kind != WT_TSC_GUEST)) {
         lost(); stop(); __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
     }
     /* Freeze the label across admission; a racing interior-frame change is explicit loss. */
@@ -68,12 +68,13 @@ static void append_epoch(WtTscRecord *r, uint64_t epoch) {
         lost(); __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE); return;
     }
     uint32_t index = __atomic_fetch_add(&reserved, 1, __ATOMIC_ACQ_REL);
-    if (index >= WT_TSC_RECORDS || index >= WT_TSC_BYTES / sizeof *r) {
+    if (index >= WT_TSC_RECORDS || index >= WT_TSC_BYTES / sizeof *in) {
         __atomic_fetch_add(&overflow, 1, __ATOMIC_RELAXED); stop();
     } else {
-        r->version = WT_TSC_VERSION; r->size = sizeof *r;
-        r->frame = frame_snapshot; r->sequence = (uint64_t)index + 1;
-        slots[index].record = *r;
+        WtTscRecord r = *in;
+        r.version = WT_TSC_VERSION; r.size = sizeof r;
+        r.frame = frame_snapshot; r.sequence = (uint64_t)index + 1;
+        slots[index].record = r;
 #ifdef WT_TSC_TEST_BEFORE_PUBLISH
         WT_TSC_TEST_BEFORE_PUBLISH();
 #endif
@@ -81,17 +82,19 @@ static void append_epoch(WtTscRecord *r, uint64_t epoch) {
     }
     __atomic_fetch_sub(&admission, 2, __ATOMIC_RELEASE);
 }
-static void append(WtTscRecord *r) { append_epoch(r, 0); }
 static void guest_emit(uint64_t epoch, const WtTscRecord *in) {
-    if (!epoch || epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE) || !wt_tsc_enabled()) return;
-    if (!in) append_epoch(NULL, epoch);
-    else { WtTscRecord r = *in; append_epoch(&r, epoch); }
+    if (!epoch || epoch != __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE)) return;
+    append(in, epoch);
 }
 int wt_tsc_start(const char *dir, int requested, WtTscBind bind) {
     /* The run owner must finish before restarting; do not overwrite live state. */
     if (__atomic_load_n(&requested_run, __ATOMIC_ACQUIRE) || (__atomic_load_n(&admission, __ATOMIC_ACQUIRE) & WT_TSC_COUNT_MASK) ||
         __atomic_load_n(&lock, __ATOMIC_ACQUIRE)) return -1;
     if (!requested) return 0;
+    /* Never recycle an epoch, including after an unsuccessful guest binding. */
+    uint64_t epoch = __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE);
+    if (epoch == UINT64_MAX) return -1;
+    epoch++;
     char path[1024], summary_path[1024];
     if (!dir || !*dir || snprintf(path, sizeof path, "%s/temporal_source.bin", dir) >= (int)sizeof path ||
         snprintf(summary_path, sizeof summary_path, "%s/temporal_source.json", dir) >= (int)sizeof summary_path) return -1;
@@ -114,8 +117,6 @@ int wt_tsc_start(const char *dir, int requested, WtTscBind bind) {
     __atomic_store_n(&admission, WT_TSC_CLOSED, __ATOMIC_RELEASE);
     memset(slots, 0, sizeof slots);
     memset(buffers, 0, sizeof buffers);
-    uint64_t epoch = __atomic_load_n(&capture_epoch, __ATOMIC_ACQUIRE) + 1;
-    if (!epoch) epoch = 1;
     __atomic_store_n(&capture_epoch, epoch, __ATOMIC_RELEASE);
     game_bind = bind;
     if (!bind || bind(WT_TSC_VERSION, sizeof(WtTscRecord), epoch, &admission, guest_emit)) lost();
@@ -159,7 +160,7 @@ void wt_tsc_begin(uint64_t cb) {
     if (i < 0) { lost(); stop(); leave(); return; }
     buffers[i].cb = cb; buffers[i].generation = ++generation; buffers[i].ordinal = 0;
     WtTscRecord r = {0}; r.kind = WT_TSC_BEGIN; r.word[0] = cb; r.word[1] = generation;
-    append(&r); leave();
+    append(&r, 0); leave();
 }
 void wt_tsc_command(uint64_t cb) {
     enter();
@@ -185,7 +186,7 @@ void wt_tsc_ranges(uint64_t cb, uint32_t stage, uint32_t first, uint32_t count, 
             if (!pairs || !command_record(&r, cb)) { if (!pairs) { lost(); stop(); } break; }
             r.word[3] = stage; r.word[4] = slot;
             r.word[5] = pairs[2u * (slot - first)]; r.word[6] = pairs[2u * (slot - first) + 1u];
-            append(&r);
+            append(&r, 0);
         }
     }
     leave();
@@ -195,14 +196,14 @@ void wt_tsc_program(uint64_t cb, uint64_t program, uint64_t serial, uint64_t mas
     if (wt_tsc_enabled()) {
         WtTscRecord r = {0}; r.kind = WT_TSC_PROGRAM;
         if (command_record(&r, cb)) {
-            r.word[3] = program; r.word[4] = serial; r.word[5] = mask; append(&r);
+            r.word[3] = program; r.word[4] = serial; r.word[5] = mask; append(&r, 0);
         }
     }
     leave();
 }
 void wt_tsc_backend(const uint64_t identity[16]) {
     WtTscRecord r = {0}; r.kind = WT_TSC_BACKEND;
-    memcpy(r.word, identity, sizeof r.word); append(&r);
+    memcpy(r.word, identity, sizeof r.word); append(&r, 0);
 }
 uint64_t wt_tsc_code_hash(unsigned stage, const void *code, size_t size) {
     if (!code || !size) return 0;

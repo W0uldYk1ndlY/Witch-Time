@@ -7,6 +7,8 @@ name: wtbuild
 on:
   pull_request:
     paths: ['tools/wtbuild/**', 'lifter/**', 'runtime/gen_static/**', 'runtime/freestanding/**',
+            'runtime/nvn_vk_m4.c', 'runtime/temporal_source_capture.c', 'tests/vulkan_cache_test.py',
+            'tests/vulkan_allocator_test.*', 'tests/native_integer_simd*', 'tests/sqdmulh_test.c', 'tests/temporal_source*',
             'tests/language_test.c', 'tests/mx_prev_test.c', 'tests/mv_match_test.c',
             'tests/gpu_component_report_test.py', 'tests/temporal_diag_wiring_test.py',
             'android/app/src/main/cpp/save_export*', 'android/app/src/main/java/org/witchtime/android/*Activity.java', 'android/app/src/main/AndroidManifest.xml', 'android/app/src/main/cpp/CMakeLists.txt', 'tests/save_export*',
@@ -24,7 +26,7 @@ jobs:
         run: |
           echo 'nameserver 1.1.1.1' | sudo tee /etc/resolv.conf      # 2026-11-11: the runners' own resolver timed out on the Ubuntu mirrors' names (20 s a try); take this line out when it answers again
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld libssl-dev
+          sudo apt-get install -y --no-install-recommends clang lld libssl-dev libvulkan-dev
 
       - name: Build and unit tests
         run: |
@@ -33,6 +35,20 @@ jobs:
 
       - name: Freestanding compile (runtime/freestanding against the system's headers)
         run: tools/wtbuild/target/release/wtbuild check-freestanding --words 200000 --seed 1 --jobs 4
+
+      - name: Exact integer arithmetic and SIMD aliasing under UBSan
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -fsanitize=undefined -fno-sanitize-recover=undefined -I runtime tests/sqdmulh_test.c -lm -o "$RUNNER_TEMP/sqdmulh_test"
+          "$RUNNER_TEMP/sqdmulh_test"
+          for backend in 0 1; do
+            gcc -std=c11 -O2 -Wall -Wextra -fsanitize=undefined -fno-sanitize-recover=undefined -DWT_NATIVE_INT_SIMD=$backend -I runtime tests/native_integer_simd_test.c -lm -o "$RUNNER_TEMP/native_integer_simd_test"
+            "$RUNNER_TEMP/native_integer_simd_test"
+          done
+
+      - name: Vulkan allocator pressure and transactional caches (no GPU required)
+        run: |
+          python3 tests/vulkan_allocator_test.py
+          python3 tests/vulkan_cache_test.py
 
       - name: The runtime's own SHA-1 and MD5 (runtime/plat_hash.h) against OpenSSL
         run: |
@@ -228,6 +244,22 @@ jobs:
           python3 tests/diag_replay_hid_test.py
           clang -O2 -Wall -I runtime tests/gfx_diag_hook_test.c runtime/diag.c -lpthread -o "$RUNNER_TEMP/gfx_diag_hook_test"
           "$RUNNER_TEMP/gfx_diag_hook_test" 
+
+  android-integer-helpers:
+    # Execute the actual NDK-built helpers, not just the x86 host reference.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned Android NDK and test-only emulator
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;28.2.13676358'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          python3 -m venv "$RUNNER_TEMP/integer-checks"
+          "$RUNNER_TEMP/integer-checks/bin/pip" install 'unicorn==2.1.4' 'pyelftools==0.33'
+      - name: Packed code generation and exact AArch64 execution
+        run: |
+          "$RUNNER_TEMP/integer-checks/bin/python" tests/native_integer_simd_codegen_test.py
+          "$RUNNER_TEMP/integer-checks/bin/python" tests/native_integer_simd_arm64_test.py
 
   lifter-check:
     # the shipped lifter against Unicorn: random words of the forms added to the lifter, run in Unicorn and as their lifted C

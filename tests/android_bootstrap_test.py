@@ -73,7 +73,11 @@ char *getenv(const char *name);
     "sys/stat.h": """#pragma once
 struct stat { unsigned st_mode; };
 #define S_ISREG(mode) (((mode) & 0170000) == 0100000)
+#define S_ISDIR(mode) (((mode) & 0170000) == 0040000)
 int lstat(const char *path, struct stat *buf);
+int stat(const char *path, struct stat *buf);
+int chmod(const char *path, unsigned mode);
+unsigned umask(unsigned mode);
 #if defined(_WIN32)
 #include <direct.h>
 int test_record_mkdir(const char *path);
@@ -115,6 +119,7 @@ struct JNINativeInterface_ {
 
 TEST_DRIVER_C = r"""
 #include <stdio.h>
+#include <stdint.h>
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +187,10 @@ char *SDL_strdup(const char *text) {
 }
 void SDL_free(void *ptr) { free(ptr); }
 int lstat(const char *path, struct stat *buf) { (void)path; (void)buf; return -1; }
+/* Keep the mock stat layout and all permission operations inside the fixture. */
+int stat(const char *path, struct stat *buf) { (void)path; (void)buf; return -1; }
+int chmod(const char *path, unsigned mode) { (void)path; (void)mode; return 0; }
+unsigned umask(unsigned mode) { (void)mode; return 0; }
 
 int SDL_SetHint(const char *name, const char *value) {
     record(EV_SET_HINT, name, value);

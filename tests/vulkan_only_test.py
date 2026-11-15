@@ -38,6 +38,7 @@ class VulkanOnlyTest(unittest.TestCase):
                 obj = tmp / (source + ".o")
                 command = shlex.split(os.environ.get("CC", "cc")) + [
                     "-std=gnu11", "-O2", "-D_GNU_SOURCE", "-DWT_VULKAN_ONLY=1",
+                    "-include", "signal.h",  # POSIX plat.h declares a siginfo_t fault callback.
                     "-D__declspec(x)=", "-I", str(tmp), "-I", str(ROOT / "runtime/posix"),
                     "-I", str(ROOT / "runtime"), "-c", str(ROOT / "runtime" / source), "-o", str(obj)]
                 build = subprocess.run(command, capture_output=True, text=True)

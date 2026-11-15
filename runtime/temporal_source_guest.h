@@ -7,8 +7,13 @@ static WtTscEmit wt_tsc_guest_emit;
 static uint64_t wt_tsc_guest_epoch;
 /* The two original sites have no guest call between them; never join across Ctx/SP/thread/epoch. */
 static _Thread_local struct { uint64_t epoch, context, sp, vtable; } wt_tsc_guest_table;
-__declspec(dllexport) int game_temporal_source_bind(uint32_t version, uint32_t size,
-                                                   uint64_t epoch, const uint32_t *active, WtTscEmit emit) {
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+int game_temporal_source_bind(uint32_t version, uint32_t size,
+                             uint64_t epoch, const uint32_t *active, WtTscEmit emit) {
     if (version != WT_TSC_VERSION || size != sizeof(WtTscRecord) || (!active != !emit) || (!!active != !!epoch)) return -1;
     if (!active) {
         __atomic_store_n(&wt_tsc_guest_epoch, 0, __ATOMIC_RELEASE);

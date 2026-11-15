@@ -14,7 +14,7 @@ static void yield_thread(void) { SwitchToThread(); }
 #define make_dir(p) mkdir(p, 0700)
 static void yield_thread(void) { sched_yield(); }
 #endif
-static uint32_t pause_writer, pause_admit, pause_before_admit, pause_arm, arm_thread, entered, release_writer;
+static uint32_t pause_writer, pause_admit, pause_before_admit, pause_arm, arm_thread, malformed_writer, entered, release_writer;
 static void before_admit(void) {
     if (!__atomic_load_n(&pause_before_admit, __ATOMIC_ACQUIRE)) return;
     __atomic_store_n(&entered, 1, __ATOMIC_RELEASE);
@@ -44,16 +44,17 @@ static WtTscEmit emitter;
 static uint64_t emitter_epoch;
 static int bind_capture(uint32_t v, uint32_t s, uint64_t epoch, const uint32_t *gate, WtTscEmit emit) {
     assert(v == WT_TSC_VERSION && s == sizeof(WtTscRecord));
-    assert(!!gate == !!emit && !!gate == !!epoch);
+    assert(!!gate == !!epoch && !!emit == !!epoch);
     emitter = emit; emitter_epoch = epoch; return 0;
 }
 static void run_writer(void *arg) {
     if (__atomic_load_n(&arm_thread, __ATOMIC_ACQUIRE)) { wt_tsc_frame(50, 1); return; }
     WtTscEmit emit = emitter;
     uint64_t epoch = emitter_epoch;
+    uint32_t malformed = __atomic_load_n(&malformed_writer, __ATOMIC_ACQUIRE);
     for (unsigned i = 0; i < 200; i++) {
         WtTscRecord r = {0}; r.version = WT_TSC_VERSION; r.size = sizeof r; r.kind = WT_TSC_GUEST;
-        r.site = (uint64_t)(uintptr_t)arg; r.word[0] = i; emit(epoch, &r);
+        r.site = (uint64_t)(uintptr_t)arg; r.word[0] = i; emit(epoch, malformed ? NULL : &r);
     }
 }
 #ifdef _WIN32
@@ -113,33 +114,34 @@ int main(int argc, char **argv) {
         while (fread(&r, sizeof r, 1, f)) { assert(r.frame >= 10 && r.frame < 14); count++; }
         fclose(f); assert(count == (interior ? 0u : 1u));
     }
-    /* A callback paused before admission must not enter a subsequent run, even when
-       both runs use the same frame and the admission word has returned to OPEN. */
     __atomic_store_n(&pause_admit, 0, __ATOMIC_RELEASE);
-    snprintf(dir, sizeof dir, "%s/old_epoch", argv[1]); assert(!make_dir(dir));
-    assert(!wt_tsc_start(dir, 1, bind_capture)); wt_tsc_frame(20, 1);
-    WtTscEmit old_emit = emitter; uint64_t old_epoch = emitter_epoch;
-    __atomic_store_n(&pause_before_admit, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&entered, 0, __ATOMIC_RELEASE); __atomic_store_n(&release_writer, 0, __ATOMIC_RELEASE);
-    paused = launch(1); tries = 0;
-    while (!__atomic_load_n(&entered, __ATOMIC_ACQUIRE) && ++tries < 10000000) yield_thread();
-    assert(__atomic_load_n(&entered, __ATOMIC_ACQUIRE));
-    wt_tsc_frame(24, 1); wt_tsc_core_loss(0); assert(wt_tsc_finish() == -1);
-    snprintf(dir, sizeof dir, "%s/new_epoch", argv[1]); assert(!make_dir(dir));
-    assert(!wt_tsc_start(dir, 1, bind_capture)); assert(emitter_epoch && emitter_epoch != old_epoch);
-    wt_tsc_frame(20, 1);
-    __atomic_store_n(&release_writer, 1, __ATOMIC_RELEASE); join(paused);
-    __atomic_store_n(&pause_before_admit, 0, __ATOMIC_RELEASE);
-    r = (WtTscRecord){0};
-    old_emit(old_epoch, NULL); old_emit(old_epoch, &r); /* Invalid stale input cannot stop the new run. */
-    assert(wt_tsc_enabled());
-    r.version = WT_TSC_VERSION; r.size = sizeof r; r.kind = WT_TSC_GUEST; r.site = 99;
-    emitter(emitter_epoch, &r);
-    wt_tsc_frame(24, 1); wt_tsc_core_loss(0); assert(!wt_tsc_finish());
-    snprintf(file, sizeof file, "%s/temporal_source.bin", dir); f = fopen(file, "rb"); assert(f);
-    assert(fread(&r, sizeof r, 1, f) == 1 && r.site == 99 && r.sequence == 1);
-    assert(fread(&r, sizeof r, 1, f) == 0); fclose(f);
+    for (int malformed = 0; malformed < 2; malformed++) {
+        snprintf(dir, sizeof dir, "%s/stale_old_%d", argv[1], malformed); assert(!make_dir(dir));
+        assert(!wt_tsc_start(dir, 1, bind_capture)); wt_tsc_frame(10, 1);
+        uint64_t old_epoch = emitter_epoch;
+        __atomic_store_n(&malformed_writer, malformed, __ATOMIC_RELEASE);
+        __atomic_store_n(&pause_before_admit, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&entered, 0, __ATOMIC_RELEASE); __atomic_store_n(&release_writer, 0, __ATOMIC_RELEASE);
+        paused = launch(1); tries = 0;
+        while (!__atomic_load_n(&entered, __ATOMIC_ACQUIRE) && ++tries < 10000000) yield_thread();
+        assert(__atomic_load_n(&entered, __ATOMIC_ACQUIRE));
+        wt_tsc_frame(14, 0); wt_tsc_core_loss(0); assert(wt_tsc_finish() == -1);
 
+        /* No reservation exists yet: a delayed callback must recheck its epoch after admission. */
+        snprintf(dir, sizeof dir, "%s/stale_new_%d", argv[1], malformed); assert(!make_dir(dir));
+        assert(!wt_tsc_start(dir, 1, bind_capture)); assert(emitter_epoch && emitter_epoch != old_epoch);
+        wt_tsc_frame(100, 1);
+        __atomic_store_n(&pause_before_admit, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&release_writer, 1, __ATOMIC_RELEASE); join(paused);
+        assert(wt_tsc_enabled());
+        WtTscRecord current = {0};
+        current.version = WT_TSC_VERSION; current.size = sizeof current; current.kind = WT_TSC_GUEST;
+        current.site = 900; emitter(emitter_epoch, &current);
+        wt_tsc_frame(104, 0); wt_tsc_core_loss(0); assert(!wt_tsc_finish());
+        snprintf(file, sizeof file, "%s/temporal_source.bin", dir); f = fopen(file, "rb"); assert(f);
+        assert(fread(&r, sizeof r, 1, f) == 1 && r.site == 900 && r.frame == 100 && r.sequence == 1);
+        assert(!fread(&r, sizeof r, 1, f)); fclose(f);
+    }
     snprintf(dir, sizeof dir, "%s/finish_arm", argv[1]); assert(!make_dir(dir));
     assert(!wt_tsc_start(dir, 1, bind_capture));
     __atomic_store_n(&pause_arm, 1, __ATOMIC_RELEASE); __atomic_store_n(&arm_thread, 1, __ATOMIC_RELEASE);

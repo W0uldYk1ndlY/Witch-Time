@@ -15,7 +15,19 @@
 #endif
 
 static unsigned observations;
-static void count_record(uint64_t epoch, const WtTscRecord *r) { assert(epoch == 1 && r->site == 123); observations++; }
+static void count_record(uint64_t epoch, const WtTscRecord *r) {
+    assert(epoch == 127 && r->site == 123); observations++;
+}
+static uint64_t bound_epoch;
+static WtTscEmit bound_emit;
+static int bind_capture(uint32_t version, uint32_t size, uint64_t epoch,
+                        const uint32_t *gate, WtTscEmit emit) {
+    if (gate) {
+        assert(emit && epoch > bound_epoch);
+        bound_epoch = epoch; bound_emit = emit;
+    } else assert(!epoch && !emit);
+    return game_temporal_source_bind(version, size, epoch, gate, emit);
+}
 static void path_for(char *out, size_t size, const char *root, const char *name) {
     assert(snprintf(out, size, "%s/%s", root, name) < (int)size);
     assert(make_dir(out) == 0);
@@ -29,10 +41,13 @@ int main(int argc, char **argv) {
     Ctx c, before;
     memset(&c, 0xa5, sizeof c); before = c;
     uint32_t gate = 0;
-    assert(game_temporal_source_bind(999, sizeof(WtTscRecord), 1, &gate, count_record) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, 1, 1, &gate, count_record) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 1, &gate, NULL) == -1);
-    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 1, &gate, count_record) == 0);
+    assert(game_temporal_source_bind(999, sizeof(WtTscRecord), 127, &gate, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, 1, 127, &gate, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 127, &gate, NULL) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 127, NULL, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 0, &gate, count_record) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 127, NULL, NULL) == -1);
+    assert(game_temporal_source_bind(WT_TSC_VERSION, sizeof(WtTscRecord), 127, &gate, count_record) == 0);
     wt_temporal_guest_site(&c, 123); assert(!observations);
     gate = 1; wt_temporal_guest_site(&c, 123); assert(observations == 1);
     assert(!memcmp(&c, &before, sizeof c));
@@ -46,8 +61,8 @@ int main(int argc, char **argv) {
     wt_tsc_frame(1, 1); assert(!wt_tsc_enabled()); assert(wt_tsc_finish() == -1);
 
     path_for(dir, sizeof dir, argv[1], "window");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == -1);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == -1);
     wt_temporal_guest_site(&c, 100);
     wt_tsc_frame(9, 0); assert(!wt_tsc_enabled());
     wt_tsc_frame(10, 1); assert(wt_tsc_enabled());
@@ -72,7 +87,7 @@ int main(int argc, char **argv) {
     FILE *f = open_records(dir); WtTscRecord r;
     unsigned n = 0, ranges = 0, begins = 0;
     while (fread(&r, sizeof r, 1, f)) {
-        assert(r.version == WT_TSC_VERSION && r.size == sizeof r && r.sequence == ++n);
+        assert(r.version == 2 && r.size == sizeof r && r.sequence == ++n);
         if (r.kind == WT_TSC_GUEST) { assert(r.site == 101); assert(r.word[0] == c.x[0]); }
         if (r.kind == WT_TSC_BEGIN) { assert(r.word[1] == ++begins); }
         if (r.kind == WT_TSC_RANGE) {
@@ -85,10 +100,36 @@ int main(int argc, char **argv) {
     }
     fclose(f); assert(n == 8 && ranges == 3 && begins == 2);
     /* Existing evidence must never be truncated by an accidental second start. */
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == -1);
+    assert(wt_tsc_start(dir, 1, bind_capture) == -1);
+
+    /* Retained old callbacks must neither record evidence nor invalidate a later run. */
+    uint64_t stale_epoch = bound_epoch;
+    WtTscEmit stale_emit = bound_emit;
+    path_for(dir, sizeof dir, argv[1], "epoch");
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
+    wt_tsc_frame(20, 1);
+    WtTscRecord stale = {0};
+    stale.version = WT_TSC_VERSION; stale.size = sizeof stale; stale.kind = WT_TSC_GUEST;
+    stale.site = 666;
+    stale_emit(stale_epoch, &stale);
+    stale_emit(stale_epoch, NULL);
+    stale_emit(0, NULL);
+    assert(wt_tsc_enabled());
+    wt_temporal_guest_site(&c, 777);
+    wt_tsc_frame(24, 0); wt_tsc_core_loss(0); assert(!wt_tsc_finish());
+    f = open_records(dir);
+    assert(fread(&r, sizeof r, 1, f) == 1 && r.site == 777 && r.frame == 20 && r.sequence == 1);
+    assert(!fread(&r, sizeof r, 1, f)); fclose(f);
+
+    path_for(dir, sizeof dir, argv[1], "malformed_current");
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
+    wt_tsc_frame(1, 1);
+    bound_emit(bound_epoch, NULL);
+    assert(!wt_tsc_enabled());
+    wt_tsc_frame(5, 0); wt_tsc_core_loss(0); assert(wt_tsc_finish() == -1);
 
     path_for(dir, sizeof dir, argv[1], "budget");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
     wt_tsc_frame(100, 1);
     for (unsigned i = 0; i <= WT_TSC_RECORDS; i++) wt_temporal_guest_site(&c, i);
     assert(!wt_tsc_enabled()); assert(wt_tsc_finish() == -1);
@@ -96,7 +137,7 @@ int main(int argc, char **argv) {
     assert((unsigned long)ftell(f) == WT_TSC_RECORDS * sizeof r); fclose(f);
 
     path_for(dir, sizeof dir, argv[1], "unknown_generation");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
     wt_tsc_frame(1, 1); wt_tsc_command(999);
     wt_tsc_ranges(999, 0, 9, 1, pairs); wt_temporal_guest_site(&c, 1);
     assert(wt_tsc_enabled()); assert(wt_tsc_finish() == -1);
@@ -105,15 +146,15 @@ int main(int argc, char **argv) {
     assert(wt_tsc_code_hash(0, code, 3) != wt_tsc_code_hash(1, code, 3));
     assert(!wt_tsc_code_hash(0, NULL, 0));
     path_for(dir, sizeof dir, argv[1], "no_scene");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
     wt_tsc_frame(1, 0); assert(!wt_tsc_enabled()); assert(wt_tsc_finish() == -1);
     path_for(dir, sizeof dir, argv[1], "buffer_budget");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
     wt_tsc_frame(1, 1);
     for (unsigned i = 0; i < 33; i++) wt_tsc_begin(i);
     assert(!wt_tsc_enabled()); assert(wt_tsc_finish() == -1);
     path_for(dir, sizeof dir, argv[1], "core_loss");
-    assert(wt_tsc_start(dir, 1, game_temporal_source_bind) == 0);
+    assert(wt_tsc_start(dir, 1, bind_capture) == 0);
     wt_tsc_frame(1, 1); wt_temporal_guest_site(&c, 1); wt_tsc_frame(5, 1);
     wt_tsc_core_loss(1); assert(wt_tsc_finish() == -1);
     puts("temporal source capture contracts passed (mocked guest/frontend/backend)");
